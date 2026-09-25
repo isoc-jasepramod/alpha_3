@@ -1,0 +1,59 @@
+app:
+  name: "Project Alpha 2.0"
+  version: "2.0.0"
+  env: "development"
+  log_level: "INFO"
+
+server:
+  host: "0.0.0.0"
+  port: 8001
+  ws_throttle_ms: 250
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  market_channel: "channel:market_ticks"
+  simulated_channel: "channel:simulated_ticks"
+  signals_channel: "channel:signals"
+  telemetry_channel: "channel:telemetry"
+
+database:
+  url: "postgresql+asyncpg://alpha_user:alpha_password@localhost:5432/alpha_db"
+
+angel_one:
+  api_key: "${ANGEL_API_KEY}"
+  client_code: "${ANGEL_CLIENT_CODE}"
+  pin: "${ANGEL_PIN}"
+  totp_token: "${ANGEL_TOTP_TOKEN}"
+  instrument_master_url: "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+  feed_token: ""
+
+risk:
+  total_account_equity: 100000.0  # ₹1,00,000 baseline
+  risk_per_trade_pct: 0.01        # 1.0% risk per trade
+  daily_max_drawdown_pct: 0.025   # 2.5% circuit breaker
+  sl_floor_ratio: 0.80            # If SL < 0.75 * P_entry, force SL = 0.80 * P_entry
+  sl_floor_threshold: 0.75
+  rr_ratio: 2.0                   # 1:2 Risk to Reward
+  # Adaptive runaway guardrails — per-strategy profiles
+  runaway_profiles:
+    default:
+      surge_pct: 0.035              # +3.5% chase prevented
+      time_window_sec: 30
+    GAMMA_SCALP:
+      surge_pct: 0.08               # +8.0% — 0-DTE gamma options routinely expand 4-8% per tick
+      time_window_sec: 15
+    VWAP_EMA:
+      surge_pct: 0.05               # +5.0% — expiry-day options have elevated gamma
+      time_window_sec: 25
+    ORB_BREAKOUT:
+      surge_pct: 0.035              # +3.5% — morning liquidity is high
+      time_window_sec: 30
+    OI_SQUEEZE:
+      surge_pct: 0.04               # +4.0% — squeeze spikes are inherently sharp
+      time_window_sec: 25
+    MOMENTUM_IMPULSE:
+      surge_pct: 0.10               # +10.0% — fast impulse moves expand rapidly
+      time_window_sec: 15
+

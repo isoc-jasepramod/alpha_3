@@ -1,0 +1,102 @@
+instruments:
+  NIFTY:
+    symbol: "NIFTY"
+    name: "NIFTY 50"
+    spot_token: "99926000"
+    spot_exchange: "nse_cm"
+    opt_exchange: "nfo_fo"
+    strike_interval: 50
+    default_lot_size: 65
+    gamma_premium_min: 25.0
+    gamma_premium_max: 60.0
+    expiry_day: 1  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri (dynamically resolved)
+  SENSEX:
+    symbol: "SENSEX"
+    name: "BSE SENSEX"
+    spot_token: "99919000"
+    spot_exchange: "bse_cm"
+    opt_exchange: "bfo_fo"
+    strike_interval: 100
+    default_lot_size: 20
+    gamma_premium_min: 60.0
+    gamma_premium_max: 150.0
+    expiry_day: 3  # Thursday (dynamically resolved)
+
+trading_hours:
+  market_open: "09:15:00"
+  market_close: "15:30:00"
+  master_sync_time: "08:30:00"
+
+strategies:
+  oi_squeeze:
+    enabled: true
+    start_time: "09:15:00"
+    end_time: "15:30:00"
+    lookback_window_sec: 180
+    min_oi_drop_pct: -8.0
+    min_price_spike_pct: 5.0
+    vol_multiplier: 2.0
+    strikes_monitored: [-2, -1, 0, 1, 2] # ATM-2 to ATM+2
+  
+  orb_breakout:
+    enabled: true
+    start_time: "09:15:00"
+    end_time: "10:30:00"
+    orb_window_start: "09:15:00"
+    orb_window_end: "09:30:00"
+    buffer_margin_factor: 0.0003
+    min_rvol: 1.50
+    candle_timeframe_min: 5
+    max_gap_pct: 0.40
+    extreme_gap_pct: 1.50
+    contact_multiplier: 1.80        # Volume spike threshold for level contact
+    min_dry_bars: 2                 # Bars of volume contraction before ignition
+
+  vwap_ema:
+    enabled: true
+    start_time: "09:15:00"
+    end_time: "15:15:00"
+    candle_timeframe_min: 3
+    ema_fast: 9
+    ema_slow: 21
+    vwap_touch_tolerance: 0.0005
+    min_bottom_wick_ratio: 0.35
+    min_top_wick_ratio: 0.15
+    contact_multiplier: 1.80        # Institutional volume contact multiplier
+    min_dry_bars: 3                 # Volume dry-up contraction bars
+    ignition_multiplier: 2.0        # Volume ignition multiplier following dry-up
+    rsi_period: 14
+    rsi_ce_min: 48.0
+    rsi_ce_max: 72.0
+    rsi_pe_min: 18.0
+    rsi_pe_max: 52.0
+
+
+  gamma_scalp:
+    enabled: true
+    start_time: "13:15:00"
+    end_time: "15:30:00"
+    consolidation_start: "12:00:00"
+    consolidation_end: "13:00:00"
+    min_roc_3m_pct: 0.10
+    max_mid_range_pct: 0.003        # was 0.005 — tighter consolidation (≤0.3% of spot)
+    min_vol_multiplier: 2.5
+    vol_sma_period: 20
+    premium_staleness_pct: 10.0     # reject if premium already surged >10% from 3-min low
+    watch_proximity_pct: 0.15       # fire WATCH alert when spot within 0.15% of H_mid/L_mid
+
+  momentum_impulse:
+    enabled: true
+    start_time: "09:20:00"
+    end_time: "15:20:00"
+    nifty_velocity_pts: 25.0        # >= 25 pt move in <= 20s
+    sensex_velocity_pts: 75.0       # >= 75 pt move in <= 20s
+    window_sec: 20.0
+    min_tick_count: 4
+    min_directional_pct: 0.70       # 70% directional tick consistency
+    radar_velocity_ratio: 0.65      # Radar pre-alert at 65% of threshold (~16.25 Nifty / ~48.75 Sensex)
+    min_opt_surge_pct: 3.5          # ATM Option must be expanding by at least +3.5%
+    max_opt_surge_pct: 16.0         # Reject if option already surged > 16.0% (avoids buying top)
+    impulse_ttl_sec: 25.0           # Validity window for armed impulse awaiting option tick
+    cooldown_sec: 90.0
+
