@@ -120,8 +120,8 @@ def simulate_orb(df: pd.DataFrame, inst: str, date_str: str) -> Optional[Dict[st
     return None
 
 def simulate_gamma_scalp(df: pd.DataFrame, inst: str, weekday: int, date_str: str) -> Optional[Dict[str, Any]]:
-    # Thursday = NIFTY (weekday 3), Friday = SENSEX (weekday 4)
-    is_expiry_inst = (inst == "NIFTY" and weekday == 3) or (inst == "SENSEX" and weekday == 4)
+    # Tuesday = NIFTY (weekday 1), Thursday = SENSEX (weekday 3)
+    is_expiry_inst = (inst == "NIFTY" and weekday == 1) or (inst == "SENSEX" and weekday == 3)
     if not is_expiry_inst:
         return None
 

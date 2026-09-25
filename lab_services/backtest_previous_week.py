@@ -38,10 +38,10 @@ LOT_SIZE_SENSEX = 20
 DELTA_ATM = 0.50
 
 TRADING_DATES = [
-    ("2026-09-15", "Tuesday", False, False),
-    ("2026-09-16", "Wednesday", False, False),
-    ("2026-09-17", "Thursday", True, False),   # NIFTY 0-DTE Expiry
-    ("2026-09-18", "Friday", False, True),     # SENSEX 0-DTE Expiry
+    ("2026-09-15", "Tuesday", True, False),    # NIFTY 0-DTE Weekly Expiry
+    ("2026-09-16", "Wednesday", False, False),  # Regular Trading Session
+    ("2026-09-17", "Thursday", False, True),    # SENSEX 0-DTE Weekly Expiry
+    ("2026-09-18", "Friday", False, False),     # Regular Trading Session
 ]
 
 def fetch_candles_for_date(auth: AngelOneAuth, date_str: str) -> Dict[str, pd.DataFrame]:

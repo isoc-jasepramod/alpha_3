@@ -138,10 +138,11 @@ class IVEngine(BaseStrategy):
             "SENSEX": deque(maxlen=60)
         }
 
-    def _get_time_to_expiry_years(self, ts: float) -> float:
-        """Approximates trading time left to weekly expiry (Thursday 15:30 IST)"""
+    def _get_time_to_expiry_years(self, ts: float, inst: str = "NIFTY") -> float:
+        """Approximates trading time left to weekly expiry (NIFTY Tuesday 15:30 IST, SENSEX Thursday 15:30 IST)"""
         dt = self.parse_ist_time(ts)
-        days_ahead = (3 - dt.weekday()) % 7
+        exp_weekday = 1 if inst == "NIFTY" else 3  # Tuesday=1 for NIFTY, Thursday=3 for SENSEX
+        days_ahead = (exp_weekday - dt.weekday()) % 7
         target = dt.replace(hour=15, minute=30, second=0, microsecond=0) + timedelta(days=days_ahead)
         if target <= dt:
             target += timedelta(days=7)

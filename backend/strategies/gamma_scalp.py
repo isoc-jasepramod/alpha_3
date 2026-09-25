@@ -248,9 +248,9 @@ class ExpiryDayGammaScalp(BaseStrategy):
 
         inst = meta.get("name", "NIFTY")
 
-        # Expiry Day verification: NIFTY (Tuesday=1) & SENSEX (Friday=4)
+        # Expiry Day verification: NIFTY (Tuesday=1) & SENSEX (Thursday=3)
         if self.enforce_expiry_day:
-            is_weekly_expiry = (inst == "NIFTY" and now_dt.weekday() == 1) or (inst == "SENSEX" and now_dt.weekday() == 4)
+            is_weekly_expiry = (inst == "NIFTY" and now_dt.weekday() == 1) or (inst == "SENSEX" and now_dt.weekday() == 3)
             exp_str = meta.get("expiry", "")
             is_contract_expiry_today = False
             for fmt in ("%d%b%Y", "%d-%b-%Y", "%d%B%Y"):

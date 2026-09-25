@@ -32,9 +32,10 @@ class GEXEngine(BaseStrategy):
         self.prev_regimes: Dict[str, str] = {"NIFTY": "NEUTRAL", "SENSEX": "NEUTRAL"}
         self.last_eval_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
 
-    def _get_time_to_expiry_years(self, ts: float) -> float:
+    def _get_time_to_expiry_years(self, ts: float, inst: str = "NIFTY") -> float:
         dt = self.parse_ist_time(ts)
-        days_ahead = (3 - dt.weekday()) % 7
+        exp_weekday = 1 if inst == "NIFTY" else 3  # Tuesday=1 for NIFTY, Thursday=3 for SENSEX
+        days_ahead = (exp_weekday - dt.weekday()) % 7
         target = dt.replace(hour=15, minute=30, second=0, microsecond=0) + timedelta(days=days_ahead)
         if target <= dt:
             target += timedelta(days=7)
