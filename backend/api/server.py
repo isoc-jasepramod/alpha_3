@@ -27,6 +27,7 @@ from backend.strategies.gex_engine import GEXEngine
 from backend.strategies.flow_engine import FlowEngine
 from backend.strategies.squeeze_detector import SqueezeDetector
 from backend.core.chain_poller import OptionChainPoller
+from backend.core.telegram_notifier import TelegramNotifier
 from backend.api.routes import router, app_state
 
 class EngineCoordinator:
@@ -36,6 +37,7 @@ class EngineCoordinator:
         self.risk_governor = RiskGovernor()
         self.signal_tracker = SignalTracker(self.redis_bus, self.risk_governor)
         self.auth = AngelOneAuth()
+        self.telegram = TelegramNotifier()
         self.ws_client: Optional[SmartAPIWebSocketClient] = None
         
         # Load strategy configuration
@@ -225,6 +227,8 @@ class EngineCoordinator:
             logger.warning(f"⚠️ Database initialization failed (PostgreSQL offline): {e}. Proceeding in resilient mode — live signals will stream via Redis/WebSocket.")
         await self.redis_bus.connect()
         await self.instrument_mgr.sync_master()
+        if hasattr(self, "telegram") and self.telegram:
+            await self.telegram.initialize()
 
         # Authenticate AngelOne SmartAPI with .env credentials
         auth_res = await self.auth.login()
@@ -326,6 +330,8 @@ class EngineCoordinator:
             await self.ws_client.stop()
         for t in self.tasks:
             t.cancel()
+        if hasattr(self, "telegram") and self.telegram:
+            await self.telegram.close()
         await self.redis_bus.close()
         logger.info("Alpha 2.0 Engine stopped.")
 
@@ -478,7 +484,7 @@ class EngineCoordinator:
         })
 
     async def _signals_listener_loop(self):
-        """Listens to channel:signals and pushes immediately to WebSocket clients"""
+        """Listens to channel:signals and pushes immediately to WebSocket clients and Telegram"""
         async for msg in self.redis_bus.subscribe(self.redis_bus.signals_channel):
             if not self.running:
                 break
@@ -488,6 +494,19 @@ class EngineCoordinator:
                     await ws.send_text(payload)
                 except Exception:
                     pass
+
+            # Telegram dispatch for signals, precursor radar alerts, and trade resolutions
+            if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
+                try:
+                    evt = msg.get("event")
+                    if evt == "NEW_SIGNAL" and "signal" in msg:
+                        await self.telegram.notify_new_signal(msg["signal"])
+                    elif evt == "RADAR_PRE_ALERT" and "alert" in msg:
+                        await self.telegram.notify_radar_alert(msg["alert"])
+                    elif evt == "SIGNAL_RESOLVED" and "signal" in msg:
+                        await self.telegram.notify_signal_resolved(msg["signal"])
+                except Exception as e:
+                    logger.warning(f"Telegram dispatch error in signals listener: {e}")
 
     async def _throttle_broadcast_loop(self):
         """

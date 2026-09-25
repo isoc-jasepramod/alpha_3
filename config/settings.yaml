@@ -57,3 +57,12 @@ risk:
       surge_pct: 0.10               # +10.0% — fast impulse moves expand rapidly
       time_window_sec: 15
 
+telegram:
+  enabled: true
+  parse_mode: "HTML"
+  rate_limit_per_sec: 1.0
+  notifications:
+    signals: true
+    radar_precursors: true
+    resolutions: true
+
