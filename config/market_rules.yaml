@@ -35,6 +35,9 @@ strategies:
     lookback_window_sec: 300
     min_oi_drop_pct: -5.0
     min_price_spike_pct: 3.0
+    early_ignition_oi_drop_pct: -2.0
+    early_ignition_price_spike_pct_expiry: 8.0     # 0-DTE / high gamma
+    early_ignition_price_spike_pct_standard: 12.0  # non-expiry day
     vol_multiplier: 2.0
     strikes_monitored: [-2, -1, 0, 1, 2] # ATM-2 to ATM+2
   

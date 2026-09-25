@@ -85,3 +85,78 @@ async def test_oi_squeeze_strike_expansion():
     )
     # Should NOT be rejected due to offset != 0
     assert len(sentinel.token_history["73904"]) == 2
+
+@pytest.mark.asyncio
+async def test_oi_squeeze_early_ignition():
+    sentinel = OISqueezeSentinel()
+    base_ts = 1727241000.0  # 10:40 IST (active trading window)
+    sentinel.update_spot("NIFTY", 24000.0, base_ts)
+    sentinel.spot_ema20["NIFTY"].seed(23980.0)
+
+    # 0-DTE option metadata
+    meta = {
+        "name": "NIFTY",
+        "offset": 0,
+        "option_type": "CE",
+        "strike": 24000.0,
+        "lot_size": 50,
+        "symbol": "NIFTY24000CE",
+        "expiry": "25Sep2024"
+    }
+
+    # 4 warm-up ticks establishing baseline
+    for i in range(4):
+        await sentinel.on_tick(
+            {"token": "73904", "ltp": 100.0, "open_interest": 10000000, "volume": 10000, "exchange_timestamp": base_ts + (i * 12.0)},
+            meta
+        )
+
+    # Early Ignition tick: +9.0% price surge, -2.5% OI unwinding, 50s total span
+    sig = await sentinel.on_tick(
+        {"token": "73904", "ltp": 109.0, "open_interest": 9750000, "volume": 15000, "total_buy_qty": 60000, "total_sell_qty": 20000, "exchange_timestamp": base_ts + 50.0},
+        meta
+    )
+
+    assert sig is not None
+    assert sig["details"]["squeeze_type"] == "EARLY_IGNITION"
+    assert sig["entry_price"] == 109.0
+    assert sig["direction"] == "CE"
+
+@pytest.mark.asyncio
+async def test_confluence_pre_entry_alert():
+    iv_eng = IVEngine()
+    gex_eng = GEXEngine(iv_engine=iv_eng)
+    base_ts = 1727241000.0
+    gex_eng.update_spot("NIFTY", 24080.0, base_ts)
+
+    # Seed IV Skew history to simulate +2.5% Call wing skew surge
+    iv_eng.skew_history["NIFTY"].append((base_ts - 120.0, 1.0))
+    iv_eng.skew_history["NIFTY"].append((base_ts, 3.5))
+
+    # Add strikes around 24100 (Call Wall)
+    for idx, k in enumerate([24000.0, 24050.0, 24100.0, 24150.0]):
+        ts = base_ts + idx * 2.0
+        await gex_eng.on_tick(
+            {"token": f"CE_{int(k)}", "ltp": 120.0, "open_interest": 8000000 if k == 24100.0 else 2000000, "exchange_timestamp": ts},
+            {"name": "NIFTY", "option_type": "CE", "strike": k, "lot_size": 50}
+        )
+        await gex_eng.on_tick(
+            {"token": f"PE_{int(k)}", "ltp": 80.0, "open_interest": 2000000, "exchange_timestamp": ts},
+            {"name": "NIFTY", "option_type": "PE", "strike": k, "lot_size": 50}
+        )
+
+    # Final tick to trigger GEX regime evaluation (>5s elapsed)
+    await gex_eng.on_tick(
+        {"token": "CE_24100", "ltp": 125.0, "open_interest": 8000000, "exchange_timestamp": base_ts + 15.0},
+        {"name": "NIFTY", "option_type": "CE", "strike": 24100.0, "lot_size": 50}
+    )
+
+    # Check that elevated CONFLUENCE_PRE_ENTRY alert fired
+    alerts = list(gex_eng.pending_alerts)
+    confluence_alerts = [a for a in alerts if a.get("alert_type") == "CONFLUENCE_PRE_ENTRY"]
+    assert len(confluence_alerts) > 0
+    al = confluence_alerts[0]
+    assert al["direction"] == "CE"
+    assert al["details"]["entry_strike"] == 24100.0
+    assert al["details"]["recommended_sl"] == 24080.0 - 25.0
+    assert al["details"]["target_1"] == 24100.0 + 35.0

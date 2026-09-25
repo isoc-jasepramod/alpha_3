@@ -169,6 +169,20 @@ class IVEngine(BaseStrategy):
         val = self.token_iv.get(token)
         return (val[1], val[2], val[3], val[4]) if val else None
 
+    def get_latest_skew_delta(self, inst: str) -> Optional[float]:
+        """Returns the delta skew (current - baseline in window) for instrument"""
+        hist = self.skew_history.get(inst)
+        if hist and len(hist) >= 2:
+            return hist[-1][1] - hist[0][1]
+        return None
+
+    def get_latest_skew(self, inst: str) -> Optional[float]:
+        """Returns the latest 25-delta Risk Reversal skew (Call IV - Put IV)"""
+        hist = self.skew_history.get(inst)
+        if hist:
+            return hist[-1][1]
+        return None
+
     async def on_tick(self, tick: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         token = str(tick.get("token", ""))
         ltp = float(tick.get("ltp", 0.0))

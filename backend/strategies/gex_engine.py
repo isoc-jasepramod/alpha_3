@@ -169,8 +169,78 @@ class GEXEngine(BaseStrategy):
                 now_ts=ts
             )
 
+        # Check for GEX + IV Skew Confluence (Elevated Radar Alert)
+        delta_skew = self.iv_engine.get_latest_skew_delta(inst) if self.iv_engine else None
+        current_skew = self.iv_engine.get_latest_skew(inst) if self.iv_engine else None
+        proximity_pts = 35.0 if inst == "NIFTY" else 100.0
+        sl_pts = 25.0 if inst == "NIFTY" else 75.0
+        target_1_pts = 35.0 if inst == "NIFTY" else 100.0
+        target_2_pts = 75.0 if inst == "NIFTY" else 220.0
+
+        is_call_confluence = (
+            call_wall_strike > 0 and 
+            0 < (call_wall_strike - spot) <= proximity_pts and
+            ((delta_skew is not None and delta_skew >= 1.5) or (current_skew is not None and current_skew >= 2.0))
+        )
+
+        is_put_confluence = (
+            put_wall_strike > 0 and 
+            0 < (spot - put_wall_strike) <= proximity_pts and
+            ((delta_skew is not None and delta_skew <= -1.5) or (current_skew is not None and current_skew <= -2.0))
+        )
+
+        # Elevated Confluence Alert (CE): Call Gamma Wall + Institutional Call IV Skew Surge
+        if is_call_confluence:
+            spot_sl = spot - sl_pts
+            t1 = call_wall_strike + target_1_pts
+            t2 = call_wall_strike + target_2_pts
+            skew_str = f"+{delta_skew:.1f}%" if delta_skew is not None else "Elevated"
+            self.emit_radar_alert(
+                alert_type="CONFLUENCE_PRE_ENTRY",
+                instrument=inst,
+                direction="CE",
+                title=f"🎯 ELEVATED RADAR: {inst} Pre-Breakout Confluence @ {call_wall_strike:.0f} CE",
+                message=f"High-conviction confluence: {inst} approaching Call Wall ({call_wall_strike:.0f}) with Call IV Skew expansion ({skew_str}). Plan: Strike {call_wall_strike:.0f} CE | Spot SL: {spot_sl:.1f} | T1: {t1:.0f} | T2: {t2:.0f}",
+                meta_details={
+                    "spot": spot,
+                    "entry_strike": call_wall_strike,
+                    "recommended_sl": round(spot_sl, 2),
+                    "target_1": round(t1, 2),
+                    "target_2": round(t2, 2),
+                    "call_wall": call_wall_strike,
+                    "delta_skew": round(delta_skew, 2) if delta_skew is not None else 0.0,
+                    "net_gex": round(net_gex, 2),
+                    "confluence_type": "GEX_CALL_WALL + CALL_IV_SKEW_SURGE"
+                },
+                now_ts=ts
+            )
+        # Elevated Confluence Alert (PE): Put Gamma Wall + Institutional Put IV Skew Surge
+        elif is_put_confluence:
+            spot_sl = spot + sl_pts
+            t1 = put_wall_strike - target_1_pts
+            t2 = put_wall_strike - target_2_pts
+            skew_str = f"{delta_skew:.1f}%" if delta_skew is not None else "Elevated"
+            self.emit_radar_alert(
+                alert_type="CONFLUENCE_PRE_ENTRY",
+                instrument=inst,
+                direction="PE",
+                title=f"🎯 ELEVATED RADAR: {inst} Pre-Breakdown Confluence @ {put_wall_strike:.0f} PE",
+                message=f"High-conviction confluence: {inst} approaching Put Wall ({put_wall_strike:.0f}) with Put IV Skew expansion ({skew_str}). Plan: Strike {put_wall_strike:.0f} PE | Spot SL: {spot_sl:.1f} | T1: {t1:.0f} | T2: {t2:.0f}",
+                meta_details={
+                    "spot": spot,
+                    "entry_strike": put_wall_strike,
+                    "recommended_sl": round(spot_sl, 2),
+                    "target_1": round(t1, 2),
+                    "target_2": round(t2, 2),
+                    "put_wall": put_wall_strike,
+                    "delta_skew": round(delta_skew, 2) if delta_skew is not None else 0.0,
+                    "net_gex": round(net_gex, 2),
+                    "confluence_type": "GEX_PUT_WALL + PUT_IV_SKEW_SURGE"
+                },
+                now_ts=ts
+            )
         # Alert 2: Proximity to Call Wall under Short Gamma (Classic Gamma Squeeze Setup)
-        if call_wall_strike > 0 and 0 < (call_wall_strike - spot) <= (30.0 if inst == "NIFTY" else 90.0):
+        elif call_wall_strike > 0 and 0 < (call_wall_strike - spot) <= (30.0 if inst == "NIFTY" else 90.0):
             # Spot is within 30 points of Call Wall
             self.emit_radar_alert(
                 alert_type="GAMMA_SQUEEZE_PRE_ALERT",

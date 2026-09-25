@@ -21,6 +21,9 @@ class OISqueezeSentinel(BaseStrategy):
         self.tau = cfg.get("lookback_window_sec", 300) # 300 seconds (5 min)
         self.min_oi_drop_pct = cfg.get("min_oi_drop_pct", -5.0) # -5.0%
         self.min_price_spike_pct = cfg.get("min_price_spike_pct", 3.0) # +3.0%
+        self.early_ignition_oi_drop_pct = cfg.get("early_ignition_oi_drop_pct", -2.0) # -2.0%
+        self.early_ignition_price_spike_pct_expiry = cfg.get("early_ignition_price_spike_pct_expiry", 8.0) # +8.0% for 0-DTE high gamma
+        self.early_ignition_price_spike_pct_standard = cfg.get("early_ignition_price_spike_pct_standard", 12.0) # +12.0% for non-expiry
         self.vol_multiplier = cfg.get("vol_multiplier", 2.0)
         self.min_adx = cfg.get("min_adx", 20.0)
 
@@ -80,6 +83,31 @@ class OISqueezeSentinel(BaseStrategy):
                 if inst in self.spot_adx:
                     self.spot_adx[inst].update(hi, lo, cl)
         logger.info(f"✅ [OI_SQUEEZE] {inst} warmed up! EMA20={self.spot_ema20[inst].value:.1f}, ADX={self.spot_adx[inst].value:.1f}")
+
+    def _get_early_ignition_price_threshold(self, inst: str, now_dt: datetime, meta: Optional[Dict[str, Any]] = None) -> float:
+        """
+        Determines the dynamic Early Ignition threshold.
+        NIFTY / SENSEX 0-DTE has massive gamma so +8.0% in rolling tau is a screaming signal.
+        Non-expiry contracts require +12.0% to guard against lower-gamma false positives.
+        """
+        is_expiry_today = False
+        if meta and meta.get("expiry"):
+            exp_str = str(meta.get("expiry", ""))
+            for fmt in ("%d%b%Y", "%d-%b-%Y", "%d%B%Y"):
+                try:
+                    exp_date = datetime.strptime(exp_str, fmt).date()
+                    if exp_date == now_dt.date():
+                        is_expiry_today = True
+                    break
+                except ValueError:
+                    continue
+        else:
+            # Default weekly expiry days: NIFTY (Thursday=3 or Tuesday=1), SENSEX (Friday=4)
+            weekday = now_dt.weekday()
+            if (inst == "NIFTY" and weekday in (1, 3)) or (inst == "SENSEX" and weekday in (3, 4)):
+                is_expiry_today = True
+
+        return self.early_ignition_price_spike_pct_expiry if is_expiry_today else self.early_ignition_price_spike_pct_standard
 
     async def on_tick(self, tick: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -154,12 +182,37 @@ class OISqueezeSentinel(BaseStrategy):
         delta_oi_pct = ((oi - old_oi) / old_oi) * 100.0
         delta_price_pct = ((ltp - old_ltp) / old_ltp) * 100.0
 
+        # Check squeeze conditions:
+        # Standard: dOI <= -5.0%, dPrice >= +3.0%
+        # Early Ignition: Dynamic threshold (+8.0% for 0-DTE, +12.0% standard) and dOI <= -2.0% (early unwinding)
+        early_price_thresh = self._get_early_ignition_price_threshold(inst, now_dt, meta)
+        is_standard_squeeze = (delta_oi_pct <= self.min_oi_drop_pct and delta_price_pct >= self.min_price_spike_pct)
+        is_early_ignition = (delta_oi_pct <= self.early_ignition_oi_drop_pct and delta_price_pct >= early_price_thresh)
+
+        if not (is_standard_squeeze or is_early_ignition):
+            return None
+
+        # Check positive order flow / CVD if available
+        cvd_val = tick.get("cvd")
+        buy_qty = tick.get("total_buy_qty", 0.0)
+        sell_qty = tick.get("total_sell_qty", 0.0)
+        if is_early_ignition and cvd_val is not None:
+            if opt_type == "CE" and cvd_val < 0:
+                return None
+            elif opt_type == "PE" and cvd_val > 0:
+                return None
+        elif is_early_ignition and buy_qty > 0 and sell_qty > 0:
+            if opt_type == "CE" and buy_qty < sell_qty * 0.9:
+                return None
+            elif opt_type == "PE" and sell_qty < buy_qty * 0.9:
+                return None
+
         # Dynamic Warm-up Guard:
         # Standard squeezes require >= 120s and >= 8 ticks.
-        # High-velocity squeezes (dOI <= -8% and dP >= 5%) need only >= 60s and >= 5 ticks.
-        is_extreme_squeeze = (delta_oi_pct <= -8.0 and delta_price_pct >= 5.0)
-        min_required_time = 60.0 if is_extreme_squeeze else 120.0
-        min_ticks = 5 if is_extreme_squeeze else 8
+        # Early ignition and high-velocity squeezes need only >= 45s and >= 4 ticks.
+        is_fast_path = is_early_ignition or (delta_oi_pct <= -8.0 and delta_price_pct >= 5.0)
+        min_required_time = 45.0 if is_fast_path else 120.0
+        min_ticks = 4 if is_fast_path else 8
 
         if len(hist) < min_ticks or time_span < min_required_time:
             return None
@@ -167,18 +220,12 @@ class OISqueezeSentinel(BaseStrategy):
         if delta_oi_pct <= -4.0 or delta_price_pct >= 2.5:
             logger.debug(f"[OI DEBUG] {token} ({symbol}): dOI={delta_oi_pct:.2f}%, dP={delta_price_pct:.2f}%, span={time_span:.0f}s, old_oi={old_oi}, cur_oi={oi}, old_ltp={old_ltp}, cur_ltp={ltp}")
 
-        # Check conditions
-        # 1. Delta OI <= -5.0% (Unwinding)
-        # 2. Delta Price >= +3.0%
-        if delta_oi_pct > self.min_oi_drop_pct or delta_price_pct < self.min_price_spike_pct:
-            return None
-
         # 3. Spot vs EMA20
         spot = self.spot_prices.get(inst, 0.0)
         ema20 = self.spot_ema20.get(inst).value if self.spot_ema20.get(inst) else None
         
         # Directional validation:
-        # If EMA20 is available, verify directional alignment. If in extreme squeeze, allow slight tolerance.
+        # If EMA20 is available, verify directional alignment. If in fast path, allow slight tolerance.
         if ema20 and spot > 0:
             is_bullish_ce = (opt_type == "CE" and spot >= ema20 * 0.9995)
             is_bearish_pe = (opt_type == "PE" and spot <= ema20 * 1.0005)
@@ -188,30 +235,29 @@ class OISqueezeSentinel(BaseStrategy):
             return None
 
         # 4. ADX Filter: Ensure market is trending (ADX >= 20)
-        # Compression Exception: When a violent breakout launches out of a tight range,
-        # ADX is initially low (<20) because the compression is just ending.
-        # High-conviction squeezes are not discarded on low ADX.
+        # Fast-Path Exception: Early ignition or extreme squeezes breaking out of tight compression
+        # start with low ADX (<20). Do not suppress early ignition signals on compression breakouts.
         adx_val = self.spot_adx.get(inst, IncrementalADX()).value
-        if adx_val < self.min_adx and not is_extreme_squeeze:
+        if adx_val < self.min_adx and not is_fast_path:
             return None
 
         # 5. Volume surge check: Option vol in tau >= 2.0x avg 1m volume
         vols = list(self.volume_history_1m.get(token, []))
         vol_confirmed = True
-        if len(vols) >= 5:
+        if len(vols) >= 5 and not is_early_ignition:
             avg_vol = sum(vols) / len(vols)
             window_vol = vol - old_vol
-            if avg_vol > 0 and window_vol < (self.vol_multiplier * avg_vol):
+            if avg_vol > 0 and window_vol > 0 and window_vol < (self.vol_multiplier * avg_vol):
                 return None
             vol_confirmed = (avg_vol > 0 and window_vol >= (self.vol_multiplier * avg_vol))
 
         # 6. Confidence Scoring
         conditions = {
             "trend_alignment": True,
-            "volume_confirmation": vol_confirmed,
-            "momentum_strength": min(1.0, delta_price_pct / 6.0),
+            "volume_confirmation": vol_confirmed or is_early_ignition,
+            "momentum_strength": 1.0 if is_early_ignition else min(1.0, delta_price_pct / 6.0),
             "time_quality": self.is_time_gated(now_dt, "09:30:00", "15:00:00"),
-            "context_filter": (adx_val >= 25.0)
+            "context_filter": (adx_val >= 25.0) or is_early_ignition
         }
         confidence = self.compute_confidence(conditions)
 
@@ -225,7 +271,8 @@ class OISqueezeSentinel(BaseStrategy):
         if not self.can_trigger(sig_key, ts):
             return None
 
-        logger.info(f"⚡ [OI SQUEEZE] Triggered for {symbol} ({opt_type})! dOI: {delta_oi_pct:.1f}%, dPrice: +{delta_price_pct:.1f}%, Confidence: {confidence}%, ADX: {adx_val:.1f}")
+        squeeze_label = "EARLY IGNITION" if is_early_ignition else "STANDARD SQUEEZE"
+        logger.info(f"⚡ [OI SQUEEZE - {squeeze_label}] Triggered for {symbol} ({opt_type})! dOI: {delta_oi_pct:.1f}%, dPrice: +{delta_price_pct:.1f}%, Confidence: {confidence}%, ADX: {adx_val:.1f}")
 
         return self.build_signal_payload(
             instrument=inst,
@@ -239,6 +286,7 @@ class OISqueezeSentinel(BaseStrategy):
             lot_size=lot_size,
             confidence=confidence,
             meta_details={
+                "squeeze_type": "EARLY_IGNITION" if is_early_ignition else "STANDARD_SQUEEZE",
                 "delta_oi_pct": round(delta_oi_pct, 2),
                 "delta_price_pct": round(delta_price_pct, 2),
                 "spot": spot,
