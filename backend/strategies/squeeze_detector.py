@@ -118,14 +118,13 @@ class SqueezeDetector(BaseStrategy):
             bars = self.squeeze_bars[inst]
             if bars >= 4 and bars % 3 == 0:
                 self.emit_radar_alert(
+                    alert_type="VOLATILITY_COIL_ACTIVE",
                     instrument=inst,
                     direction="CE" if spot > ema_val else "PE",
-                    alert_type="VOLATILITY_COIL_ACTIVE",
                     title=f"⏳ {inst} Volatility Squeeze Coiling ({bars} bars)",
                     message=f"{inst} Bollinger Bands compressed inside Keltner Channels for {bars * 3} mins (ATR: {atr_val:.1f}). Extreme compression precedes multi-sigma impulse explosion.",
-                    spot=spot,
-                    now_ts=ts,
-                    cooldown_key=f"SQUEEZE_COIL_{inst}"
+                    meta_details={"spot": spot, "squeeze_bars": bars, "atr": round(atr_val, 2)},
+                    now_ts=ts
                 )
         else:
             # Check for Squeeze Release (Squeeze Firing)
@@ -136,14 +135,13 @@ class SqueezeDetector(BaseStrategy):
 
                 direction = "CE" if spot > ema_val else "PE"
                 self.emit_radar_alert(
+                    alert_type="SQUEEZE_BREAKOUT_FIRING",
                     instrument=inst,
                     direction=direction,
-                    alert_type="SQUEEZE_BREAKOUT_FIRING",
                     title=f"💥 {inst} SQUEEZE BREAKOUT FIRING ({direction})!",
                     message=f"{inst} Squeeze fired after {bars * 3} mins of compression! Spot {spot:.1f} released {'above' if direction=='CE' else 'below'} 20 EMA ({ema_val:.1f}). High-velocity expansion initiated.",
-                    spot=spot,
-                    now_ts=ts,
-                    cooldown_key=f"SQUEEZE_FIRE_{inst}"
+                    meta_details={"spot": spot, "squeeze_bars": bars, "ema20": round(ema_val, 2)},
+                    now_ts=ts
                 )
 
     async def on_tick(self, tick: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:

@@ -139,25 +139,23 @@ class FlowEngine(BaseStrategy):
             if delta_cvd > self.min_cvd_surge and cur_q_ratio > 1.4:
                 alert_key = f"FLOW_ABSORP_CE_{inst}"
                 self.emit_radar_alert(
+                    alert_type="ORDER_FLOW_ABSORPTION_CE",
                     instrument=inst,
                     direction="CE",
-                    alert_type="ORDER_FLOW_ABSORPTION_CE",
                     title=f"🌊 {inst} Aggressive Order Flow Absorption (CE Precursor)",
                     message=f"{inst} spot flat at {spot:.1f}, but aggressive Buyer CVD surged +{int(delta_cvd):,} contracts (Bid/Ask Queue: {cur_q_ratio:.2f}x). Limit sell walls being exhausted.",
-                    spot=spot,
-                    now_ts=ts,
-                    cooldown_key=alert_key
+                    meta_details={"spot": spot, "delta_cvd": int(delta_cvd), "queue_ratio": round(cur_q_ratio, 2)},
+                    now_ts=ts
                 )
             # Bearish Absorption: CVD dumping down (aggressive sellers absorbing limit bids)
             elif delta_cvd < -self.min_cvd_surge and cur_q_ratio < 0.7:
                 alert_key = f"FLOW_ABSORP_PE_{inst}"
                 self.emit_radar_alert(
+                    alert_type="ORDER_FLOW_ABSORPTION_PE",
                     instrument=inst,
                     direction="PE",
-                    alert_type="ORDER_FLOW_ABSORPTION_PE",
                     title=f"🔻 {inst} Aggressive Order Flow Absorption (PE Precursor)",
                     message=f"{inst} spot pinned at {spot:.1f}, but aggressive Seller CVD dumped {int(delta_cvd):,} contracts (Bid/Ask Queue: {cur_q_ratio:.2f}x). Passive bid liquidity vanishing.",
-                    spot=spot,
-                    now_ts=ts,
-                    cooldown_key=alert_key
+                    meta_details={"spot": spot, "delta_cvd": int(delta_cvd), "queue_ratio": round(cur_q_ratio, 2)},
+                    now_ts=ts
                 )

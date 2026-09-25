@@ -250,25 +250,23 @@ class IVEngine(BaseStrategy):
         if delta_skew >= self.skew_velocity_threshold:
             alert_key = f"IV_SKEW_CE_{inst}"
             self.emit_radar_alert(
+                alert_type="IV_SKEW_SURGE_CE",
                 instrument=inst,
                 direction="CE",
-                alert_type="IV_SKEW_SURGE_CE",
                 title=f"⚡ {inst} Institutional Call Wing IV Surge (+{delta_skew:.1f}%)",
                 message=f"{inst} OTM Call IV surged from {baseline_skew:.1f}% to {skew:.1f}%. Smart money bidding up upside wing volatility 5-10m before spot breakout.",
-                spot=spot,
-                now_ts=ts,
-                cooldown_key=alert_key
+                meta_details={"spot": spot, "skew": round(skew, 2), "baseline_skew": round(baseline_skew, 2), "delta_skew": round(delta_skew, 2)},
+                now_ts=ts
             )
         # Check for aggressive downside skew surge (Put bidding)
         elif delta_skew <= -self.skew_velocity_threshold:
             alert_key = f"IV_SKEW_PE_{inst}"
             self.emit_radar_alert(
+                alert_type="IV_SKEW_SURGE_PE",
                 instrument=inst,
                 direction="PE",
-                alert_type="IV_SKEW_SURGE_PE",
                 title=f"⚠️ {inst} Institutional Put Wing IV Surge ({delta_skew:.1f}%)",
                 message=f"{inst} OTM Put IV expanded relative to Call IV (Skew: {skew:.1f}% vs baseline {baseline_skew:.1f}%). Heavy downside positioning detected.",
-                spot=spot,
-                now_ts=ts,
-                cooldown_key=alert_key
+                meta_details={"spot": spot, "skew": round(skew, 2), "baseline_skew": round(baseline_skew, 2), "delta_skew": round(delta_skew, 2)},
+                now_ts=ts
             )

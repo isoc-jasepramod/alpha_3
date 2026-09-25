@@ -32,9 +32,9 @@ strategies:
     enabled: true
     start_time: "09:15:00"
     end_time: "15:30:00"
-    lookback_window_sec: 180
-    min_oi_drop_pct: -8.0
-    min_price_spike_pct: 5.0
+    lookback_window_sec: 300
+    min_oi_drop_pct: -5.0
+    min_price_spike_pct: 3.0
     vol_multiplier: 2.0
     strikes_monitored: [-2, -1, 0, 1, 2] # ATM-2 to ATM+2
   

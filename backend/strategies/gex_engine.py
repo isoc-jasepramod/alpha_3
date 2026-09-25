@@ -160,38 +160,35 @@ class GEXEngine(BaseStrategy):
         # Alert 1: Zero-Gamma Flip (Market Maker regime switches to amplifier)
         if prev == "LONG_GAMMA_DAMPENER" and current_regime == "SHORT_GAMMA_AMPLIFIER":
             self.emit_radar_alert(
+                alert_type="ZERO_GAMMA_FLIP",
                 instrument=inst,
                 direction="PE" if spot < put_wall_strike else "CE",
-                alert_type="ZERO_GAMMA_FLIP",
                 title=f"⚡ {inst} Zero-Gamma Flip: Market Entering High-Volatility Amplifier Zone",
                 message=f"{inst} Net GEX flipped to {net_gex:.1f} Cr. Market maker delta hedging will now amplify moves instead of dampening them. Prepare for violent spikes.",
-                spot=spot,
-                now_ts=ts,
-                cooldown_key=f"GEX_FLIP_{inst}"
+                meta_details={"spot": spot, "net_gex": round(net_gex, 2), "call_wall": call_wall_strike, "put_wall": put_wall_strike},
+                now_ts=ts
             )
 
         # Alert 2: Proximity to Call Wall under Short Gamma (Classic Gamma Squeeze Setup)
         if call_wall_strike > 0 and 0 < (call_wall_strike - spot) <= (30.0 if inst == "NIFTY" else 90.0):
             # Spot is within 30 points of Call Wall
             self.emit_radar_alert(
+                alert_type="GAMMA_SQUEEZE_PRE_ALERT",
                 instrument=inst,
                 direction="CE",
-                alert_type="GAMMA_SQUEEZE_PRE_ALERT",
                 title=f"🚀 {inst} Gamma Squeeze Wall Alert @ {call_wall_strike:.0f}",
                 message=f"{inst} (Spot: {spot:.1f}) is within striking distance of Major Call Gamma Wall ({call_wall_strike:.0f}). Piercing this strike forces dealer short covering cascade.",
-                spot=spot,
-                now_ts=ts,
-                cooldown_key=f"GEX_SQUEEZE_{inst}"
+                meta_details={"spot": spot, "call_wall": call_wall_strike, "net_gex": round(net_gex, 2)},
+                now_ts=ts
             )
         # Alert 3: Proximity to Put Wall (Downside Cascade)
         elif put_wall_strike > 0 and 0 < (spot - put_wall_strike) <= (30.0 if inst == "NIFTY" else 90.0):
             self.emit_radar_alert(
+                alert_type="GAMMA_CASCADE_PE_ALERT",
                 instrument=inst,
                 direction="PE",
-                alert_type="GAMMA_CASCADE_PE_ALERT",
                 title=f"🔻 {inst} Downside Gamma Cascade Alert @ {put_wall_strike:.0f}",
                 message=f"{inst} (Spot: {spot:.1f}) approaching Put Gamma Wall ({put_wall_strike:.0f}). Breaking below triggers forced dealer short futures selling.",
-                spot=spot,
-                now_ts=ts,
-                cooldown_key=f"GEX_CASCADE_{inst}"
+                meta_details={"spot": spot, "put_wall": put_wall_strike, "net_gex": round(net_gex, 2)},
+                now_ts=ts
             )

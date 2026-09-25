@@ -166,5 +166,5 @@ class OptionChainPoller:
                 "iso_time": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
             }
         }
-        await self.redis_bus.publish_alert(alert_payload)
+        await self.redis_bus.publish_signal(alert_payload)
         logger.info(f"📢 [CHAIN POLLER RADAR] Emitted: {title}")
