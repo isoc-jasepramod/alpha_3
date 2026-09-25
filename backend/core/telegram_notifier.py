@@ -272,7 +272,17 @@ class TelegramNotifier:
         details = alert.get("details", {})
 
         is_confluence = "CONFLUENCE" in alert_type
-        header = "🎯 <b>ELEVATED RADAR: CONFLUENCE SETUP</b>" if is_confluence else f"📡 <b>RADAR PRE-ALERT: {alert_type}</b>"
+        is_gamma_watch = "GAMMA_WATCH" in alert_type
+
+        if is_gamma_watch:
+            header = "⚡ <b>ELEVATED RADAR: GAMMA SCALP IMMINENT (0-DTE)</b>"
+            bias_badge = "🟢 <b>CE BREAKOUT IMMINENT</b>" if direction == "CE" else "🔴 <b>PE BREAKDOWN IMMINENT</b>"
+        elif is_confluence:
+            header = "🎯 <b>ELEVATED RADAR: CONFLUENCE SETUP</b>"
+            bias_badge = f"<b>{direction}</b>"
+        else:
+            header = f"📡 <b>RADAR PRE-ALERT: {alert_type}</b>"
+            bias_badge = f"<b>{direction}</b>"
 
         plan_str = ""
         if is_confluence and details:
@@ -291,7 +301,7 @@ class TelegramNotifier:
         return (
             f"{header}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Instrument:</b> <code>{inst}</code> | <b>Bias:</b> <code>{direction}</code>\n"
+            f"<b>Instrument:</b> <code>{inst}</code> | <b>Bias:</b> {bias_badge}\n"
             f"<b>Setup:</b> {title}\n"
             f"{plan_str}"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
