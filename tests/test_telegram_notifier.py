@@ -115,3 +115,35 @@ async def test_queue_and_mock_dispatch(sample_signal):
         assert "ALPHA 3.0 — NEW SIGNAL" in json_body["text"]
 
         await notifier.close()
+
+@pytest.mark.asyncio
+async def test_multi_recipient_dispatch(sample_signal):
+    # Comma-separated chat IDs (two recipients)
+    notifier = TelegramNotifier(bot_token="1234:ABC", chat_id="11111, 22222", enabled=True)
+    
+    mock_client = AsyncMock()
+    mock_get_me = MagicMock()
+    mock_get_me.json.return_value = {"ok": True, "result": {"username": "test_bot"}}
+    mock_send = MagicMock()
+    mock_send.json.return_value = {"ok": True, "result": {"message_id": 101}}
+
+    mock_client.get.return_value = mock_get_me
+    mock_client.post.return_value = mock_send
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await notifier.initialize()
+        assert "11111" in notifier.resolved_chat_ids
+        assert "22222" in notifier.resolved_chat_ids
+
+        await notifier.notify_new_signal(sample_signal)
+        await asyncio.sleep(0.1)
+
+        # Should be called once for each recipient (2 times)
+        assert mock_client.post.call_count == 2
+        calls = mock_client.post.call_args_list
+        posted_chats = [c[1]["json"]["chat_id"] for c in calls]
+        assert "11111" in posted_chats
+        assert "22222" in posted_chats
+
+        await notifier.close()
+

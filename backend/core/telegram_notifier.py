@@ -2,7 +2,7 @@ import os
 import asyncio
 import httpx
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from loguru import logger
 import yaml
 
@@ -52,12 +52,26 @@ class TelegramNotifier:
             except Exception as e:
                 logger.warning(f"Error reading telegram settings: {e}")
 
-        self.resolved_chat_id: Optional[str] = None
+        self.raw_targets = [x.strip() for x in self.raw_chat_id.split(",") if x.strip()]
+        self.resolved_chat_ids: List[str] = []
         self.bot_username: Optional[str] = None
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         self.client: Optional[httpx.AsyncClient] = None
         self._worker_task: Optional[asyncio.Task] = None
         self.running = False
+
+    @property
+    def resolved_chat_id(self) -> Optional[str]:
+        """Convenience property for single chat or first resolved ID."""
+        return self.resolved_chat_ids[0] if self.resolved_chat_ids else None
+
+    @resolved_chat_id.setter
+    def resolved_chat_id(self, val: Optional[str]):
+        if val:
+            if val not in self.resolved_chat_ids:
+                self.resolved_chat_ids.append(val)
+        else:
+            self.resolved_chat_ids.clear()
 
     @property
     def api_url(self) -> str:
@@ -76,7 +90,7 @@ class TelegramNotifier:
             if data.get("ok"):
                 self.bot_username = data.get("result", {}).get("username", "")
                 logger.success(f"📱 Connected to Telegram Bot @{self.bot_username}!")
-                await self._resolve_chat_id()
+                await self._resolve_chat_ids()
             else:
                 logger.error(f"Telegram getMe failed: {data}")
         except Exception as e:
@@ -93,78 +107,93 @@ class TelegramNotifier:
             await self.client.aclose()
             self.client = None
 
-    async def _resolve_chat_id(self) -> Optional[str]:
+    async def _resolve_chat_ids(self) -> List[str]:
         """
-        Resolves numeric chat_id. If a username (e.g. John_4699) was provided,
-        inspects getUpdates to match the username from incoming /start messages.
+        Resolves numeric chat_ids for all configured targets.
+        Supports comma-separated IDs, channels (-100...), and usernames.
         """
-        # If numeric or channel handle
-        raw = self.raw_chat_id.lstrip("@")
-        if raw.isdigit() or raw.startswith("-"):
-            self.resolved_chat_id = self.raw_chat_id
-            return self.resolved_chat_id
+        updates = None
+        for raw in self.raw_targets:
+            clean = raw.lstrip("@")
+            # If numeric or group/channel handle
+            if clean.isdigit() or clean.startswith("-"):
+                if raw not in self.resolved_chat_ids:
+                    self.resolved_chat_ids.append(raw)
+                continue
 
-        # Try getUpdates to resolve username -> numeric ID
-        try:
-            res = await self.client.get(f"{self.api_url}/getUpdates")
-            updates = res.json().get("result", [])
+            # Query getUpdates if not fetched yet
+            if updates is None:
+                try:
+                    res = await self.client.get(f"{self.api_url}/getUpdates")
+                    updates = res.json().get("result", [])
+                except Exception as e:
+                    logger.warning(f"Could not fetch Telegram getUpdates: {e}")
+                    updates = []
+
+            matched = False
             for upd in updates:
                 msg = upd.get("message") or upd.get("channel_post") or {}
                 chat = msg.get("chat", {})
                 username = chat.get("username", "")
-                if username.lower() == raw.lower():
-                    self.resolved_chat_id = str(chat.get("id"))
-                    logger.success(f"Resolved Telegram username @{username} to Chat ID: {self.resolved_chat_id}")
-                    return self.resolved_chat_id
+                cid = str(chat.get("id"))
+                if username.lower() == clean.lower():
+                    if cid not in self.resolved_chat_ids:
+                        self.resolved_chat_ids.append(cid)
+                    logger.success(f"Resolved Telegram target @{username} to Chat ID: {cid}")
+                    matched = True
+                    break
 
-            # If user hasn't messaged yet, grab the most recent chat if available
-            if updates and not self.resolved_chat_id:
+            if not matched and updates and not self.resolved_chat_ids:
+                # Fallback to latest chat if nothing resolved yet
                 latest_chat = updates[-1].get("message", {}).get("chat", {})
                 if latest_chat.get("id"):
-                    self.resolved_chat_id = str(latest_chat.get("id"))
+                    cid = str(latest_chat.get("id"))
+                    if cid not in self.resolved_chat_ids:
+                        self.resolved_chat_ids.append(cid)
                     u = latest_chat.get("username", "user")
-                    logger.info(f"Auto-bound to latest Telegram chat: @{u} (ID: {self.resolved_chat_id})")
-                    return self.resolved_chat_id
+                    logger.info(f"Auto-bound to latest Telegram chat: @{u} (ID: {cid})")
 
-        except Exception as e:
-            logger.warning(f"Could not resolve Telegram chat ID: {e}")
+            if not matched and clean not in [x.lstrip("@") for x in self.resolved_chat_ids]:
+                logger.warning(
+                    f"⚠️ Telegram target '{raw}' not yet resolved. "
+                    f"Recipient must open https://t.me/{self.bot_username} and send /start"
+                )
 
-        if not self.resolved_chat_id:
-            logger.warning(
-                f"⚠️ Telegram chat_id '{self.raw_chat_id}' not yet resolved. "
-                f"Please open https://t.me/{self.bot_username} on your phone and tap 'START'."
-            )
-        return self.resolved_chat_id
+        return self.resolved_chat_ids
 
     async def _dispatcher_loop(self):
-        """Worker loop that dequeues messages and posts them to Telegram."""
+        """Worker loop that dequeues messages and posts them to all resolved Telegram chats."""
         while self.running:
             try:
-                payload = await self.queue.get()
-                if not self.resolved_chat_id:
-                    await self._resolve_chat_id()
+                base_payload = await self.queue.get()
+                if not self.resolved_chat_ids:
+                    await self._resolve_chat_ids()
 
-                if not self.resolved_chat_id:
-                    # Drop message if chat still not started to avoid blocking
+                if not self.resolved_chat_ids:
                     self.queue.task_done()
                     await asyncio.sleep(1.0)
                     continue
 
-                payload["chat_id"] = self.resolved_chat_id
-                if "parse_mode" not in payload:
-                    payload["parse_mode"] = self.parse_mode
+                # Broadcast to every recipient
+                for chat_id in list(self.resolved_chat_ids):
+                    payload = dict(base_payload)
+                    payload["chat_id"] = chat_id
+                    if "parse_mode" not in payload:
+                        payload["parse_mode"] = self.parse_mode
 
-                res = await self.client.post(f"{self.api_url}/sendMessage", json=payload)
-                resp_data = res.json()
-                if not resp_data.get("ok"):
-                    logger.warning(f"Telegram sendMessage error: {resp_data.get('description')}")
-                    # If 429 Too Many Requests, back off
-                    if resp_data.get("error_code") == 429:
-                        retry_after = resp_data.get("parameters", {}).get("retry_after", 3)
-                        await asyncio.sleep(retry_after)
+                    try:
+                        res = await self.client.post(f"{self.api_url}/sendMessage", json=payload)
+                        resp_data = res.json()
+                        if not resp_data.get("ok"):
+                            logger.warning(f"Telegram sendMessage to {chat_id} error: {resp_data.get('description')}")
+                            if resp_data.get("error_code") == 429:
+                                retry_after = resp_data.get("parameters", {}).get("retry_after", 3)
+                                await asyncio.sleep(retry_after)
+                    except Exception as e:
+                        logger.error(f"Error posting message to Telegram chat {chat_id}: {e}")
 
                 self.queue.task_done()
-                # Rate limit throttle
+                # Rate limit throttle between broadcasts
                 await asyncio.sleep(1.0 / max(0.5, self.rate_limit_per_sec))
 
             except asyncio.CancelledError:
