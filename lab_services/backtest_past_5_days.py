@@ -48,24 +48,37 @@ def fetch_candles_for_date(auth: AngelOneAuth, date_str: str) -> Dict[str, pd.Da
             "fromdate": f"{date_str} 09:15",
             "todate": f"{date_str} 15:30"
         }
-        try:
-            res = auth.smart_connect.getCandleData(param)
-            if res and res.get("status") and res.get("data"):
-                rows = []
-                for r in res["data"]:
-                    dt = datetime.strptime(r[0][:19], "%Y-%m-%dT%H:%M:%S")
-                    rows.append({
-                        "timestamp": dt,
-                        "open": float(r[1]),
-                        "high": float(r[2]),
-                        "low": float(r[3]),
-                        "close": float(r[4]),
-                        "volume": float(r[5])
-                    })
-                df = pd.DataFrame(rows).set_index("timestamp")
-                candles_dict[inst] = df
-        except Exception as e:
-            logger.warning(f"Error fetching {inst} on {date_str}: {e}")
+        import time as _time
+        max_retries = 4
+        for attempt in range(max_retries):
+            try:
+                res = auth.smart_connect.getCandleData(param)
+                if res and res.get("status") and res.get("data"):
+                    rows = []
+                    for r in res["data"]:
+                        dt = datetime.strptime(r[0][:19], "%Y-%m-%dT%H:%M:%S")
+                        rows.append({
+                            "timestamp": dt,
+                            "open": float(r[1]),
+                            "high": float(r[2]),
+                            "low": float(r[3]),
+                            "close": float(r[4]),
+                            "volume": float(r[5])
+                        })
+                    df = pd.DataFrame(rows).set_index("timestamp")
+                    candles_dict[inst] = df
+                break
+            except Exception as e:
+                msg = str(e)
+                if "rate" in msg.lower() and attempt < max_retries - 1:
+                    backoff = 2.0 * (attempt + 1)
+                    logger.warning(f"Rate limited fetching {inst} on {date_str}. Retrying in {backoff:.0f}s...")
+                    _time.sleep(backoff)
+                    continue
+                logger.warning(f"Error fetching {inst} on {date_str}: {e}")
+                break
+        # Throttle to respect AngelOne rate limits (~3 req/sec cap on historical API)
+        _time.sleep(0.5)
     return candles_dict
 
 def simulate_orb(df: pd.DataFrame, inst: str, date_str: str) -> Optional[Dict[str, Any]]:
