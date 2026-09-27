@@ -25,6 +25,7 @@ class AppState:
     latest_ticks_buffer: Dict[str, Dict[str, Any]] = {} # token -> tick
     circuit_breaker_status: bool = False
     spot_data: Dict[str, Dict[str, Any]] = {}
+    regime_filter: Any = None
 
 app_state = AppState()
 
@@ -39,6 +40,16 @@ async def get_telemetry():
     if not atm_data and app_state.instrument_manager:
         atm_data = getattr(app_state.instrument_manager, "current_atm", {})
 
+    regimes = {}
+    if app_state.regime_filter:
+        try:
+            regimes = {
+                "NIFTY": app_state.regime_filter.get_regime("NIFTY"),
+                "SENSEX": app_state.regime_filter.get_regime("SENSEX")
+            }
+        except Exception:
+            pass
+
     return {
         "status": "ONLINE",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -49,7 +60,8 @@ async def get_telemetry():
         "active_signals_count": active_sigs,
         "connected_clients": len(app_state.connected_websockets),
         "current_atm": atm_data,
-        "spot_data": app_state.spot_data
+        "spot_data": app_state.spot_data,
+        "regimes": regimes
     }
 
 @router.get("/api/signals/active")

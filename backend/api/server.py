@@ -22,6 +22,7 @@ from backend.strategies.orb_breakout import VolumeBackedORB
 from backend.strategies.vwap_ema import VWAPEMAAlignment
 from backend.strategies.gamma_scalp import ExpiryDayGammaScalp
 from backend.strategies.momentum_impulse import MomentumImpulseDetector
+from backend.strategies.regime_filter import RegimeFilter
 from backend.strategies.iv_engine import IVEngine
 from backend.strategies.gex_engine import GEXEngine
 from backend.strategies.flow_engine import FlowEngine
@@ -50,6 +51,9 @@ class EngineCoordinator:
             except Exception as e:
                 logger.warning(f"Failed to load market_rules.yaml: {e}")
 
+        # Shared Market Regime Filter
+        self.regime_filter = RegimeFilter(strat_cfg.get("regime_filter"))
+
         # Core and Precursor Predictive Engines
         iv_engine = IVEngine(strat_cfg.get("iv_engine"))
         gex_engine = GEXEngine(iv_engine=iv_engine, config=strat_cfg.get("gex_engine"))
@@ -62,13 +66,16 @@ class EngineCoordinator:
             poll_interval_sec=60
         )
 
+        vwap_ema_strat = VWAPEMAAlignment(strat_cfg.get("vwap_ema"), regime_filter=self.regime_filter)
+        momentum_strat = MomentumImpulseDetector(strat_cfg.get("momentum_impulse"), regime_filter=self.regime_filter)
+
         # Strategy instances with configured rules
         self.strategies = [
             OISqueezeSentinel(strat_cfg.get("oi_squeeze")),
             VolumeBackedORB(strat_cfg.get("orb_breakout")),
-            VWAPEMAAlignment(strat_cfg.get("vwap_ema")),
+            vwap_ema_strat,
             ExpiryDayGammaScalp(strat_cfg.get("gamma_scalp")),
-            MomentumImpulseDetector(strat_cfg.get("momentum_impulse")),
+            momentum_strat,
             iv_engine,
             gex_engine,
             flow_engine,
@@ -242,6 +249,10 @@ class EngineCoordinator:
 
             for inst, candles in candles_map.items():
                 if candles:
+                    try:
+                        self.regime_filter.seed_from_candles(inst, candles)
+                    except Exception as e:
+                        logger.warning(f"Failed to seed regime filter for {inst}: {e}")
                     for strat in self.strategies:
                         if hasattr(strat, "seed_from_candles"):
                             try:
@@ -293,6 +304,7 @@ class EngineCoordinator:
         app_state.instrument_manager = self.instrument_mgr
         app_state.risk_governor = self.risk_governor
         app_state.signal_tracker = self.signal_tracker
+        app_state.regime_filter = self.regime_filter
 
     def _update_token_cache(self, nifty_spot: float, sensex_spot: float):
         nifty_wings = self.instrument_mgr.get_atm_and_wings("NIFTY", nifty_spot)
@@ -529,7 +541,11 @@ class EngineCoordinator:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "ticks": ticks_to_send,
                 "active_signals": active_cards,
-                "spot_data": app_state.spot_data
+                "spot_data": app_state.spot_data,
+                "regimes": {
+                    "NIFTY": self.regime_filter.get_regime("NIFTY"),
+                    "SENSEX": self.regime_filter.get_regime("SENSEX")
+                }
             })
 
             for ws in list(app_state.connected_websockets):

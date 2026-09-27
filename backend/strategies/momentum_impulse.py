@@ -31,9 +31,10 @@ class MomentumImpulseDetector(BaseStrategy):
          - 1:2 R/R target with tight trailing guidance (+1R partial profit, trail to breakeven).
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, regime_filter: Optional[Any] = None):
         super().__init__(name="MOMENTUM_IMPULSE")
         cfg = config or {}
+        self.regime_filter = regime_filter
         self.start_time = cfg.get("start_time", "09:20:00")
         self.end_time = cfg.get("end_time", "15:20:00")
 
@@ -226,7 +227,17 @@ class MomentumImpulseDetector(BaseStrategy):
                     )
 
             # 1b. Full Impulse Trigger: Arm impulse state waiting for option confirmation
+            # Check Session Regime Filter: In CHOPPY regime, arming is suppressed (prevents entering into reversals)
             if abs_delta >= full_threshold and consistency >= self.min_directional_pct:
+                if self.regime_filter:
+                    allowed, reason = self.regime_filter.allows_momentum_arming(inst)
+                    if not allowed:
+                        logger.warning(
+                            f"🛡️ [MOMENTUM CHOPPY SUPPRESSION] {inst} {direction} impulse ({delta:+.1f} pts in {elapsed:.1f}s) "
+                            f"detected but arming SUPPRESSED: {reason}"
+                        )
+                        return None
+
                 # Do not re-arm if already active and recently updated
                 cur_impulse = self.active_impulses.get(inst)
                 if not cur_impulse or ts > cur_impulse.get("expires_at", 0) or cur_impulse.get("direction") != direction:
@@ -347,6 +358,7 @@ class MomentumImpulseDetector(BaseStrategy):
             f"Option Surge: +{surge_pct:.1f}% | SL Spot: {custom_sl:.1f} | Conf: {confidence}%"
         )
 
+        regime_st = self.regime_filter.get_regime(inst) if self.regime_filter else {}
         return self.build_signal_payload(
             instrument=inst,
             direction=opt_type,
@@ -365,6 +377,8 @@ class MomentumImpulseDetector(BaseStrategy):
                 "option_surge_pct": round(surge_pct, 1),
                 "base_premium": round(base_price, 2),
                 "spot_origin": round(spot_start, 1),
+                "regime": regime_st.get("regime", "UNKNOWN"),
+                "regime_score": regime_st.get("score", 0.0),
                 "guidance": "⚡ Momentum Impulse: High velocity move. Book 50% at +1R, trail remaining SL to breakeven immediately."
             }
         )

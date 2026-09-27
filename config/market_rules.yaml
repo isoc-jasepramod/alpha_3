@@ -103,3 +103,17 @@ strategies:
     impulse_ttl_sec: 25.0           # Validity window for armed impulse awaiting option tick
     cooldown_sec: 90.0
 
+  regime_filter:
+    enabled: true
+    trending_threshold: 65.0        # >= 65: TRENDING_BULL / TRENDING_BEAR (all setups allowed)
+    neutral_threshold: 45.0         # 45-64: NEUTRAL (only Volume Contact / Dry-Up Ignition allowed)
+    er_lookback: 10                 # Efficiency Ratio lookback bars
+    vwap_persistence_lookback: 10   # Bars evaluated for closes on same side of VWAP
+    vwap_slope_lookback: 5          # Bars evaluated for VWAP drift
+    nifty_target_slope: 0.50        # Target slope for NIFTY (pts/bar)
+    sensex_target_slope: 1.50       # Target slope for SENSEX (pts/bar)
+    weight_adx: 0.30                # ADX strength weight (30%)
+    weight_er: 0.30                 # Efficiency Ratio weight (30%)
+    weight_persistence: 0.25        # VWAP Persistence weight (25%)
+    weight_slope: 0.15              # VWAP Slope weight (15%)
+

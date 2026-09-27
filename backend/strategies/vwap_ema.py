@@ -43,9 +43,10 @@ class VWAPEMAAlignment(BaseStrategy):
       RSI(14) in [28, 52].
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, regime_filter: Optional[Any] = None):
         super().__init__(name="VWAP_EMA")
         cfg = config or {}
+        self.regime_filter = regime_filter
         self.start_time = cfg.get("start_time", "09:15:00")
         self.end_time = cfg.get("end_time", "15:15:00")
         self.vwap_tolerance = cfg.get("vwap_touch_tolerance", 0.0005)
@@ -167,9 +168,11 @@ class VWAPEMAAlignment(BaseStrategy):
         logger.info(f"⚡ [VWAP_EMA] Pre-seeded {inst} indicators from spot quote: LTP={ltp}, VWAP={typical_price:.1f}, EMA9={ltp:.1f}, EMA21={(ltp+op)/2.0:.1f}, DayHi={hi:.1f}, DayLo={lo:.1f}")
 
     def seed_from_candles(self, inst: str, candles: List[Dict[str, Any]]):
-        """Feeds historical 3-minute candles to fully warm up VWAP, EMAs, RSI, and ADX."""
+        """Feeds historical 3-minute candles to fully warm up VWAP, EMAs, RSI, ADX, and RegimeFilter."""
         if not candles:
             return
+        if self.regime_filter:
+            self.regime_filter.seed_from_candles(inst, candles)
         logger.info(f"🔄 [VWAP_EMA] Warming up {inst} indicators with {len(candles)} historical candles...")
         for c in candles:
             hi = float(c.get("high", 0.0))
@@ -358,6 +361,10 @@ class VWAPEMAAlignment(BaseStrategy):
                 v_contact_vwap_pe = self.contact_detectors[inst].check_contact(closed, vwap_val, "VWAP", direction="PE")
                 v_contact_ema9_pe = self.contact_detectors[inst].check_contact(closed, ema9_val, "EMA9", direction="PE")
 
+                # Update shared Session Regime Filter with closed 3-minute candle
+                if self.regime_filter:
+                    self.regime_filter.update_candle(inst, closed, vwap_val, adx_val)
+
                 # 1. Check if we were awaiting confirmation from prior rejection candle
                 awaiting = self.awaiting_confirmation[inst]
                 if awaiting:
@@ -368,6 +375,16 @@ class VWAPEMAAlignment(BaseStrategy):
                     if awaiting["direction"] == "CE":
                         # Confirmation candle must close above EMA9 and show bullishness
                         if c > ema9_val and c >= o:
+                            # 1. Apply Session Regime Filter (Full standdown in CHOPPY; Volume Contact/Dry-Up required in NEUTRAL)
+                            if self.regime_filter:
+                                is_c = bool(awaiting.get("volume_contact", {}).get("is_contact"))
+                                is_d = bool(awaiting.get("volume_dryup", {}).get("is_ignition"))
+                                allowed, reason = self.regime_filter.allows_vwap_ema(inst, is_volume_contact=is_c, is_dryup_ignition=is_d)
+                                if not allowed:
+                                    logger.info(f"🛡️ [VWAP_EMA REGIME FILTER] {inst} CE confirmation blocked: {reason}")
+                                    self.awaiting_confirmation[inst] = None
+                                    return None
+
                             # Apply anti-chop filters before confirming (with dynamic trend-day awareness)
                             if self.is_in_stop_cooldown(inst, "CE", ts):
                                 self.awaiting_confirmation[inst] = None
@@ -407,6 +424,16 @@ class VWAPEMAAlignment(BaseStrategy):
                     elif awaiting["direction"] == "PE":
                         # Confirmation candle must close below EMA9 and show bearishness
                         if c < ema9_val and c <= o:
+                            # 1. Apply Session Regime Filter (Full standdown in CHOPPY; Volume Contact/Dry-Up required in NEUTRAL)
+                            if self.regime_filter:
+                                is_c = bool(awaiting.get("volume_contact", {}).get("is_contact"))
+                                is_d = bool(awaiting.get("volume_dryup", {}).get("is_ignition"))
+                                allowed, reason = self.regime_filter.allows_vwap_ema(inst, is_volume_contact=is_c, is_dryup_ignition=is_d)
+                                if not allowed:
+                                    logger.info(f"🛡️ [VWAP_EMA REGIME FILTER] {inst} PE confirmation blocked: {reason}")
+                                    self.awaiting_confirmation[inst] = None
+                                    return None
+
                             # Apply anti-chop filters before confirming (with dynamic trend-day awareness)
                             if self.is_in_stop_cooldown(inst, "PE", ts):
                                 self.awaiting_confirmation[inst] = None
@@ -508,7 +535,12 @@ class VWAPEMAAlignment(BaseStrategy):
                                 # If this candle is an explosive Volume Ignition or Institutional Defense with green close, trigger immediately!
                                 is_immediate_ignition = (contact_ce["is_contact"] and c > o and c > ema9_val) or (v_dryup["is_ignition"] and c > o and c > ema9_val)
                                 if is_immediate_ignition:
-                                    if not self.is_in_stop_cooldown(inst, "CE", ts) and not self._check_exhaustion_filter(inst, "CE", c, adx=adx_val, vwap_slope=vwap_slope) and not self._check_vwap_distance_filter("CE", c, vwap_val, tested_ema9=tested_ema9, adx=adx_val):
+                                    regime_ok = True
+                                    if self.regime_filter:
+                                        regime_ok, reason = self.regime_filter.allows_vwap_ema(inst, is_volume_contact=contact_ce["is_contact"], is_dryup_ignition=v_dryup["is_ignition"])
+                                        if not regime_ok:
+                                            logger.info(f"🛡️ [VWAP_EMA REGIME FILTER] {inst} CE immediate ignition blocked: {reason}")
+                                    if regime_ok and not self.is_in_stop_cooldown(inst, "CE", ts) and not self._check_exhaustion_filter(inst, "CE", c, adx=adx_val, vwap_slope=vwap_slope) and not self._check_vwap_distance_filter("CE", c, vwap_val, tested_ema9=tested_ema9, adx=adx_val):
                                         custom_sl = min(l, ema9_val) - 5.0
                                         conditions = {
                                             "trend_alignment": (ema9_val > ema21_val and c > vwap_val),
@@ -533,22 +565,28 @@ class VWAPEMAAlignment(BaseStrategy):
                                                 "time": ts
                                             }
                                 else:
-                                    # Passive pullback: await confirmation candle
-                                    self.awaiting_confirmation[inst] = {
-                                        "direction": "CE",
-                                        "rejection_candle": closed,
-                                        "ema9": ema9_val,
-                                        "vwap": vwap_val,
-                                        "rsi": rsi_val,
-                                        "adx": adx_val,
-                                        "vwap_slope": vwap_slope,
-                                        "bottom_wick": bottom_wick,
-                                        "vol_ratio": vol_ratio,
-                                        "tested_ema9": tested_ema9,
-                                        "volume_contact": contact_ce,
-                                        "volume_dryup": v_dryup,
-                                        "time": ts
-                                    }
+                                    # Passive pullback: await confirmation candle (check regime filter)
+                                    pullback_allowed = True
+                                    if self.regime_filter:
+                                        pullback_allowed, reason = self.regime_filter.allows_vwap_ema(inst, is_volume_contact=contact_ce["is_contact"], is_dryup_ignition=v_dryup["is_ignition"])
+                                        if not pullback_allowed:
+                                            logger.debug(f"🛡️ [VWAP_EMA REGIME FILTER] {inst} CE pullback setup suppressed: {reason}")
+                                    if pullback_allowed:
+                                        self.awaiting_confirmation[inst] = {
+                                            "direction": "CE",
+                                            "rejection_candle": closed,
+                                            "ema9": ema9_val,
+                                            "vwap": vwap_val,
+                                            "rsi": rsi_val,
+                                            "adx": adx_val,
+                                            "vwap_slope": vwap_slope,
+                                            "bottom_wick": bottom_wick,
+                                            "vol_ratio": vol_ratio,
+                                            "tested_ema9": tested_ema9,
+                                            "volume_contact": contact_ce,
+                                            "volume_dryup": v_dryup,
+                                            "time": ts
+                                        }
 
                     elif ema9_val and ema21_val and (ema9_val < ema21_val) and (c < vwap_val) and (vwap_slope <= -self.min_vwap_slope) and has_vol_boost_pe:
                         tested_ema9 = (h >= ema9_val * 0.9995 and c < ema9_val)
@@ -593,7 +631,12 @@ class VWAPEMAAlignment(BaseStrategy):
                                 # If this candle is an explosive Volume Ignition or Institutional Breakdown with red close, trigger immediately!
                                 is_immediate_ignition_pe = (contact_pe["is_contact"] and c < o and c < ema9_val) or (v_dryup["is_ignition"] and c < o and c < ema9_val)
                                 if is_immediate_ignition_pe:
-                                    if not self.is_in_stop_cooldown(inst, "PE", ts) and not self._check_exhaustion_filter(inst, "PE", c, adx=adx_val, vwap_slope=vwap_slope) and not self._check_vwap_distance_filter("PE", c, vwap_val, tested_ema9=tested_ema9, adx=adx_val):
+                                    regime_ok = True
+                                    if self.regime_filter:
+                                        regime_ok, reason = self.regime_filter.allows_vwap_ema(inst, is_volume_contact=contact_pe["is_contact"], is_dryup_ignition=v_dryup["is_ignition"])
+                                        if not regime_ok:
+                                            logger.info(f"🛡️ [VWAP_EMA REGIME FILTER] {inst} PE immediate ignition blocked: {reason}")
+                                    if regime_ok and not self.is_in_stop_cooldown(inst, "PE", ts) and not self._check_exhaustion_filter(inst, "PE", c, adx=adx_val, vwap_slope=vwap_slope) and not self._check_vwap_distance_filter("PE", c, vwap_val, tested_ema9=tested_ema9, adx=adx_val):
                                         custom_sl = max(h, ema9_val) + 5.0
                                         conditions = {
                                             "trend_alignment": (ema9_val < ema21_val and c < vwap_val),
@@ -618,22 +661,28 @@ class VWAPEMAAlignment(BaseStrategy):
                                                 "time": ts
                                             }
                                 else:
-                                    # Passive pullback: await confirmation candle
-                                    self.awaiting_confirmation[inst] = {
-                                        "direction": "PE",
-                                        "rejection_candle": closed,
-                                        "ema9": ema9_val,
-                                        "vwap": vwap_val,
-                                        "rsi": rsi_val,
-                                        "adx": adx_val,
-                                        "vwap_slope": vwap_slope,
-                                        "top_wick": top_wick,
-                                        "vol_ratio": vol_ratio,
-                                        "tested_ema9": tested_ema9,
-                                        "volume_contact": contact_pe,
-                                        "volume_dryup": v_dryup,
-                                        "time": ts
-                                    }
+                                    # Passive pullback: await confirmation candle (check regime filter)
+                                    pullback_allowed = True
+                                    if self.regime_filter:
+                                        pullback_allowed, reason = self.regime_filter.allows_vwap_ema(inst, is_volume_contact=contact_pe["is_contact"], is_dryup_ignition=v_dryup["is_ignition"])
+                                        if not pullback_allowed:
+                                            logger.debug(f"🛡️ [VWAP_EMA REGIME FILTER] {inst} PE pullback setup suppressed: {reason}")
+                                    if pullback_allowed:
+                                        self.awaiting_confirmation[inst] = {
+                                            "direction": "PE",
+                                            "rejection_candle": closed,
+                                            "ema9": ema9_val,
+                                            "vwap": vwap_val,
+                                            "rsi": rsi_val,
+                                            "adx": adx_val,
+                                            "vwap_slope": vwap_slope,
+                                            "top_wick": top_wick,
+                                            "vol_ratio": vol_ratio,
+                                            "tested_ema9": tested_ema9,
+                                            "volume_contact": contact_pe,
+                                            "volume_dryup": v_dryup,
+                                            "time": ts
+                                        }
             return None
 
         # Option tick processing
@@ -655,6 +704,7 @@ class VWAPEMAAlignment(BaseStrategy):
                 conf = pending.get("confidence", 75)
                 logger.info(f"⚡ [VWAP & EMA] Confirmed Trigger for {symbol} ({opt_type})! Confidence: {conf}%, Spot: {pending['spot_close']:.1f}, SL: {pending.get('custom_sl'):.1f}")
 
+                regime_st = self.regime_filter.get_regime(inst) if self.regime_filter else {}
                 return self.build_signal_payload(
                     instrument=inst,
                     direction=opt_type,
@@ -673,7 +723,9 @@ class VWAPEMAAlignment(BaseStrategy):
                         "custom_sl": round(pending.get("custom_sl", 0.0), 1),
                         "confidence": conf,
                         "volume_contact": pending.get("volume_contact"),
-                        "volume_dryup": pending.get("volume_dryup")
+                        "volume_dryup": pending.get("volume_dryup"),
+                        "regime": regime_st.get("regime", "UNKNOWN"),
+                        "regime_score": regime_st.get("score", 0.0)
                     }
                 )
 
