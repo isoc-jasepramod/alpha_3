@@ -47,63 +47,95 @@ export function RadarAlertBanner({ alerts, onDismiss }) {
               alignItems: 'center',
               justifyContent: 'space-between',
               gap: '1rem',
-              background: glowBg,
-              borderColor: borderColor,
-              boxShadow: `0 0 16px ${borderColor.replace('0.35', '0.15').replace('0.50', '0.20')}`,
-              animation: 'pulseGlow 2.5s infinite ease-in-out',
+              background: 'rgba(30, 41, 59, 0.55)',
+              borderColor: 'rgba(148, 163, 184, 0.22)',
+              boxShadow: 'none',
+              animation: 'none',
               borderRadius: 'var(--radius-sm)'
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem', flex: 1, minWidth: 0 }}>
-              {/* Pulsing Icon */}
+              {/* Muted Watch Icon */}
               <div
                 style={{
-                  width: '36px',
-                  height: '36px',
+                  width: '34px',
+                  height: '34px',
                   borderRadius: '50%',
-                  background: 'rgba(255, 255, 255, 0.05)',
-                  border: `1px solid ${accentColor}`,
+                  background: 'rgba(255, 255, 255, 0.04)',
+                  border: '1px solid rgba(148, 163, 184, 0.25)',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   flexShrink: 0
                 }}
               >
-                {isImpulse ? (
-                  <Zap size={18} color={accentColor} />
+                {isGamma ? (
+                  <Eye size={17} color="#94a3b8" />
+                ) : isImpulse ? (
+                  <Zap size={17} color="#94a3b8" />
                 ) : isDryUp ? (
-                  <Flame size={18} color={accentColor} />
-                ) : isContact ? (
-                  <Zap size={18} color={accentColor} />
-                ) : isGamma ? (
-                  <Eye size={18} color={accentColor} />
+                  <Flame size={17} color="#94a3b8" />
                 ) : (
-                  <Radio size={18} color={accentColor} />
+                  <Radio size={17} color="#94a3b8" />
                 )}
               </div>
 
               {/* Alert Content */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem', minWidth: 0 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  {/* High-visibility NOT A TRADE label */}
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: '0.65rem',
+                      fontWeight: 800,
+                      letterSpacing: '0.06em',
+                      padding: '2px 7px',
+                      borderRadius: '3px',
+                      background: 'rgba(248, 113, 113, 0.12)',
+                      color: '#f87171',
+                      border: '1px solid rgba(248, 113, 113, 0.30)',
+                      display: 'inline-flex',
+                      alignItems: 'center'
+                    }}
+                  >
+                    NOT A TRADE
+                  </span>
+
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: '0.65rem',
+                      fontWeight: 700,
+                      letterSpacing: '0.04em',
+                      padding: '2px 6px',
+                      borderRadius: '3px',
+                      background: 'rgba(148, 163, 184, 0.12)',
+                      color: '#cbd5e1',
+                      border: '1px solid rgba(148, 163, 184, 0.22)'
+                    }}
+                  >
+                    WATCH ONLY
+                  </span>
+
                   <span
                     style={{
                       fontSize: '0.68rem',
-                      fontWeight: 700,
-                      letterSpacing: '0.06em',
-                      padding: '2px 7px',
-                      borderRadius: 'var(--radius-sm)',
-                      background: isImpulse ? 'rgba(0, 240, 255, 0.15)' : (isCE ? 'var(--ce-green-bg)' : 'var(--pe-red-bg)'),
-                      color: isImpulse ? 'var(--accent-cyan)' : (isCE ? 'var(--ce-green)' : 'var(--pe-red)'),
-                      border: `1px solid ${isImpulse ? 'var(--accent-cyan)' : (isCE ? 'var(--ce-green)' : 'var(--pe-red)')}`,
+                      fontWeight: 600,
+                      letterSpacing: '0.04em',
+                      padding: '2px 6px',
+                      borderRadius: '3px',
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      color: 'var(--text-secondary)',
+                      border: '1px solid rgba(255, 255, 255, 0.10)',
                       display: 'flex',
                       alignItems: 'center',
                       gap: '3px'
                     }}
                   >
                     {isCE ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
-                    {alert.instrument} {alert.direction} {isImpulse ? 'IMPULSE' : 'PRE-MOVE'}
+                    {alert.instrument} {alert.direction === 'CE' ? 'TOP' : 'BOTTOM'}
                   </span>
-
 
                   <span
                     style={{
@@ -114,24 +146,11 @@ export function RadarAlertBanner({ alerts, onDismiss }) {
                   >
                     {alert.title}
                   </span>
-
-                  <span
-                    className="mono"
-                    style={{
-                      fontSize: '0.68rem',
-                      color: 'var(--accent-cyan)',
-                      background: 'rgba(0, 240, 255, 0.1)',
-                      padding: '1px 6px',
-                      borderRadius: '3px'
-                    }}
-                  >
-                    HEADS-UP
-                  </span>
                 </div>
 
                 <div
                   style={{
-                    fontSize: '0.78rem',
+                    fontSize: '0.76rem',
                     color: 'var(--text-secondary)',
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',

@@ -4,6 +4,7 @@ import { Activity, ShieldAlert, Volume2, VolumeX, PlayCircle, Layers } from 'luc
 export function HeaderTelemetry({
   telemetry,
   spotData = {},
+  regimes = {},
   connected,
   soundEnabled,
   onToggleSound,
@@ -33,6 +34,60 @@ export function HeaderTelemetry({
   const sensexChange = sensexData.change ?? 0.0;
   const sensexChangePct = sensexData.change_pct ?? 0.0;
 
+  // Session Regime Data
+  const niftyRegime = regimes?.NIFTY || telemetry?.regimes?.NIFTY;
+  const sensexRegime = regimes?.SENSEX || telemetry?.regimes?.SENSEX;
+
+  const renderRegimePill = (regimeInfo) => {
+    if (!regimeInfo || !regimeInfo.regime) return null;
+    const regime = regimeInfo.regime;
+    const score = Math.round(regimeInfo.score || 50);
+
+    let text = `⚖️ NEUTRAL ${score}`;
+    let bg = 'rgba(255, 179, 0, 0.12)';
+    let color = '#ffb300';
+    let border = '1px solid rgba(255, 179, 0, 0.35)';
+
+    if (regime === 'TRENDING_BULL') {
+      text = `🔺 TREND UP ${score}`;
+      bg = 'rgba(0, 230, 118, 0.15)';
+      color = '#00e676';
+      border = '1px solid rgba(0, 230, 118, 0.40)';
+    } else if (regime === 'TRENDING_BEAR') {
+      text = `🔻 TREND DOWN ${score}`;
+      bg = 'rgba(255, 51, 102, 0.15)';
+      color = '#ff3366';
+      border = '1px solid rgba(255, 51, 102, 0.40)';
+    } else if (regime === 'CHOPPY') {
+      text = `〰️ CHOPPY ${score}`;
+      bg = 'rgba(179, 136, 255, 0.12)';
+      color = '#b388ff';
+      border = '1px solid rgba(179, 136, 255, 0.35)';
+    }
+
+    return (
+      <span
+        className="mono"
+        style={{
+          fontSize: '0.62rem',
+          fontWeight: 700,
+          letterSpacing: '0.04em',
+          padding: '2px 6px',
+          borderRadius: '4px',
+          background: bg,
+          color: color,
+          border: border,
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '3px'
+        }}
+        title={`Session Regime: ${regime} (Score: ${score}/100)`}
+      >
+        {text}
+      </span>
+    );
+  };
+
   return (
     <header className="glass-panel telemetry-bar">
       <div className="telemetry-left">
@@ -60,7 +115,10 @@ export function HeaderTelemetry({
         <div className="spot-card" title={`NIFTY 50 Spot | High: ${niftyData.high || niftyLtp} | Low: ${niftyData.low || niftyLtp}`}>
           <div className="spot-header">
             <span className="spot-name">NIFTY 50</span>
-            <span className="spot-atm-tag mono">ATM {niftyAtm}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+              {renderRegimePill(niftyRegime)}
+              <span className="spot-atm-tag mono">ATM {niftyAtm}</span>
+            </div>
           </div>
           <div className="spot-body">
             <span className={`spot-ltp mono ${niftyChange >= 0 ? 'price-up' : 'price-down'}`}>
@@ -76,7 +134,10 @@ export function HeaderTelemetry({
         <div className="spot-card" title={`SENSEX Spot | High: ${sensexData.high || sensexLtp} | Low: ${sensexData.low || sensexLtp}`}>
           <div className="spot-header">
             <span className="spot-name">SENSEX</span>
-            <span className="spot-atm-tag mono">ATM {sensexAtm}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+              {renderRegimePill(sensexRegime)}
+              <span className="spot-atm-tag mono">ATM {sensexAtm}</span>
+            </div>
           </div>
           <div className="spot-body">
             <span className={`spot-ltp mono ${sensexChange >= 0 ? 'price-up' : 'price-down'}`}>

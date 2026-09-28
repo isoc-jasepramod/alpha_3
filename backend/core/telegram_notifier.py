@@ -242,17 +242,29 @@ class TelegramNotifier:
         reward_pts = abs(tgt - entry)
         rr_str = f"1:{reward_pts / risk_pts:.1f}" if risk_pts > 0 else "1:2.0"
 
+        # Use pre-computed targets from Risk Governor (available in signal payload)
+        target_1r = float(sig.get("target_1r", 0.0))
+        if target_1r <= 0:
+            # Fallback: for option buys, target is always ABOVE entry regardless of CE/PE
+            target_1r = entry + risk_pts
+
+        linked_str = ""
+        linked_alert_id = details.get("linked_alert_id")
+        if linked_alert_id:
+            linked_str = f"🔗 <b>Linked Pre-Alert:</b> <code>{linked_alert_id}</code>\n"
+
         return (
-            f"🚀 <b>ALPHA 3.0 — NEW SIGNAL</b>\n"
+            f"🚀 <b>ALPHA 3.0 — TRADE SIGNAL (ACTIONABLE)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Instrument:</b> <code>{inst}</code> | <b>Strike:</b> <code>{int(strike)} {opt_type}</code>\n"
             f"<b>Symbol:</b> <code>{symbol}</code>\n"
             f"<b>Strategy:</b> <code>{strat_display}</code>\n"
+            f"{linked_str}"
             f"<b>Action:</b> {dir_badge}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>Entry Price:</b> <code>₹{entry:.2f}</code>\n"
             f"🛑 <b>Stop Loss:</b> <code>₹{sl:.2f}</code> (-{risk_pts:.1f} pts)\n"
-            f"🏁 <b>Target (+1.0R):</b> <code>₹{entry + (risk_pts if opt_type=='CE' else -risk_pts):.2f}</code> (Book 50%, Trail BE)\n"
+            f"🏁 <b>Target (+1.0R):</b> <code>₹{target_1r:.2f}</code> (Book 50%, Trail BE)\n"
             f"🏆 <b>Target (+2.0R):</b> <code>₹{tgt:.2f}</code> (+{reward_pts:.1f} pts)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Position:</b> <code>{lots} Lot(s) ({qty} Qty)</code>\n"
@@ -262,7 +274,7 @@ class TelegramNotifier:
         )
 
     def format_radar_html(self, alert: Dict[str, Any]) -> str:
-        """Formats a RADAR_PRE_ALERT (e.g. CONFLUENCE_PRE_ENTRY) into clean HTML."""
+        """Formats a RADAR_PRE_ALERT into clean, honest HTML with explicit WATCH ONLY tier."""
         alert_type = alert.get("alert_type", "PRE_ALERT")
         inst = alert.get("instrument", "NIFTY")
         direction = alert.get("direction", "CE")
@@ -272,17 +284,17 @@ class TelegramNotifier:
         details = alert.get("details", {})
 
         is_confluence = "CONFLUENCE" in alert_type
-        is_gamma_watch = "GAMMA_WATCH" in alert_type
+        is_gamma = "GAMMA" in alert_type
 
-        if is_gamma_watch:
-            header = "⚡ <b>ELEVATED RADAR: GAMMA SCALP IMMINENT (0-DTE)</b>"
-            bias_badge = "🟢 <b>CE BREAKOUT IMMINENT</b>" if direction == "CE" else "🔴 <b>PE BREAKDOWN IMMINENT</b>"
+        if is_gamma:
+            header = "👀 <b>RADAR WATCH: GAMMA SETUP FORMING (0-DTE)</b>"
+            side_badge = "🟡 <b>TESTING RANGE TOP (WATCHING / REVERSAL POSSIBLE)</b>" if direction == "CE" else "🟡 <b>TESTING RANGE BOTTOM (WATCHING / REVERSAL POSSIBLE)</b>"
         elif is_confluence:
-            header = "🎯 <b>ELEVATED RADAR: CONFLUENCE SETUP</b>"
-            bias_badge = f"<b>{direction}</b>"
+            header = "🎯 <b>RADAR WATCH: CONFLUENCE SETUP</b>"
+            side_badge = f"<b>{direction} SETUP MONITORING</b>"
         else:
-            header = f"📡 <b>RADAR PRE-ALERT: {alert_type}</b>"
-            bias_badge = f"<b>{direction}</b>"
+            header = f"📡 <b>RADAR WATCH: {alert_type}</b>"
+            side_badge = f"<b>{direction}</b>"
 
         plan_str = ""
         if is_confluence and details:
@@ -291,7 +303,7 @@ class TelegramNotifier:
             t1 = details.get("target_1", 0.0)
             t2 = details.get("target_2", 0.0)
             plan_str = (
-                f"\n📋 <b>Pre-Calculated Action Plan:</b>\n"
+                f"\n📋 <b>Hypothetical Action Plan (If Break Occurs):</b>\n"
                 f"• <b>Focus Strike:</b> <code>{int(entry_strike)} {direction}</code>\n"
                 f"• <b>Spot SL:</b> <code>{sl:.1f}</code>\n"
                 f"• <b>Projected T1:</b> <code>{t1:.0f}</code>\n"
@@ -301,11 +313,13 @@ class TelegramNotifier:
         return (
             f"{header}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Instrument:</b> <code>{inst}</code> | <b>Bias:</b> {bias_badge}\n"
-            f"<b>Setup:</b> {title}\n"
+            f"<b>Instrument:</b> <code>{inst}</code> | <b>Side:</b> {side_badge}\n"
+            f"<b>Tier:</b> <code>WATCH ONLY — NOT A TRADE</code>\n"
+            f"<b>Observation:</b> {title}\n"
             f"{plan_str}"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"ℹ️ {message}\n"
+            f"⚠️ <i>Advisory heads-up only. Price frequently reverses off boundaries. DO NOT execute orders on WATCH alerts.</i>\n"
             f"🕒 <i>{now_str}</i>"
         )
 

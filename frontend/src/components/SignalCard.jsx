@@ -89,10 +89,22 @@ export function SignalCard({ signal }) {
             <span className={`dir-badge ${direction === 'CE' ? 'ce' : 'pe'}`}>
               {instrument} {direction}
             </span>
+            <span className="strategy-tag" style={{ background: 'rgba(0, 230, 118, 0.15)', color: 'var(--ce-green)', borderColor: 'rgba(0, 230, 118, 0.35)', fontWeight: 700 }}>
+              ACTIONABLE TRADE
+            </span>
             <span className="strategy-tag">{strategy.replace('_', ' ')}</span>
             {confidence && (
               <span className="strategy-tag" style={{ background: 'rgba(0, 240, 255, 0.15)', color: '#00f0ff', borderColor: 'rgba(0, 240, 255, 0.3)' }}>
                 {confidence}% CONF
+              </span>
+            )}
+            {signal.details?.linked_alert_id && (
+              <span
+                className="strategy-tag mono"
+                style={{ fontSize: '0.62rem', background: 'rgba(255, 255, 255, 0.05)', color: 'var(--text-muted)' }}
+                title={`Linked to Pre-Alert: ${signal.details.linked_alert_id}`}
+              >
+                LINKED: {signal.details.linked_alert_id.split('-').slice(0, 3).join('-')}
               </span>
             )}
           </div>

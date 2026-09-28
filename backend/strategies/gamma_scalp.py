@@ -41,9 +41,14 @@ class ExpiryDayGammaScalp(BaseStrategy):
         self.enforce_expiry_day = cfg.get("enforce_expiry_day", False)
 
         # Premium staleness check: reject if premium already surged > X% from its 3-min low
-        self.premium_staleness_pct = cfg.get("premium_staleness_pct", 10.0)
-        # WATCH alert proximity: fire when spot is within X% of H_mid/L_mid
-        self.watch_proximity_pct = cfg.get("watch_proximity_pct", 0.15)
+        self.premium_staleness_pct = float(cfg.get("premium_staleness_pct", 10.0))
+        # Tighter proximity: 0.08% (tightened from 0.15% to prevent firing too far from boundary)
+        self.watch_proximity_pct = float(cfg.get("watch_proximity_pct", 0.08))
+        # Real velocity requirement: approach speed towards boundary (>= 0.04%/30s)
+        self.min_approach_velocity_pct = float(cfg.get("min_approach_velocity_pct", 0.04))
+        # 5-min rate limit and directional lock across CE/PE
+        self.armed_cooldown_sec = float(cfg.get("armed_cooldown_sec", 300.0))
+        self.armed_ttl_sec = float(cfg.get("armed_ttl_sec", 300.0))
 
         # Midday consolidation range
         self.mid_ranges: Dict[str, Dict[str, float]] = {
@@ -74,9 +79,17 @@ class ExpiryDayGammaScalp(BaseStrategy):
         # Rolling option premium low tracker (3-minute window) for staleness check
         self.opt_premium_low: Dict[str, deque] = {}  # token -> deque of (ts, ltp)
 
-        # WATCH alert tracking (avoid spamming)
-        self._watch_emitted: Dict[str, float] = {}  # "NIFTY_CE" -> last_watch_ts
-        self._watch_cooldown_sec = 120  # 2 min between WATCH alerts
+        # Two-stage Armed Setup Tracking: inst -> armed state dict
+        self.armed_setups: Dict[str, Optional[Dict[str, Any]]] = {
+            "NIFTY": None,
+            "SENSEX": None
+        }
+
+        # Rate limit & directional lock tracker per instrument: inst -> last_armed_ts
+        self._last_armed_ts: Dict[str, float] = {
+            "NIFTY": 0.0,
+            "SENSEX": 0.0
+        }
 
     def _in_consolidation_window(self, dt: datetime) -> bool:
         t = dt.time()
@@ -183,7 +196,7 @@ class ExpiryDayGammaScalp(BaseStrategy):
             if closed:
                 self.spot_3m_history[inst].append((ts, closed["close"]))
 
-            # 4. WATCH alert: Pre-breakout proximity alert
+            # 4. Two-Stage Flow: Clean GAMMA_ARMED Pre-Alert with Directional Lock & 5-min Rate Limit
             if self._in_gamma_window(now_dt):
                 rng = self.mid_ranges.get(inst, {})
                 if rng.get("finalized"):
@@ -193,48 +206,81 @@ class ExpiryDayGammaScalp(BaseStrategy):
 
                     # Check range quality first
                     if 0 < mid_range <= (self.max_mid_range_pct * ltp):
-                        proximity_threshold = ltp * self.watch_proximity_pct / 100.0
+                        proximity_threshold = ltp * (self.watch_proximity_pct / 100.0)
                         tick_vel = self._compute_tick_velocity(inst, lookback_sec=30.0)
 
-                        # CE WATCH: spot approaching H_mid from below with positive velocity
-                        if 0 < (h_mid - ltp) <= proximity_threshold and tick_vel > 0.02:
-                            watch_key = f"{inst}_CE"
-                            last_watch = self._watch_emitted.get(watch_key, 0)
-                            if ts - last_watch > self._watch_cooldown_sec:
-                                self._watch_emitted[watch_key] = ts
-                                logger.warning(
-                                    f"👀 [GAMMA WATCH] {inst} spot {ltp:.1f} approaching H_mid {h_mid:.1f} "
+                        # Enforce 5-minute rate limit & directional lock per instrument
+                        last_armed = self._last_armed_ts.get(inst, 0.0)
+                        can_arm = (ts - last_armed) >= self.armed_cooldown_sec
+
+                        if can_arm:
+                            # CE Setup: spot approaching H_mid from below with real velocity
+                            if 0 < (h_mid - ltp) <= proximity_threshold and tick_vel >= self.min_approach_velocity_pct:
+                                self._last_armed_ts[inst] = ts
+                                logger.info(
+                                    f"👀 [GAMMA ARMED] {inst} spot {ltp:.1f} testing range top {h_mid:.1f} "
                                     f"(gap: {h_mid - ltp:.1f} pts, velocity: +{tick_vel:.3f}%/30s). "
-                                    f"CE breakout imminent — prepare to execute!"
+                                    f"Watching for breakout or rejection — NOT A TRADE."
                                 )
-                                self.emit_radar_alert(
-                                    alert_type="GAMMA_WATCH",
+                                alert = self.emit_radar_alert(
+                                    alert_type="GAMMA_ARMED",
                                     instrument=inst,
                                     direction="CE",
-                                    title=f"👀 {inst} Gamma Scalp Imminent",
-                                    message=f"{inst} spot ({ltp:.1f}) is within {h_mid - ltp:.1f} pts of H_mid ({h_mid:.1f}) with +{tick_vel:.3f}%/30s velocity! Prepare for CE expansion.",
+                                    title=f"👀 {inst} Gamma Setup Forming (Range Top Test)",
+                                    message=f"{inst} spot ({ltp:.1f}) is testing range top ({h_mid:.1f}, gap: {h_mid - ltp:.1f} pts) with +{tick_vel:.3f}%/30s velocity. Watching for breakout or rejection — NOT A TRADE.",
+                                    meta_details={
+                                        "h_mid": h_mid,
+                                        "l_mid": l_mid,
+                                        "gap_pts": round(h_mid - ltp, 1),
+                                        "velocity": round(tick_vel, 3),
+                                        "tier": "WATCH",
+                                        "honest_note": "Watching range top, reversal possible. NOT A TRADE."
+                                    },
                                     now_ts=ts
                                 )
+                                if alert:
+                                    self.armed_setups[inst] = {
+                                        "alert_id": alert["id"],
+                                        "direction": "CE",
+                                        "armed_ts": ts,
+                                        "expires_at": ts + self.armed_ttl_sec,
+                                        "h_mid": h_mid,
+                                        "l_mid": l_mid
+                                    }
 
-                        # PE WATCH: spot approaching L_mid from above with negative velocity
-                        elif 0 < (ltp - l_mid) <= proximity_threshold and tick_vel < -0.02:
-                            watch_key = f"{inst}_PE"
-                            last_watch = self._watch_emitted.get(watch_key, 0)
-                            if ts - last_watch > self._watch_cooldown_sec:
-                                self._watch_emitted[watch_key] = ts
-                                logger.warning(
-                                    f"👀 [GAMMA WATCH] {inst} spot {ltp:.1f} approaching L_mid {l_mid:.1f} "
+                            # PE Setup: spot approaching L_mid from above with real velocity
+                            elif 0 < (ltp - l_mid) <= proximity_threshold and tick_vel <= -self.min_approach_velocity_pct:
+                                self._last_armed_ts[inst] = ts
+                                logger.info(
+                                    f"👀 [GAMMA ARMED] {inst} spot {ltp:.1f} testing range bottom {l_mid:.1f} "
                                     f"(gap: {ltp - l_mid:.1f} pts, velocity: {tick_vel:.3f}%/30s). "
-                                    f"PE breakdown imminent — prepare to execute!"
+                                    f"Watching for breakdown or rejection — NOT A TRADE."
                                 )
-                                self.emit_radar_alert(
-                                    alert_type="GAMMA_WATCH",
+                                alert = self.emit_radar_alert(
+                                    alert_type="GAMMA_ARMED",
                                     instrument=inst,
                                     direction="PE",
-                                    title=f"👀 {inst} Gamma Scalp Imminent",
-                                    message=f"{inst} spot ({ltp:.1f}) is within {ltp - l_mid:.1f} pts of L_mid ({l_mid:.1f}) with {tick_vel:.3f}%/30s velocity! Prepare for PE expansion.",
+                                    title=f"👀 {inst} Gamma Setup Forming (Range Bottom Test)",
+                                    message=f"{inst} spot ({ltp:.1f}) is testing range bottom ({l_mid:.1f}, gap: {ltp - l_mid:.1f} pts) with {tick_vel:.3f}%/30s velocity. Watching for breakdown or rejection — NOT A TRADE.",
+                                    meta_details={
+                                        "h_mid": h_mid,
+                                        "l_mid": l_mid,
+                                        "gap_pts": round(ltp - l_mid, 1),
+                                        "velocity": round(tick_vel, 3),
+                                        "tier": "WATCH",
+                                        "honest_note": "Watching range bottom, reversal possible. NOT A TRADE."
+                                    },
                                     now_ts=ts
                                 )
+                                if alert:
+                                    self.armed_setups[inst] = {
+                                        "alert_id": alert["id"],
+                                        "direction": "PE",
+                                        "armed_ts": ts,
+                                        "expires_at": ts + self.armed_ttl_sec,
+                                        "h_mid": h_mid,
+                                        "l_mid": l_mid
+                                    }
 
 
             return None
@@ -327,6 +373,21 @@ class ExpiryDayGammaScalp(BaseStrategy):
         if not (is_ce_breakout or is_pe_breakout):
             return None
 
+        # TWO-STAGE LINKAGE REQUIREMENT:
+        # Every CONFIRMED signal MUST link back to an active GAMMA_ARMED alert.
+        # If no armed alert exists, or if it expired, breakout without pre-alert is rejected!
+        armed = self.armed_setups.get(inst)
+        if not armed or armed.get("direction") != opt_type or ts > armed.get("expires_at", 0):
+            logger.debug(
+                f"🛡️ [GAMMA SCALP] {inst} {opt_type} breakout at {curr_spot:.1f} suppressed: "
+                f"no active preceding GAMMA_ARMED alert linked."
+            )
+            return None
+
+        linked_alert_id = armed.get("alert_id")
+        # Clear armed setup so it cannot trigger multiple trades from a single alert
+        self.armed_setups[inst] = None
+
         # PREMIUM STALENESS CHECK: Reject if premium already surged from its 3-min low
         premium_3m_low = self._get_premium_3m_low(token, ts)
         if premium_3m_low > 0:
@@ -382,7 +443,8 @@ class ExpiryDayGammaScalp(BaseStrategy):
             return None
 
         logger.info(
-            f"⚡ [GAMMA SCALP] Triggered for {symbol} ({opt_type})! "
+            f"⚡ [GAMMA SCALP] CONFIRMED Trigger for {symbol} ({opt_type})! "
+            f"Linked to Pre-Alert: {linked_alert_id} | "
             f"Confidence: {confidence}%, Premium: {ltp:.1f}, "
             f"Tick Velocity: {tick_velocity:.3f}%/30s, 3m-RoC: {roc_3m:.2f}%, "
             f"Spot: {curr_spot:.1f}, 3m-Low Premium: ₹{premium_3m_low:.1f}"
@@ -401,6 +463,7 @@ class ExpiryDayGammaScalp(BaseStrategy):
             confidence=confidence,
             custom_sl_spot=custom_sl,
             meta_details={
+                "linked_alert_id": linked_alert_id,
                 "roc_3m": round(roc_3m, 2),
                 "tick_velocity_30s": round(tick_velocity, 3),
                 "h_mid": h_mid,
@@ -409,6 +472,7 @@ class ExpiryDayGammaScalp(BaseStrategy):
                 "entry_premium": ltp,
                 "premium_3m_low": round(premium_3m_low, 2),
                 "custom_sl": round(custom_sl, 1),
-                "confidence": confidence
+                "confidence": confidence,
+                "tier": "ACTIONABLE"
             }
         )

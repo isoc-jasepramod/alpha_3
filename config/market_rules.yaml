@@ -86,7 +86,10 @@ strategies:
     min_vol_multiplier: 2.5
     vol_sma_period: 20
     premium_staleness_pct: 10.0     # reject if premium already surged >10% from 3-min low
-    watch_proximity_pct: 0.15       # fire WATCH alert when spot within 0.15% of H_mid/L_mid
+    watch_proximity_pct: 0.08       # tightened from 0.15% to 0.08% for clean boundary proximity
+    min_approach_velocity_pct: 0.04 # real velocity required to arm (≥0.04%/30s approach)
+    armed_cooldown_sec: 300.0       # 5-min rate limit & directional lock across CE/PE
+    armed_ttl_sec: 300.0            # Validity window for armed setup awaiting breakout
 
   momentum_impulse:
     enabled: true

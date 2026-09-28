@@ -8,6 +8,7 @@ export function useWebSocketStream(onNewSignal, onSignalResolved, onRadarAlert) 
     NIFTY: { ltp: 23346.4, change: 0, change_pct: 0, atm: 23350, open: 23346.4, high: 23346.4, low: 23346.4 },
     SENSEX: { ltp: 74294.96, change: 0, change_pct: 0, atm: 74300, open: 74294.96, high: 74294.96, low: 74294.96 }
   });
+  const [regimes, setRegimes] = useState({ NIFTY: {}, SENSEX: {} });
   const [telemetry, setTelemetry] = useState({
     total_equity: 100000.0,
     realized_pnl: 0.0,
@@ -49,6 +50,9 @@ export function useWebSocketStream(onNewSignal, onSignalResolved, onRadarAlert) 
               if (data.telemetry.spot_data) {
                 setSpotData(data.telemetry.spot_data);
               }
+              if (data.telemetry.regimes) {
+                setRegimes(data.telemetry.regimes);
+              }
             }
           } else if (data.type === 'TICK_BATCH') {
             // 250ms batch update from backend
@@ -57,6 +61,9 @@ export function useWebSocketStream(onNewSignal, onSignalResolved, onRadarAlert) 
             }
             if (data.spot_data) {
               setSpotData(data.spot_data);
+            }
+            if (data.regimes) {
+              setRegimes(data.regimes);
             }
           } else if (data.event === 'NEW_SIGNAL') {
             const sig = data.signal;
@@ -129,6 +136,9 @@ export function useWebSocketStream(onNewSignal, onSignalResolved, onRadarAlert) 
           if (t.spot_data) {
             setSpotData(t.spot_data);
           }
+          if (t.regimes) {
+            setRegimes(t.regimes);
+          }
         }
       } catch (e) {}
     }, 2000);
@@ -141,7 +151,7 @@ export function useWebSocketStream(onNewSignal, onSignalResolved, onRadarAlert) 
     };
   }, [connect]);
 
-  return { connected, activeSignals, radarAlerts, dismissRadarAlert, telemetry, spotData };
+  return { connected, activeSignals, radarAlerts, dismissRadarAlert, telemetry, spotData, regimes };
 }
 
 

@@ -82,6 +82,8 @@ class BaseStrategy(ABC):
             "instrument": instrument,
             "direction": direction,
             "alert_type": alert_type,
+            "tier": "WATCH",
+            "is_trade": False,
             "title": title,
             "message": message,
             "timestamp": ts,
@@ -210,6 +212,9 @@ class BaseStrategy(ABC):
         if custom_sl_spot is not None:
             details["custom_sl_spot"] = custom_sl_spot
 
+        details["tier"] = "ACTIONABLE"
+        details["is_trade"] = True
+
         sig_id = f"SIG-{datetime.now().strftime('%Y%m%d%H%M%S')}-{instrument}-{option_type}-{str(uuid.uuid4())[:4].upper()}"
         return {
             "signal_id": sig_id,
@@ -226,6 +231,8 @@ class BaseStrategy(ABC):
             "lot_size": lot_size,
             "confidence": confidence,
             "custom_sl_spot": custom_sl_spot,
+            "tier": "ACTIONABLE",
+            "is_trade": True,
             "details": details
         }
 
