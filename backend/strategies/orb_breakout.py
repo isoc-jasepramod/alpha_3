@@ -19,9 +19,10 @@ class VolumeBackedORB(BaseStrategy):
     PE Trigger: 5-min candle closes < (L_ORB - delta) with RVOL >= 1.50.
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, regime_filter: Optional[Any] = None):
         super().__init__(name="ORB_BREAKOUT")
         cfg = config or {}
+        self.regime_filter = regime_filter
         self.start_time = cfg.get("start_time", "09:15:00")
         self.end_time = cfg.get("end_time", "10:30:00")
         self.orb_start_time = cfg.get("orb_window_start", "09:15:00")
@@ -33,6 +34,17 @@ class VolumeBackedORB(BaseStrategy):
         self.breakout_strength_pct = cfg.get("breakout_strength_pct", 0.05)
         self.max_gap_pct = cfg.get("max_gap_pct", 0.40) # 0.40% gap threshold for Gap-and-Go
         self.extreme_gap_pct = cfg.get("extreme_gap_pct", 1.50) # 1.50% hard cutoff for hazardous gaps
+
+        # Re-entry cap: prevent re-firing the SAME failed breakout every 5 min (the 29-Sep
+        # incident where ORB went 0/20 on a whipsaw day). Max triggers per instrument+direction
+        # per day; also a longer cooldown between ORB triggers than the base 60s.
+        self.max_triggers_per_dir = int(cfg.get("max_triggers_per_dir", 2))
+        self.retrigger_cooldown_sec = float(cfg.get("retrigger_cooldown_sec", 900.0))  # 15 min
+        # inst -> {"CE": count, "PE": count, "date": date, "last_trigger_ts": ts}
+        self._trigger_counts: Dict[str, Dict[str, Any]] = {
+            "NIFTY": {"CE": 0, "PE": 0, "date": None, "last_trigger_ts": 0.0},
+            "SENSEX": {"CE": 0, "PE": 0, "date": None, "last_trigger_ts": 0.0},
+        }
 
         # High/Low for ORB range per instrument
         self.orb_ranges: Dict[str, Dict[str, Any]] = {
@@ -72,6 +84,47 @@ class VolumeBackedORB(BaseStrategy):
         if inst == "SENSEX":
             return (60.0, 500.0)
         return (self.min_range, self.max_range)
+
+    def _reset_trigger_counts_if_new_day(self, inst: str, day, ts: float):
+        tc = self._trigger_counts.setdefault(inst, {"CE": 0, "PE": 0, "date": None, "last_trigger_ts": 0.0})
+        if tc["date"] != day:
+            tc["date"] = day
+            tc["CE"] = 0
+            tc["PE"] = 0
+            tc["last_trigger_ts"] = 0.0
+
+    def _can_fire_breakout(self, inst: str, direction: str, ts: float) -> tuple[bool, str]:
+        """
+        Re-entry guard: caps ORB triggers per instrument+direction per day and enforces
+        a cooldown between triggers so the same failed breakout is not re-fired repeatedly.
+        """
+        tc = self._trigger_counts.get(inst, {})
+        if tc.get(direction, 0) >= self.max_triggers_per_dir:
+            return False, f"daily {direction} trigger cap reached ({self.max_triggers_per_dir})"
+        if (ts - tc.get("last_trigger_ts", 0.0)) < self.retrigger_cooldown_sec:
+            remaining = int(self.retrigger_cooldown_sec - (ts - tc.get("last_trigger_ts", 0.0)))
+            return False, f"re-entry cooldown active ({remaining}s remaining)"
+        return True, "ok"
+
+    def _regime_allows(self, inst: str, direction: str) -> tuple[bool, str]:
+        """
+        Regime gate: block ORB breakouts that fight the session regime.
+        - CHOPPY: block all (whipsaw days are where ORB gets chopped, e.g. 29-Sep).
+        - TRENDING_BULL: block PE (counter-trend). TRENDING_BEAR: block CE (counter-trend).
+        - NEUTRAL: allow (breakout may be establishing a new trend).
+        """
+        if not self.regime_filter:
+            return True, "no regime filter"
+        st = self.regime_filter.get_regime(inst)
+        regime = st.get("regime", "NEUTRAL")
+        score = st.get("score", 50.0)
+        if regime == "CHOPPY":
+            return False, f"regime CHOPPY (score {score:.0f}) — breakouts unreliable"
+        if regime == "TRENDING_BULL" and direction == "PE":
+            return False, f"counter-trend: PE blocked in TRENDING_BULL (score {score:.0f})"
+        if regime == "TRENDING_BEAR" and direction == "CE":
+            return False, f"counter-trend: CE blocked in TRENDING_BEAR (score {score:.0f})"
+        return True, f"{regime} (score {score:.0f})"
 
     def _in_orb_window(self, dt: datetime) -> bool:
         t = dt.time()
@@ -142,6 +195,7 @@ class VolumeBackedORB(BaseStrategy):
                 dt_info["gap_dir"] = None
                 dt_info["gap_pct"] = 0.0
                 self.orb_ranges[inst] = {"high": -1.0, "low": 1e9, "finalized": False, "pending_signal": None}
+                self._reset_trigger_counts_if_new_day(inst, today, ts)
 
             dt_info["last_close"] = ltp
 
@@ -340,10 +394,28 @@ class VolumeBackedORB(BaseStrategy):
                     logger.warning(f"⚠️ [ORB SUPPRESSED] {symbol} ({opt_type}) score {confidence} < threshold {self.confidence_threshold}. Conditions: {conditions}")
                     return None
 
+                # RE-ENTRY GUARD: do not re-fire the same failed breakout repeatedly
+                can_fire, reentry_reason = self._can_fire_breakout(inst, opt_type, ts)
+                if not can_fire:
+                    logger.info(f"🛡️ [ORB RE-ENTRY GUARD] {symbol} ({opt_type}) suppressed: {reentry_reason}")
+                    self.orb_ranges[inst]["pending_signal"] = None
+                    return None
+
+                # REGIME GATE: block breakouts that fight the session regime (CHOPPY / counter-trend)
+                regime_ok, regime_reason = self._regime_allows(inst, opt_type)
+                if not regime_ok:
+                    logger.info(f"🛡️ [ORB REGIME FILTER] {symbol} ({opt_type}) suppressed: {regime_reason}")
+                    self.orb_ranges[inst]["pending_signal"] = None
+                    return None
+
                 sig_key = f"ORB_{inst}_{opt_type}_{strike}"
                 if self.can_trigger(sig_key, ts):
                     self.orb_ranges[inst]["pending_signal"] = None
-                    logger.info(f"⚡ [ORB BREAKOUT] Triggered for {symbol} ({opt_type})! RVOL: {rvol:.2f}, Confidence: {confidence}%, Spot: {pending['close']}")
+                    # Record the trigger for the re-entry cap
+                    tc = self._trigger_counts.setdefault(inst, {"CE": 0, "PE": 0, "date": now_dt.date(), "last_trigger_ts": 0.0})
+                    tc[opt_type] = tc.get(opt_type, 0) + 1
+                    tc["last_trigger_ts"] = ts
+                    logger.info(f"⚡ [ORB BREAKOUT] Triggered for {symbol} ({opt_type})! RVOL: {rvol:.2f}, Confidence: {confidence}%, Spot: {pending['close']} | Regime: {regime_reason} | {opt_type} #{tc[opt_type]}/{self.max_triggers_per_dir} today")
 
                     return self.build_signal_payload(
                         instrument=inst,

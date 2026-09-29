@@ -191,3 +191,68 @@ class SignalTracker:
                     logger.info(f"Updated DB signal {sig['signal_id']} status: {sig['status']} (Exit: {sig.get('exit_price')}, PnL: ₹{sig.get('theoretical_pnl')})")
         except Exception as e:
             logger.error(f"Failed to update DB for signal {sig.get('signal_id')}: {e}")
+
+    async def sweep_eod_signals(self) -> list:
+        """
+        End-of-Day sweep: resolves all signals still in ACTIVE status.
+        Called at 15:25 IST. Marks them as EOD_EXPIRED, records last known LTP
+        as exit price, computes theoretical PnL, persists to DB, and broadcasts.
+        Returns list of expired signal dicts for Telegram summary.
+        """
+        now_ts = datetime.now(timezone.utc).timestamp()
+        expired_signals = []
+
+        for sig_id, sig in list(self.active_signals.items()):
+            if sig.get("status") not in (None, "ACTIVE"):
+                continue
+
+            entry = float(sig.get("entry_price", 0.0))
+            last_ltp = float(sig.get("live_ltp", entry))
+            qty = int(sig.get("quantity", 1))
+            pnl = round((last_ltp - entry) * qty, 2)
+
+            sig["status"] = "EOD_EXPIRED"
+            sig["exit_price"] = last_ltp
+            sig["theoretical_pnl"] = pnl
+            sig["resolved_ts"] = now_ts
+            expired_signals.append(sig)
+
+            icon = "📊" if pnl >= 0 else "📉"
+            logger.info(
+                f"{icon} [EOD EXPIRED] Signal {sig_id} ({sig.get('option_symbol')}) "
+                f"expired at market close. Last LTP: ₹{last_ltp:.2f}, "
+                f"PnL: ₹{pnl:+,.2f}"
+            )
+
+            # Record PnL in Risk Governor
+            if pnl != 0.0:
+                self.risk_governor.record_trade_result(pnl)
+
+            # Persist to PostgreSQL
+            await self._persist_signal_resolution(sig)
+
+            # Broadcast resolution to dashboard
+            await self.redis_bus.publish_signal({
+                "event": "SIGNAL_RESOLVED",
+                "signal": sig
+            })
+
+            # Notify strategy callbacks
+            for cb in self._resolution_callbacks:
+                try:
+                    cb(sig)
+                except Exception as e:
+                    logger.error(f"EOD resolution callback error: {e}")
+
+        # Clear all signals (resolved + expired) after EOD sweep
+        self.active_signals.clear()
+
+        if expired_signals:
+            logger.warning(
+                f"🏁 [EOD SWEEP] Expired {len(expired_signals)} active signal(s) at market close. "
+                f"Total EOD PnL: ₹{sum(s.get('theoretical_pnl', 0) for s in expired_signals):+,.2f}"
+            )
+        else:
+            logger.info("🏁 [EOD SWEEP] No active signals at market close.")
+
+        return expired_signals

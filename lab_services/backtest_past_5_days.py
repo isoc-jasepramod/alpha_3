@@ -183,6 +183,42 @@ def simulate_gamma_scalp(df: pd.DataFrame, inst: str, weekday: int, date_str: st
             }
     return None
 
+def _compute_regime_series(df3: pd.DataFrame, inst: str) -> pd.Series:
+    """
+    Computes the live RegimeFilter's composite 4-component score for EVERY 3-min bar,
+    cumulatively (no look-ahead). Returns a pd.Series indexed like df3 with the score.
+
+    Mirrors backend/strategies/regime_filter.py exactly:
+      Score = 0.30*ADX + 0.30*ER + 0.25*VWAP_Persistence + 0.15*VWAP_Slope
+    Uses the shared live RegimeFilter class so backtest and production stay in lockstep.
+    """
+    import os as _os, sys as _sys
+    _root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), ".."))
+    if _root not in _sys.path:
+        _sys.path.insert(0, _root)
+    from backend.strategies.regime_filter import RegimeFilter
+    from backend.strategies.indicators import IncrementalADX, IncrementalVWAP
+
+    rf = RegimeFilter()
+    adx_ind = IncrementalADX(period=14)
+    vwap_ind = IncrementalVWAP()
+
+    scores = []
+    for ts, row in df3.iterrows():
+        h = float(row["high"])
+        l = float(row["low"])
+        cl = float(row["close"])
+        vol = float(row["volume"]) if row["volume"] > 0 else 1000.0
+        typical = (h + l + cl) / 3.0
+        vwap_val = vwap_ind.update(typical, vol)
+        adx_val = adx_ind.update(h, l, cl)
+        candle = {"open": float(row["open"]), "high": h, "low": l, "close": cl, "volume": vol}
+        state = rf.update_candle(inst, candle, vwap_val, adx_val)
+        scores.append(state["score"])
+
+    return pd.Series(scores, index=df3.index)
+
+
 def simulate_vwap_ema(df: pd.DataFrame, inst: str, date_str: str) -> List[Dict[str, Any]]:
     df3 = df.resample("3min").agg({
         "open": "first",
@@ -198,12 +234,24 @@ def simulate_vwap_ema(df: pd.DataFrame, inst: str, date_str: str) -> List[Dict[s
     v = df3["volume"].cumsum()
     df3["vwap"] = pv / v.replace(0, 1)
 
+    # REGIME GATE: compute cumulative regime score per bar.
+    # VWAP_EMA continuation setups (no volume-contact/dry-up context available in this
+    # vectorised sim) are trend-following pullbacks, so they require a TRENDING regime
+    # (score >= 65). CHOPPY and NEUTRAL bars are suppressed.
+    df3["regime_score"] = _compute_regime_series(df3, inst)
+    TRENDING_THRESHOLD = 65.0
+
     trades = []
     scan_window = df3.between_time("09:45", "14:45")
     last_trade_time = datetime.min
 
     for ts, row in scan_window.iterrows():
         if (ts.to_pydatetime() - last_trade_time).total_seconds() < 1800:
+            continue
+
+        # REGIME GATE: suppress VWAP_EMA pullback continuation unless session is TRENDING
+        regime_score = float(row.get("regime_score", 50.0))
+        if regime_score < TRENDING_THRESHOLD:
             continue
 
         c = float(row["close"])
@@ -260,6 +308,21 @@ def simulate_momentum_impulse(df: pd.DataFrame, inst: str, date_str: str) -> Lis
     thresh = 25.0 if inst == "NIFTY" else 75.0
     last_trade_time = datetime.min
 
+    # REGIME GATE: build a cumulative regime score on 3-min bars, then map each 1-min
+    # bar to the most recent COMPLETED 3-min bar's score (no look-ahead). Momentum arming
+    # is suppressed only in CHOPPY (score < NEUTRAL_THRESHOLD); TRENDING & NEUTRAL allowed.
+    NEUTRAL_THRESHOLD = 45.0
+    df3_regime = df.resample("3min").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+    }).dropna()
+    if len(df3_regime) > 0:
+        regime_3m = _compute_regime_series(df3_regime, inst)
+        # Shift by one bar so a 1-min tick only sees a 3-min score that already closed.
+        regime_3m_lagged = regime_3m.shift(1)
+        regime_1m = regime_3m_lagged.reindex(df.index, method="ffill")
+    else:
+        regime_1m = pd.Series(50.0, index=df.index)
+
     for i in range(3, len(df)):
         window = df.iloc[i-3:i+1]
         delta = float(window["close"].iloc[-1]) - float(window["close"].iloc[0])
@@ -269,6 +332,13 @@ def simulate_momentum_impulse(df: pd.DataFrame, inst: str, date_str: str) -> Lis
             continue
 
         if (ts.to_pydatetime() - last_trade_time).total_seconds() < 1800:
+            continue
+
+        # REGIME GATE: suppress arming in CHOPPY sessions
+        rscore = regime_1m.get(ts, 50.0)
+        if pd.isna(rscore):
+            rscore = 50.0
+        if float(rscore) < NEUTRAL_THRESHOLD:
             continue
 
         if delta <= -thresh:

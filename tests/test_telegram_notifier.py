@@ -58,7 +58,9 @@ def sample_resolution():
 def test_format_signal_html(sample_signal):
     notifier = TelegramNotifier(bot_token="test_token", chat_id="12345", enabled=True)
     html = notifier.format_signal_html(sample_signal)
-    assert "ALPHA 3.0 — NEW SIGNAL" in html
+    # A real trade must be clearly labeled as a TRADE SIGNAL (ACTIONABLE tier)
+    assert "TRADE SIGNAL" in html
+    assert "ACTIONABLE" in html
     assert "NIFTY" in html
     assert "23050 CE" in html
     assert "₹150.00" in html
@@ -70,7 +72,9 @@ def test_format_signal_html(sample_signal):
 def test_format_radar_html(sample_radar):
     notifier = TelegramNotifier(bot_token="test_token", chat_id="12345", enabled=True)
     html = notifier.format_radar_html(sample_radar)
-    assert "ELEVATED RADAR: CONFLUENCE SETUP" in html
+    # A radar alert must be clearly labeled WATCH-only, never as a trade
+    assert "RADAR WATCH: CONFLUENCE SETUP" in html
+    assert "NOT A TRADE" in html
     assert "Dual Gamma Wall Breakdown" in html
     assert "23050 CE" in html
     assert "23010.0" in html
@@ -112,7 +116,7 @@ async def test_queue_and_mock_dispatch(sample_signal):
         assert "sendMessage" in call_args[0][0]
         json_body = call_args[1]["json"]
         assert json_body["chat_id"] == "999888777"
-        assert "ALPHA 3.0 — NEW SIGNAL" in json_body["text"]
+        assert "TRADE SIGNAL" in json_body["text"]
 
         await notifier.close()
 

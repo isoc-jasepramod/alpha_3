@@ -153,6 +153,7 @@ class OptionChainPoller:
         logger.debug(f"[CHAIN POLLER] {inst}: PCR={pcr:.2f}, MaxPain={max_pain_strike:.0f}, StrikesTracked={len(active_strikes)}")
 
     async def _publish_radar_alert(self, inst: str, direction: str, alert_type: str, title: str, message: str, now_ts: float):
+        from backend.strategies.base_strategy import categorize_alert
         alert_payload = {
             "event": "RADAR_PRE_ALERT",
             "alert": {
@@ -160,9 +161,13 @@ class OptionChainPoller:
                 "instrument": inst,
                 "direction": direction,
                 "alert_type": alert_type,
+                "category": categorize_alert(alert_type),
+                "tier": "WATCH",
+                "is_trade": False,
                 "title": title,
                 "message": message,
                 "timestamp": now_ts,
+                "expires_in_sec": 75,
                 "iso_time": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
             }
         }

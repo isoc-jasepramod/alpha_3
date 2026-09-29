@@ -44,13 +44,42 @@ class MomentumImpulseDetector(BaseStrategy):
         self.window_sec = float(cfg.get("window_sec", 20.0))
         self.min_tick_count = int(cfg.get("min_tick_count", 4))
         self.min_directional_pct = float(cfg.get("min_directional_pct", 0.70))
-        self.radar_ratio = float(cfg.get("radar_velocity_ratio", 0.65))
+        # Lowered from 0.65 -> 0.50 so the heads-up fires earlier (at ~50% of full
+        # velocity) giving the trader real lead time before the full impulse completes.
+        self.radar_ratio = float(cfg.get("radar_velocity_ratio", 0.50))
+
+        # --- Acceleration pre-alert (earliest heads-up) ---
+        # Fires when velocity is *accelerating* (2nd derivative), which often precedes the
+        # full impulse by a few seconds. This is the earliest, lowest-confidence heads-up.
+        self.accel_enabled = bool(cfg.get("accel_enabled", True))
+        # Min points-per-second in the recent sub-window to consider it accelerating.
+        self.nifty_accel_min_recent_vel = float(cfg.get("nifty_accel_min_recent_vel", 2.5))
+        self.sensex_accel_min_recent_vel = float(cfg.get("sensex_accel_min_recent_vel", 7.5))
+        # Recent sub-window (s) whose velocity is compared against the older sub-window.
+        self.accel_recent_window_sec = float(cfg.get("accel_recent_window_sec", 5.0))
+        # Recent velocity must exceed older velocity by this ratio to count as accelerating.
+        self.accel_ratio = float(cfg.get("accel_ratio", 1.6))
 
         # Option expansion thresholds
         self.min_opt_surge_pct = float(cfg.get("min_opt_surge_pct", 3.5))
         self.max_opt_surge_pct = float(cfg.get("max_opt_surge_pct", 16.0))
         self.impulse_ttl_sec = float(cfg.get("impulse_ttl_sec", 25.0))
         self.cooldown_sec = float(cfg.get("cooldown_sec", 90.0))
+
+        # --- Post-impulse pullback entry (human-takeable) ---
+        # Chasing the vertical spike is a race a human loses (radar->trigger was ~1s on
+        # Sep 29). Instead, after an impulse arms we wait for the first shallow pullback
+        # that HOLDS above the impulse origin, then signal — a slower, real entry with a
+        # tight stop. The trader trades the pullback, not the spike.
+        self.pullback_enabled = bool(cfg.get("pullback_enabled", True))
+        # How far spot may retrace from the impulse peak, as a fraction of the impulse size.
+        # e.g. 0.50 => a pullback of up to half the move still counts as a valid shallow dip.
+        self.pullback_max_retrace = float(cfg.get("pullback_max_retrace", 0.50))
+        # Pullback must "hold": spot must resume in the impulse direction by at least this
+        # fraction of the impulse size off the pullback low/high before we signal.
+        self.pullback_resume_frac = float(cfg.get("pullback_resume_frac", 0.15))
+        # How long (s) after arming we keep waiting for a qualifying pullback.
+        self.pullback_window_sec = float(cfg.get("pullback_window_sec", 90.0))
 
         # Spot tick rolling history: inst -> deque of (ts, ltp)
         self.spot_ticks: Dict[str, deque] = {
@@ -82,6 +111,24 @@ class MomentumImpulseDetector(BaseStrategy):
             self.spot_ticks[inst].clear()
             self.spot_ticks[inst].append((now_ts - 5.0, ltp))
             self.spot_ticks[inst].append((now_ts, ltp))
+
+    def reset_session(self):
+        """
+        Clears all session-scoped state so nothing from day N leaks into day N+1
+        when the app runs continuously across sessions without a restart.
+
+        Resets:
+          - Active impulses (including any pending pullback entries)
+          - Spot and option tick buffers
+          - Radar alert cooldowns
+        """
+        for inst in list(self.active_impulses.keys()):
+            self.active_impulses[inst] = None
+        for inst in list(self.spot_ticks.keys()):
+            self.spot_ticks[inst].clear()
+        self.opt_ticks.clear()
+        self._radar_emitted.clear()
+        logger.info("🔄 [MOMENTUM_IMPULSE] Session state reset for next trading day.")
 
     def _in_session_window(self, dt: datetime) -> bool:
         t = dt.time()
@@ -142,6 +189,146 @@ class MomentumImpulseDetector(BaseStrategy):
             "tick_count": len(window_ticks)
         }
 
+    def _compute_acceleration(self, inst: str, cur_ts: float) -> Optional[Dict[str, Any]]:
+        """
+        Detects that spot is ACCELERATING: the velocity of the most recent sub-window is
+        meaningfully higher than the velocity of the sub-window just before it, and both
+        point the same way. This 2nd-derivative signal tends to precede the full impulse.
+
+        Returns {"direction", "recent_vel", "older_vel"} or None.
+        """
+        ticks = list(self.spot_ticks.get(inst, []))
+        if len(ticks) < self.min_tick_count + 1:
+            return None
+
+        cur_time = ticks[-1][0]
+        w = self.accel_recent_window_sec
+        recent_cut = cur_time - w
+        older_cut = cur_time - (2.0 * w)
+
+        recent = [(t, p) for (t, p) in ticks if t >= recent_cut]
+        older = [(t, p) for (t, p) in ticks if older_cut <= t < recent_cut]
+        if len(recent) < 2 or len(older) < 2:
+            return None
+
+        def _vel(seg):
+            dt = max(0.5, seg[-1][0] - seg[0][0])
+            return (seg[-1][1] - seg[0][1]) / dt  # pts/sec, signed
+
+        recent_vel = _vel(recent)
+        older_vel = _vel(older)
+
+        # Must be moving in a consistent direction across both sub-windows.
+        if recent_vel == 0.0 or (recent_vel > 0) != (older_vel >= 0):
+            return None
+
+        min_recent = self.nifty_accel_min_recent_vel if inst == "NIFTY" else self.sensex_accel_min_recent_vel
+        if abs(recent_vel) < min_recent:
+            return None
+
+        # Accelerating: recent speed exceeds older speed by the required ratio.
+        if abs(recent_vel) < abs(older_vel) * self.accel_ratio:
+            return None
+
+        return {
+            "direction": "CE" if recent_vel > 0 else "PE",
+            "recent_vel": recent_vel,
+            "older_vel": older_vel
+        }
+
+    def _track_pullback(self, inst: str, ltp: float, ts: float):
+        """
+        Tracks the post-impulse pullback for an armed impulse in AWAITING_PULLBACK phase.
+        Advances it to PULLBACK_READY (and emits an ACTIONABLE alert) once spot retraces
+        shallowly from the impulse peak and then resumes in the impulse direction.
+        """
+        if not self.pullback_enabled:
+            return
+        imp = self.active_impulses.get(inst)
+        if not imp or imp.get("phase") != "AWAITING_PULLBACK":
+            return
+        if ts > imp.get("expires_at", 0):
+            return
+
+        direction = imp["direction"]
+        spot_start = imp["spot_start"]
+        peak = imp.get("peak_spot", ltp)
+        impulse_size = abs(peak - spot_start)
+        if impulse_size <= 0.5:
+            return
+
+        max_retrace_pts = self.pullback_max_retrace * impulse_size
+        resume_pts = self.pullback_resume_frac * impulse_size
+
+        if direction == "CE":
+            # Update peak if still rising (no pullback yet).
+            if ltp >= peak:
+                imp["peak_spot"] = ltp
+                imp["pullback_extreme"] = ltp
+                imp["spot_curr"] = ltp
+                return
+            # We are below the peak: track the deepest pullback low.
+            imp["pullback_extreme"] = min(imp.get("pullback_extreme", ltp), ltp)
+            retrace = peak - imp["pullback_extreme"]
+            # Retrace must be a shallow dip, not a full reversal.
+            if retrace <= 0 or retrace > max_retrace_pts:
+                if retrace > max_retrace_pts:
+                    # Reversal too deep — this impulse is dead; drop it.
+                    self.active_impulses[inst] = None
+                return
+            # Resume: has price recovered up from the pullback low by resume_pts?
+            resumed = ltp - imp["pullback_extreme"]
+            if resumed >= resume_pts:
+                self._promote_to_pullback_ready(inst, imp, ltp, ts, retrace)
+        else:  # PE
+            if ltp <= peak:
+                imp["peak_spot"] = ltp
+                imp["pullback_extreme"] = ltp
+                imp["spot_curr"] = ltp
+                return
+            imp["pullback_extreme"] = max(imp.get("pullback_extreme", ltp), ltp)
+            retrace = imp["pullback_extreme"] - peak
+            if retrace <= 0 or retrace > max_retrace_pts:
+                if retrace > max_retrace_pts:
+                    self.active_impulses[inst] = None
+                return
+            resumed = imp["pullback_extreme"] - ltp
+            if resumed >= resume_pts:
+                self._promote_to_pullback_ready(inst, imp, ltp, ts, retrace)
+
+    def _promote_to_pullback_ready(self, inst: str, imp: Dict[str, Any], ltp: float, ts: float, retrace: float):
+        """Flip an armed impulse to PULLBACK_READY and emit a one-time ACTIONABLE alert."""
+        imp["phase"] = "PULLBACK_READY"
+        imp["pullback_entry_spot"] = ltp
+        # Give the option confirmation a fresh, generous window from the pullback point.
+        imp["expires_at"] = ts + self.impulse_ttl_sec
+        imp["spot_curr"] = ltp
+        direction = imp["direction"]
+        if not imp.get("pullback_alerted"):
+            imp["pullback_alerted"] = True
+            arrow = "▲" if direction == "CE" else "▼"
+            side = "higher-low" if direction == "CE" else "lower-high"
+            title = f"🎯 {inst} Momentum Pullback Entry Ready ({direction})"
+            msg = (
+                f"{arrow} {inst} pulled back ~{retrace:.1f} pts after the impulse and is holding a "
+                f"{side} at {ltp:.1f}. Human-takeable {direction} entry forming — awaiting ATM premium confirmation."
+            )
+            logger.success(f"🎯 [MOMENTUM PULLBACK READY] {title}: {msg}")
+            self.emit_radar_alert(
+                alert_type="MOMENTUM_PULLBACK_READY",
+                instrument=inst,
+                direction=direction,
+                title=title,
+                message=msg,
+                meta_details={
+                    "pullback_retrace_pts": round(retrace, 1),
+                    "entry_spot": round(ltp, 1),
+                    "impulse_origin": round(imp["spot_start"], 1),
+                    "peak_spot": round(imp.get("peak_spot", ltp), 1)
+                },
+                now_ts=ts
+            )
+
     def _get_opt_base_price(self, token: str, cur_ts: float, lookback_sec: float = 30.0) -> float:
         """Finds the lowest price in the rolling lookback window as the pre-impulse base."""
         ticks = self.opt_ticks.get(token, deque())
@@ -198,7 +385,38 @@ class MomentumImpulseDetector(BaseStrategy):
 
             direction = "CE" if delta > 0 else "PE"
 
-            # 1a. Radar Pre-Alert: Early heads-up when 65% of impulse velocity is achieved
+            # 1a-pre. Acceleration Pre-Alert: EARLIEST heads-up. Fires when spot velocity is
+            # rising (2nd derivative), which often leads the full impulse by a few seconds.
+            if self.accel_enabled:
+                accel = self._compute_acceleration(inst, ts)
+                if accel:
+                    accel_dir = accel["direction"]
+                    accel_key = f"{inst}_{accel_dir}_ACCEL"
+                    last_accel = self._radar_emitted.get(accel_key, 0)
+                    if ts - last_accel >= self._radar_cooldown_sec:
+                        self._radar_emitted[accel_key] = ts
+                        arrow = "▲" if accel_dir == "CE" else "▼"
+                        title = f"⚡ {inst} Momentum Building (Accelerating)"
+                        msg = (
+                            f"{arrow} {inst} price velocity accelerating "
+                            f"({accel['recent_vel']:+.1f} pts/s, up from {accel['older_vel']:+.1f}). "
+                            f"An impulse may be starting — watch ATM {accel_dir}. NOT A TRADE yet."
+                        )
+                        self.emit_radar_alert(
+                            alert_type="MOMENTUM_ACCELERATION",
+                            instrument=inst,
+                            direction=accel_dir,
+                            title=title,
+                            message=msg,
+                            meta_details={
+                                "recent_vel": round(accel["recent_vel"], 2),
+                                "older_vel": round(accel["older_vel"], 2),
+                                "spot_curr": ltp
+                            },
+                            now_ts=ts
+                        )
+
+            # 1a. Radar Pre-Alert: Early heads-up when ~50% of impulse velocity is achieved
             if abs_delta >= radar_threshold and consistency >= 0.65:
                 radar_key = f"{inst}_{direction}_IMPULSE"
                 last_radar = self._radar_emitted.get(radar_key, 0)
@@ -241,10 +459,14 @@ class MomentumImpulseDetector(BaseStrategy):
                 # Do not re-arm if already active and recently updated
                 cur_impulse = self.active_impulses.get(inst)
                 if not cur_impulse or ts > cur_impulse.get("expires_at", 0) or cur_impulse.get("direction") != direction:
+                    # In pullback mode the impulse lives longer (we wait for a dip to hold),
+                    # so use the pullback window as the TTL; otherwise the classic short TTL.
+                    ttl = self.pullback_window_sec if self.pullback_enabled else self.impulse_ttl_sec
+                    phase = "AWAITING_PULLBACK" if self.pullback_enabled else "AWAITING_SURGE"
                     logger.success(
                         f"🚀 [MOMENTUM IMPULSE ARMED] {inst} {direction} Impulse Confirmed: "
                         f"{delta:+.1f} pts in {elapsed:.1f}s ({consistency*100:.0f}% consistency). "
-                        f"Awaiting ATM option surge confirmation."
+                        f"Phase: {phase}."
                     )
                     self.active_impulses[inst] = {
                         "direction": direction,
@@ -254,8 +476,25 @@ class MomentumImpulseDetector(BaseStrategy):
                         "elapsed": elapsed,
                         "consistency": consistency,
                         "timestamp": ts,
-                        "expires_at": ts + self.impulse_ttl_sec
+                        "expires_at": ts + ttl,
+                        "phase": phase,
+                        "peak_spot": ltp,           # extreme reached in the impulse direction
+                        "pullback_extreme": ltp,    # extreme of the retrace (low for CE, high for PE)
+                        "pullback_alerted": False
                     }
+                elif cur_impulse and cur_impulse.get("direction") == direction:
+                    # Same-direction continuation: extend the peak so pullback is measured
+                    # from the true top/bottom of the move.
+                    if direction == "CE":
+                        cur_impulse["peak_spot"] = max(cur_impulse.get("peak_spot", ltp), ltp)
+                    else:
+                        cur_impulse["peak_spot"] = min(cur_impulse.get("peak_spot", ltp), ltp)
+                    cur_impulse["spot_curr"] = ltp
+
+            # 1c. Pullback tracking: once armed and in AWAITING_PULLBACK, watch for a shallow
+            # retrace that then resumes in the impulse direction. When it holds, flip the
+            # phase to PULLBACK_READY and emit an ACTIONABLE alert the trader can actually act on.
+            self._track_pullback(inst, ltp, ts)
 
             return None
 
@@ -295,6 +534,13 @@ class MomentumImpulseDetector(BaseStrategy):
         if impulse.get("direction") != opt_type:
             return None
 
+        # Phase gate: in pullback mode, only fire once the pullback has held (PULLBACK_READY).
+        # While still AWAITING_PULLBACK we deliberately do NOT signal — we are waiting for a
+        # human-takeable dip rather than chasing the vertical spike.
+        phase = impulse.get("phase", "AWAITING_SURGE")
+        if phase == "AWAITING_PULLBACK":
+            return None
+
         # Focus strictly on ATM or closest strike (offset in [-1, 0, 1])
         if not is_atm and offset not in (-1, 0, 1):
             return None
@@ -332,14 +578,18 @@ class MomentumImpulseDetector(BaseStrategy):
         # Consume the impulse so it fires only once per wave
         self.active_impulses[inst] = None
 
-        # Anchor custom spot SL tightly to the impulse origin
+        # Anchor custom spot SL. For a pullback entry, anchor to the pullback extreme (the
+        # dip low for CE / spike high for PE) — a tight, well-defined stop that invalidates
+        # the setup if the pullback fails. For a classic entry, anchor to the impulse origin.
         spot_start = impulse["spot_start"]
         spot_curr = impulse["spot_curr"]
         buffer_pts = 6.0 if inst == "NIFTY" else 18.0
+        is_pullback_entry = impulse.get("phase") == "PULLBACK_READY"
+        sl_anchor = impulse.get("pullback_extreme", spot_start) if is_pullback_entry else spot_start
         if opt_type == "CE":
-            custom_sl = spot_start - buffer_pts
+            custom_sl = sl_anchor - buffer_pts
         else:
-            custom_sl = spot_start + buffer_pts
+            custom_sl = sl_anchor + buffer_pts
 
         # Confidence Scoring (Impulse moves carry high momentum weight)
         full_thresh = self._get_velocity_threshold(inst)
@@ -377,8 +627,14 @@ class MomentumImpulseDetector(BaseStrategy):
                 "option_surge_pct": round(surge_pct, 1),
                 "base_premium": round(base_price, 2),
                 "spot_origin": round(spot_start, 1),
+                "entry_type": "PULLBACK" if is_pullback_entry else "IMPULSE",
                 "regime": regime_st.get("regime", "UNKNOWN"),
                 "regime_score": regime_st.get("score", 0.0),
-                "guidance": "⚡ Momentum Impulse: High velocity move. Book 50% at +1R, trail remaining SL to breakeven immediately."
+                "guidance": (
+                    "🎯 Pullback Entry: Entered on the first dip that held after the impulse. "
+                    "Tight stop below the pullback low. Book 50% at +1R, trail to breakeven."
+                    if is_pullback_entry else
+                    "⚡ Momentum Impulse: High velocity move. Book 50% at +1R, trail remaining SL to breakeven immediately."
+                )
             }
         )

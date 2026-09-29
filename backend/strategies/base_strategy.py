@@ -9,6 +9,56 @@ IST = timezone(timedelta(hours=5, minutes=30))
 CONFIDENCE_THRESHOLD = 60
 ELEVATED_CONFIDENCE_THRESHOLD = 75
 
+# -----------------------------------------------------------------------------
+# Radar alert categories — tier alerts by how close they are to an actionable
+# trade so the UI can surface the important ones and mute background context.
+#
+#   CONTEXT    : describes the market environment; not a setup. Silent, collapsible.
+#   WATCH      : a setup is forming; prepare but do not act yet. Subtle notify.
+#   ACTIONABLE : a setup at/near trigger; the closest thing to a trade cue. Prominent + sound.
+#
+# Anything not listed defaults to WATCH (safe middle — visible but not loud).
+# -----------------------------------------------------------------------------
+ALERT_CATEGORY_CONTEXT = "CONTEXT"
+ALERT_CATEGORY_WATCH = "WATCH"
+ALERT_CATEGORY_ACTIONABLE = "ACTIONABLE"
+
+ALERT_CATEGORIES = {
+    # --- CONTEXT: background positioning/volatility weather, not a timing cue ---
+    "CHAIN_PCR_VELOCITY_CE": ALERT_CATEGORY_CONTEXT,
+    "CHAIN_PCR_VELOCITY_PE": ALERT_CATEGORY_CONTEXT,
+    "IV_SKEW_SURGE_CE": ALERT_CATEGORY_CONTEXT,
+    "IV_SKEW_SURGE_PE": ALERT_CATEGORY_CONTEXT,
+    "ZERO_GAMMA_FLIP": ALERT_CATEGORY_CONTEXT,
+    "VOLATILITY_COIL_ACTIVE": ALERT_CATEGORY_CONTEXT,
+
+    # --- WATCH: a setup is forming, prepare ---
+    "CONFLUENCE_PRE_ENTRY": ALERT_CATEGORY_WATCH,
+    "GAMMA_ARMED": ALERT_CATEGORY_WATCH,
+    "GAMMA_SQUEEZE_PRE_ALERT": ALERT_CATEGORY_WATCH,
+    "GAMMA_CASCADE_PE_ALERT": ALERT_CATEGORY_WATCH,
+    "ORB_CONTACT": ALERT_CATEGORY_WATCH,
+    "BREAKOUT_PENDING": ALERT_CATEGORY_WATCH,
+    "VOLUME_CONTACT": ALERT_CATEGORY_WATCH,
+    "PULLBACK_REJECTION": ALERT_CATEGORY_WATCH,
+    "ORDER_FLOW_ABSORPTION_CE": ALERT_CATEGORY_WATCH,
+    "ORDER_FLOW_ABSORPTION_PE": ALERT_CATEGORY_WATCH,
+    "MOMENTUM_IMPULSE": ALERT_CATEGORY_WATCH,          # early heads-up (still WATCH)
+    "MOMENTUM_ACCELERATION": ALERT_CATEGORY_WATCH,     # earliest heads-up
+
+    # --- ACTIONABLE: at/near trigger, closest to a real entry ---
+    "MOMENTUM_PULLBACK_READY": ALERT_CATEGORY_ACTIONABLE,
+    "SQUEEZE_BREAKOUT_FIRING": ALERT_CATEGORY_ACTIONABLE,
+    "DRYUP_IGNITION": ALERT_CATEGORY_ACTIONABLE,
+    "ORB_DRYUP_IGNITION": ALERT_CATEGORY_ACTIONABLE,
+    "VOLUME_DRYUP_SQUEEZE": ALERT_CATEGORY_ACTIONABLE,
+}
+
+
+def categorize_alert(alert_type: str) -> str:
+    """Returns the CONTEXT/WATCH/ACTIONABLE tier for an alert_type (defaults to WATCH)."""
+    return ALERT_CATEGORIES.get(alert_type, ALERT_CATEGORY_WATCH)
+
 class BaseStrategy(ABC):
     def __init__(self, name: str, enabled: bool = True, confidence_threshold: int = CONFIDENCE_THRESHOLD):
         self.name = name
@@ -76,12 +126,14 @@ class BaseStrategy(ABC):
             return None
 
         self._alert_cooldowns[key] = ts
+        category = categorize_alert(alert_type)
         alert = {
             "id": f"RADAR-{int(ts)}-{instrument}-{direction}-{str(uuid.uuid4())[:4].upper()}",
             "strategy": self.name,
             "instrument": instrument,
             "direction": direction,
             "alert_type": alert_type,
+            "category": category,
             "tier": "WATCH",
             "is_trade": False,
             "title": title,

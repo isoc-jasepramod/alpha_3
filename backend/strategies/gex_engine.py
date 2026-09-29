@@ -32,6 +32,24 @@ class GEXEngine(BaseStrategy):
         self.prev_regimes: Dict[str, str] = {"NIFTY": "NEUTRAL", "SENSEX": "NEUTRAL"}
         self.last_eval_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
 
+        # --- Confluence alert dedup latch ---
+        # CONFLUENCE_PRE_ENTRY is a *state* condition (spot near a gamma wall + IV skew),
+        # not an event. Left ungated it re-fired every ~60-75s while spot loitered near a
+        # wall on Sep 29, spamming the radar. We latch the active confluence setup by
+        # identity (direction + wall strike) and only re-alert when a materially DIFFERENT
+        # setup forms after the previous one has cleared.
+        # { inst: {"direction": "CE"/"PE", "wall": <strike>} or None }
+        self._confluence_active: Dict[str, Optional[Dict[str, Any]]] = {
+            "NIFTY": None,
+            "SENSEX": None
+        }
+        # Wall-strike moves smaller than this are treated as the SAME setup (avoids
+        # re-alerting on tiny wall drift as OI shuffles between adjacent strikes).
+        self.confluence_wall_tolerance: Dict[str, float] = {
+            "NIFTY": float(cfg.get("nifty_confluence_wall_tolerance", 50.0)),
+            "SENSEX": float(cfg.get("sensex_confluence_wall_tolerance", 100.0))
+        }
+
     def _get_time_to_expiry_years(self, ts: float, inst: str = "NIFTY") -> float:
         dt = self.parse_ist_time(ts)
         exp_weekday = 1 if inst == "NIFTY" else 3  # Tuesday=1 for NIFTY, Thursday=3 for SENSEX
@@ -118,6 +136,23 @@ class GEXEngine(BaseStrategy):
 
         return None
 
+    def _is_new_confluence(self, inst: str, direction: str, wall: float) -> bool:
+        """
+        Returns True only when a confluence setup is materially new relative to the one
+        currently latched for this instrument — i.e. a different direction, or a wall that
+        has shifted beyond the per-instrument tolerance. Same-setup persistence returns
+        False so we do NOT re-alert while spot loiters near the same wall.
+        """
+        active = self._confluence_active.get(inst)
+        if active is None:
+            return True
+        if active.get("direction") != direction:
+            return True
+        tol = self.confluence_wall_tolerance.get(inst, 50.0)
+        if abs(float(active.get("wall", 0.0)) - float(wall)) > tol:
+            return True
+        return False
+
     def _evaluate_gamma_regime(self, inst: str, ts: float, spot: float):
         strikes = self.chain_data.get(inst, {})
         if len(strikes) < 3:
@@ -191,57 +226,68 @@ class GEXEngine(BaseStrategy):
         )
 
         # Elevated Confluence Alert (CE): Call Gamma Wall + Institutional Call IV Skew Surge
+        # Dedup: only emit when this is a NEW setup (different direction or wall) vs the one
+        # already latched. While the same setup persists we stay silent instead of spamming.
         if is_call_confluence:
-            spot_sl = spot - sl_pts
-            t1 = call_wall_strike + target_1_pts
-            t2 = call_wall_strike + target_2_pts
-            skew_str = f"+{delta_skew:.1f}%" if delta_skew is not None else "Elevated"
-            self.emit_radar_alert(
-                alert_type="CONFLUENCE_PRE_ENTRY",
-                instrument=inst,
-                direction="CE",
-                title=f"🎯 ELEVATED RADAR: {inst} Pre-Breakout Confluence @ {call_wall_strike:.0f} CE",
-                message=f"High-conviction confluence: {inst} approaching Call Wall ({call_wall_strike:.0f}) with Call IV Skew expansion ({skew_str}). Plan: Strike {call_wall_strike:.0f} CE | Spot SL: {spot_sl:.1f} | T1: {t1:.0f} | T2: {t2:.0f}",
-                meta_details={
-                    "spot": spot,
-                    "entry_strike": call_wall_strike,
-                    "recommended_sl": round(spot_sl, 2),
-                    "target_1": round(t1, 2),
-                    "target_2": round(t2, 2),
-                    "call_wall": call_wall_strike,
-                    "delta_skew": round(delta_skew, 2) if delta_skew is not None else 0.0,
-                    "net_gex": round(net_gex, 2),
-                    "confluence_type": "GEX_CALL_WALL + CALL_IV_SKEW_SURGE"
-                },
-                now_ts=ts
-            )
+            if self._is_new_confluence(inst, "CE", call_wall_strike):
+                spot_sl = spot - sl_pts
+                t1 = call_wall_strike + target_1_pts
+                t2 = call_wall_strike + target_2_pts
+                skew_str = f"+{delta_skew:.1f}%" if delta_skew is not None else "Elevated"
+                self.emit_radar_alert(
+                    alert_type="CONFLUENCE_PRE_ENTRY",
+                    instrument=inst,
+                    direction="CE",
+                    title=f"🎯 ELEVATED RADAR: {inst} Pre-Breakout Confluence @ {call_wall_strike:.0f} CE",
+                    message=f"High-conviction confluence: {inst} approaching Call Wall ({call_wall_strike:.0f}) with Call IV Skew expansion ({skew_str}). Plan: Strike {call_wall_strike:.0f} CE | Spot SL: {spot_sl:.1f} | T1: {t1:.0f} | T2: {t2:.0f}",
+                    meta_details={
+                        "spot": spot,
+                        "entry_strike": call_wall_strike,
+                        "recommended_sl": round(spot_sl, 2),
+                        "target_1": round(t1, 2),
+                        "target_2": round(t2, 2),
+                        "call_wall": call_wall_strike,
+                        "delta_skew": round(delta_skew, 2) if delta_skew is not None else 0.0,
+                        "net_gex": round(net_gex, 2),
+                        "confluence_type": "GEX_CALL_WALL + CALL_IV_SKEW_SURGE"
+                    },
+                    now_ts=ts
+                )
+            # Latch (or refresh) the active setup so it is not re-alerted while it persists.
+            self._confluence_active[inst] = {"direction": "CE", "wall": call_wall_strike}
         # Elevated Confluence Alert (PE): Put Gamma Wall + Institutional Put IV Skew Surge
         elif is_put_confluence:
-            spot_sl = spot + sl_pts
-            t1 = put_wall_strike - target_1_pts
-            t2 = put_wall_strike - target_2_pts
-            skew_str = f"{delta_skew:.1f}%" if delta_skew is not None else "Elevated"
-            self.emit_radar_alert(
-                alert_type="CONFLUENCE_PRE_ENTRY",
-                instrument=inst,
-                direction="PE",
-                title=f"🎯 ELEVATED RADAR: {inst} Pre-Breakdown Confluence @ {put_wall_strike:.0f} PE",
-                message=f"High-conviction confluence: {inst} approaching Put Wall ({put_wall_strike:.0f}) with Put IV Skew expansion ({skew_str}). Plan: Strike {put_wall_strike:.0f} PE | Spot SL: {spot_sl:.1f} | T1: {t1:.0f} | T2: {t2:.0f}",
-                meta_details={
-                    "spot": spot,
-                    "entry_strike": put_wall_strike,
-                    "recommended_sl": round(spot_sl, 2),
-                    "target_1": round(t1, 2),
-                    "target_2": round(t2, 2),
-                    "put_wall": put_wall_strike,
-                    "delta_skew": round(delta_skew, 2) if delta_skew is not None else 0.0,
-                    "net_gex": round(net_gex, 2),
-                    "confluence_type": "GEX_PUT_WALL + PUT_IV_SKEW_SURGE"
-                },
-                now_ts=ts
-            )
+            if self._is_new_confluence(inst, "PE", put_wall_strike):
+                spot_sl = spot + sl_pts
+                t1 = put_wall_strike - target_1_pts
+                t2 = put_wall_strike - target_2_pts
+                skew_str = f"{delta_skew:.1f}%" if delta_skew is not None else "Elevated"
+                self.emit_radar_alert(
+                    alert_type="CONFLUENCE_PRE_ENTRY",
+                    instrument=inst,
+                    direction="PE",
+                    title=f"🎯 ELEVATED RADAR: {inst} Pre-Breakdown Confluence @ {put_wall_strike:.0f} PE",
+                    message=f"High-conviction confluence: {inst} approaching Put Wall ({put_wall_strike:.0f}) with Put IV Skew expansion ({skew_str}). Plan: Strike {put_wall_strike:.0f} PE | Spot SL: {spot_sl:.1f} | T1: {t1:.0f} | T2: {t2:.0f}",
+                    meta_details={
+                        "spot": spot,
+                        "entry_strike": put_wall_strike,
+                        "recommended_sl": round(spot_sl, 2),
+                        "target_1": round(t1, 2),
+                        "target_2": round(t2, 2),
+                        "put_wall": put_wall_strike,
+                        "delta_skew": round(delta_skew, 2) if delta_skew is not None else 0.0,
+                        "net_gex": round(net_gex, 2),
+                        "confluence_type": "GEX_PUT_WALL + PUT_IV_SKEW_SURGE"
+                    },
+                    now_ts=ts
+                )
+            self._confluence_active[inst] = {"direction": "PE", "wall": put_wall_strike}
+        # Neither confluence holds any longer: clear the latch so the NEXT time a confluence
+        # forms it is treated as a fresh setup and alerts once.
+        else:
+            self._confluence_active[inst] = None
         # Alert 2: Proximity to Call Wall under Short Gamma (Classic Gamma Squeeze Setup)
-        elif call_wall_strike > 0 and 0 < (call_wall_strike - spot) <= (30.0 if inst == "NIFTY" else 90.0):
+        if not is_call_confluence and not is_put_confluence and call_wall_strike > 0 and 0 < (call_wall_strike - spot) <= (30.0 if inst == "NIFTY" else 90.0):
             # Spot is within 30 points of Call Wall
             self.emit_radar_alert(
                 alert_type="GAMMA_SQUEEZE_PRE_ALERT",

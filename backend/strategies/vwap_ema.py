@@ -204,7 +204,16 @@ class VWAPEMAAlignment(BaseStrategy):
                 cur_vwap = self.spot_vwap[inst].value
                 self.spot_vwap_history[inst].append(cur_vwap)
 
-        logger.info(f"✅ [VWAP_EMA] {inst} warmed up! VWAP={self.spot_vwap[inst].value:.1f}, EMA9={self.spot_ema9[inst].value:.1f}, EMA21={self.spot_ema21[inst].value:.1f}, RSI={self.spot_rsi[inst].value:.1f}, ADX={self.spot_adx[inst].value:.1f}")
+        def _fmt(v):
+            return f"{v:.1f}" if v is not None else "warming"
+        logger.info(
+            f"✅ [VWAP_EMA] {inst} warmed up! "
+            f"VWAP={_fmt(self.spot_vwap[inst].value)}, "
+            f"EMA9={_fmt(self.spot_ema9[inst].value)}, "
+            f"EMA21={_fmt(self.spot_ema21[inst].value)}, "
+            f"RSI={_fmt(self.spot_rsi[inst].value)}, "
+            f"ADX={_fmt(self.spot_adx[inst].value)} ({len(candles)} candles)"
+        )
 
 
     def _check_exhaustion_filter(self, inst: str, direction: str, spot: float, adx: float = 0.0, vwap_slope: float = 0.0) -> bool:
@@ -361,9 +370,10 @@ class VWAPEMAAlignment(BaseStrategy):
                 v_contact_vwap_pe = self.contact_detectors[inst].check_contact(closed, vwap_val, "VWAP", direction="PE")
                 v_contact_ema9_pe = self.contact_detectors[inst].check_contact(closed, ema9_val, "EMA9", direction="PE")
 
-                # Update shared Session Regime Filter with closed 3-minute candle
-                if self.regime_filter:
-                    self.regime_filter.update_candle(inst, closed, vwap_val, adx_val)
+                # NOTE: The shared regime filter is now fed authoritatively by the engine's
+                # independent regime driver (server.py _drive_regime), NOT from here. VWAP_EMA
+                # only CONSUMES the regime (via allows_vwap_ema/get_regime) so the trend no
+                # longer freezes when this strategy is disabled or time-gated after 15:15.
 
                 # 1. Check if we were awaiting confirmation from prior rejection candle
                 awaiting = self.awaiting_confirmation[inst]

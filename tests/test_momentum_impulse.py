@@ -19,7 +19,12 @@ async def test_momentum_impulse_lifecycle():
         "min_opt_surge_pct": 3.5,
         "max_opt_surge_pct": 16.0,
         "impulse_ttl_sec": 25.0,
-        "cooldown_sec": 60.0
+        "cooldown_sec": 60.0,
+        # This test validates the CLASSIC immediate-trigger path (fire on the impulse's
+        # option surge). Pullback mode and the acceleration pre-alert are covered separately
+        # in test_momentum_pullback.py, so pin them off here.
+        "pullback_enabled": False,
+        "accel_enabled": False
     }
 
     strat = MomentumImpulseDetector(config)
@@ -141,7 +146,10 @@ async def test_momentum_impulse_anti_top_chasing_guard():
         "min_opt_surge_pct": 3.5,
         "max_opt_surge_pct": 16.0,
         "impulse_ttl_sec": 25.0,
-        "cooldown_sec": 60.0
+        "cooldown_sec": 60.0,
+        # Classic immediate-trigger path so the anti-top-chasing guard is reachable.
+        "pullback_enabled": False,
+        "accel_enabled": False
     }
     strat = MomentumImpulseDetector(config)
     base_time = 1727255000.0
@@ -196,7 +204,10 @@ async def test_momentum_impulse_pe_breakdown():
         "min_directional_pct": 0.70,
         "min_opt_surge_pct": 3.5,
         "max_opt_surge_pct": 16.0,
-        "impulse_ttl_sec": 25.0
+        "impulse_ttl_sec": 25.0,
+        # Classic immediate-trigger path (pullback/accel covered in test_momentum_pullback.py).
+        "pullback_enabled": False,
+        "accel_enabled": False
     }
     strat = MomentumImpulseDetector(config)
     base_time = 1727255000.0

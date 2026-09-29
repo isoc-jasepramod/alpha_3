@@ -40,13 +40,13 @@ export function SignalHistoryTable() {
       <div className="table-container">
         {history.length === 0 ? (
           <p style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            No journal entries recorded yet today. Signals will appear here as they are generated and resolved.
+            No journal entries recorded yet. Signals will appear here as they are generated and resolved.
           </p>
         ) : (
           <table className="journal-table">
             <thead>
               <tr>
-                <th>Time (IST)</th>
+                <th>Date & Time</th>
                 <th>Signal ID</th>
                 <th>Instrument</th>
                 <th>Strategy</th>
@@ -74,7 +74,8 @@ export function SignalHistoryTable() {
                 return (
                   <tr key={item.signal_id}>
                     <td style={{ color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
-                      {new Date(item.created_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}
+                      {new Date(item.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' })}{' '}
+                      {new Date(item.created_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}
                     </td>
                     <td style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{item.signal_id}</td>
                     <td>

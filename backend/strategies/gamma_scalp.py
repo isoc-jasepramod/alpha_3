@@ -79,6 +79,12 @@ class ExpiryDayGammaScalp(BaseStrategy):
         # Rolling option premium low tracker (3-minute window) for staleness check
         self.opt_premium_low: Dict[str, deque] = {}  # token -> deque of (ts, ltp)
 
+        # Diagnostics: log range-finalize once per instrument per day, and throttle
+        # the "no qualifying setup" diagnostic so an expiry-day silence is explainable.
+        self._range_finalized_logged: Dict[str, bool] = {"NIFTY": False, "SENSEX": False}
+        self._last_diag_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+        self._diag_interval_sec = float(cfg.get("diag_interval_sec", 300.0))
+
         # Two-stage Armed Setup Tracking: inst -> armed state dict
         self.armed_setups: Dict[str, Optional[Dict[str, Any]]] = {
             "NIFTY": None,
@@ -109,6 +115,10 @@ class ExpiryDayGammaScalp(BaseStrategy):
         lo = float(spot_info.get("low", ltp))
         if ltp <= 0:
             return
+
+        # Reset per-day diagnostic flags on (re)seed so range-finalize logs fresh each session
+        self._range_finalized_logged[inst] = False
+        self._last_diag_ts[inst] = 0.0
 
         now_dt = self.parse_ist_time(datetime.now(timezone.utc).timestamp())
         t = now_dt.time()
@@ -187,6 +197,20 @@ class ExpiryDayGammaScalp(BaseStrategy):
                     rng["low"] = ltp
             elif self._in_gamma_window(now_dt):
                 self.mid_ranges[inst]["finalized"] = True
+                # Diagnostic: log the finalized consolidation box once, so we always have
+                # visibility into what Gamma Scalp is working with on expiry days.
+                if not self._range_finalized_logged.get(inst):
+                    self._range_finalized_logged[inst] = True
+                    _h = self.mid_ranges[inst].get("high", 0.0)
+                    _l = self.mid_ranges[inst].get("low", 1e9)
+                    _rng = _h - _l
+                    _max_allowed = self.max_mid_range_pct * ltp
+                    _quality = "TIGHT (tradeable)" if (0 < _rng <= _max_allowed) else "TOO WIDE (no setup)"
+                    logger.info(
+                        f"📐 [GAMMA_SCALP] {inst} consolidation box finalized: "
+                        f"H_mid={_h:.1f}, L_mid={_l:.1f}, range={_rng:.1f} pts "
+                        f"(max tradeable={_max_allowed:.1f}). Quality: {_quality}"
+                    )
 
             # 2. Track tick-level spot data for velocity computation
             self.spot_tick_history[inst].append((ts, ltp))
@@ -205,7 +229,18 @@ class ExpiryDayGammaScalp(BaseStrategy):
                     mid_range = h_mid - l_mid
 
                     # Check range quality first
-                    if 0 < mid_range <= (self.max_mid_range_pct * ltp):
+                    max_allowed_range = self.max_mid_range_pct * ltp
+                    if not (0 < mid_range <= max_allowed_range):
+                        # Diagnostic (throttled): range exists but is too wide to trade.
+                        # This is why Gamma Scalp can be silent on a volatile expiry day.
+                        if (ts - self._last_diag_ts.get(inst, 0.0)) >= self._diag_interval_sec:
+                            self._last_diag_ts[inst] = ts
+                            logger.info(
+                                f"🔍 [GAMMA_SCALP DIAG] {inst} no setup: consolidation range "
+                                f"{mid_range:.1f} pts exceeds max tradeable {max_allowed_range:.1f} pts "
+                                f"(≤{self.max_mid_range_pct*100:.2f}% of spot). Day too volatile for gamma scalp."
+                            )
+                    elif 0 < mid_range <= max_allowed_range:
                         proximity_threshold = ltp * (self.watch_proximity_pct / 100.0)
                         tick_vel = self._compute_tick_velocity(inst, lookback_sec=30.0)
 

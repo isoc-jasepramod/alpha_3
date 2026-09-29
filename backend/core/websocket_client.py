@@ -66,13 +66,40 @@ class SmartAPIWebSocketClient:
         logger.info("SmartAPI WebSocket client stopped.")
 
     async def _heartbeat_loop(self, ws):
-        """Sends application-level ping every 25 seconds to keep connection alive without library ping_timeout aborts."""
+        """
+        Sends application-level ping every 25 seconds to keep the connection alive
+        without relying on the library ping/pong (which Angel's gateway does not honour,
+        causing 50s keepalive-timeout drops).
+
+        websockets >= 13 removed the `.closed` boolean; connection state is now exposed
+        via the `.state` enum (websockets.protocol.State). We detect an open socket by
+        comparing against State.OPEN when available, and otherwise just attempt the send
+        and let ConnectionClosed break the loop.
+        """
         try:
-            while self.running and not ws.closed:
+            from websockets.protocol import State
+        except Exception:
+            State = None
+
+        def _is_open() -> bool:
+            state = getattr(ws, "state", None)
+            if State is not None and state is not None:
+                return state == State.OPEN
+            # Fallback for older API that still exposes .closed
+            closed = getattr(ws, "closed", False)
+            return not closed
+
+        try:
+            while self.running and _is_open():
                 await asyncio.sleep(25)
-                if not ws.closed:
+                if not self.running or not _is_open():
+                    break
+                try:
                     await ws.send("ping")
                     logger.debug("SmartAPI WS sent app-level ping heartbeat.")
+                except Exception as send_err:
+                    logger.debug(f"Heartbeat send failed (socket closing): {send_err}")
+                    break
         except asyncio.CancelledError:
             pass
         except Exception as e:

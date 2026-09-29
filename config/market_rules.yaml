@@ -54,6 +54,8 @@ strategies:
     extreme_gap_pct: 1.50
     contact_multiplier: 1.80        # Volume spike threshold for level contact
     min_dry_bars: 2                 # Bars of volume contraction before ignition
+    max_triggers_per_dir: 2         # Re-entry cap: max ORB triggers per CE/PE per day (prevents 0/20 whipsaw)
+    retrigger_cooldown_sec: 900     # Min 15 min between ORB triggers (was re-firing every 5 min)
 
   vwap_ema:
     enabled: true
@@ -100,11 +102,25 @@ strategies:
     window_sec: 20.0
     min_tick_count: 4
     min_directional_pct: 0.70       # 70% directional tick consistency
-    radar_velocity_ratio: 0.65      # Radar pre-alert at 65% of threshold (~16.25 Nifty / ~48.75 Sensex)
+    radar_velocity_ratio: 0.50      # Radar pre-alert at 50% of threshold (earlier heads-up; was 0.65)
     min_opt_surge_pct: 3.5          # ATM Option must be expanding by at least +3.5%
     max_opt_surge_pct: 16.0         # Reject if option already surged > 16.0% (avoids buying top)
     impulse_ttl_sec: 25.0           # Validity window for armed impulse awaiting option tick
     cooldown_sec: 90.0
+    # --- Acceleration pre-alert (earliest, lowest-confidence heads-up) ---
+    accel_enabled: true
+    nifty_accel_min_recent_vel: 2.5   # min pts/s in recent sub-window to be "accelerating" (NIFTY)
+    sensex_accel_min_recent_vel: 7.5  # min pts/s in recent sub-window to be "accelerating" (SENSEX)
+    accel_recent_window_sec: 5.0      # recent sub-window compared against the prior sub-window
+    accel_ratio: 1.6                  # recent velocity must exceed older velocity by this factor
+    # --- Post-impulse pullback entry (human-takeable; the reliable entry) ---
+    pullback_enabled: true
+    pullback_max_retrace: 0.50        # a dip up to 50% of the impulse still counts as shallow
+    pullback_resume_frac: 0.15        # must recover 15% of impulse size off the dip to confirm hold
+                                      # (lowered from 0.20 — Sep 29 backtest showed 0.20 was too
+                                      #  strict and filtered out a valid resumption; revisit as more
+                                      #  recorded days accumulate)
+    pullback_window_sec: 90.0         # how long after arming we keep waiting for a valid pullback
 
   regime_filter:
     enabled: true
@@ -119,4 +135,19 @@ strategies:
     weight_er: 0.30                 # Efficiency Ratio weight (30%)
     weight_persistence: 0.25        # VWAP Persistence weight (25%)
     weight_slope: 0.15              # VWAP Slope weight (15%)
+    # --- Hysteresis (anti-thrash) ---
+    # Sep 29 recorded 305 regime transitions on a choppy day because the classifier
+    # flipped instantly on every threshold crossing. Deadband + confirmation bars fix this.
+    hysteresis_enabled: true
+    trending_exit_band: 5.0         # Must fall below (trending_threshold - band) to LEAVE trending (65 enter / 60 exit)
+    choppy_exit_band: 5.0           # Must rise above (neutral_threshold + band) to LEAVE choppy (45 enter / 50 exit)
+    confirm_bars_trending: 2        # Consecutive candidate bars required to COMMIT a TRENDING regime
+    confirm_bars_relax: 1           # Consecutive candidate bars required to relax toward NEUTRAL/CHOPPY
+    direction_min_slope: 0.05       # |vwap_slope| must exceed this (pts/bar) for a directional (BULL/BEAR) stamp
+    # --- Session net-change anchor ---
+    # A directional trend label must agree with the day's actual net move (vs previous
+    # close, else session open). Blocks the "TREND UP on a red day" mislabel. If the
+    # VWAP-derived direction conflicts with a clear net-change, the regime is demoted to NEUTRAL.
+    net_change_anchor_enabled: true
+    net_change_deadband_pct: 0.10   # net move smaller than 0.10% of price = no enforced bias (flat day)
 

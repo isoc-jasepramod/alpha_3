@@ -13,9 +13,10 @@ class OISqueezeSentinel(BaseStrategy):
     PE Trigger: Delta OI <= -5.0%, Delta Price >= +3.0%, Spot < EMA20, ADX >= 20, Option Vol >= 2x 20-period avg.
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, regime_filter: Optional[Any] = None):
         super().__init__(name="OI_SQUEEZE")
         cfg = config or {}
+        self.regime_filter = regime_filter
         self.start_time = cfg.get("start_time", "09:15:00")
         self.end_time = cfg.get("end_time", "15:30:00")
         self.tau = cfg.get("lookback_window_sec", 300) # 300 seconds (5 min)
@@ -82,7 +83,11 @@ class OISqueezeSentinel(BaseStrategy):
                     self.spot_ema20[inst].update(cl)
                 if inst in self.spot_adx:
                     self.spot_adx[inst].update(hi, lo, cl)
-        logger.info(f"✅ [OI_SQUEEZE] {inst} warmed up! EMA20={self.spot_ema20[inst].value:.1f}, ADX={self.spot_adx[inst].value:.1f}")
+        ema_val = self.spot_ema20[inst].value
+        adx_val = self.spot_adx[inst].value
+        ema_str = f"{ema_val:.1f}" if ema_val is not None else "warming"
+        adx_str = f"{adx_val:.1f}" if adx_val is not None else "warming"
+        logger.info(f"✅ [OI_SQUEEZE] {inst} warmed up! EMA20={ema_str}, ADX={adx_str} ({len(candles)} candles)")
 
     def _get_early_ignition_price_threshold(self, inst: str, now_dt: datetime, meta: Optional[Dict[str, Any]] = None) -> float:
         """
@@ -264,6 +269,14 @@ class OISqueezeSentinel(BaseStrategy):
         if confidence < self.confidence_threshold:
             logger.warning(f"⚠️ [OI SQUEEZE SUPPRESSED] {symbol} score {confidence} < threshold {self.confidence_threshold}")
             return None
+
+        # Session Regime Gate: suppress in CHOPPY, block counter-trend direction in TRENDING.
+        # (Sep 29 backtest: OI Squeeze bled on counter-trend CE spikes on a bearish/choppy day.)
+        if self.regime_filter:
+            allowed, reason = self.regime_filter.allows_oi_squeeze(inst, opt_type)
+            if not allowed:
+                logger.info(f"🛡️ [OI SQUEEZE REGIME GATE] {symbol} ({opt_type}) suppressed: {reason}")
+                return None
 
         # Instrument-wide Cooldown guard (15 mins = 900s)
         sig_key = f"OI_{inst}_{opt_type}"

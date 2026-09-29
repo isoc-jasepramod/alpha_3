@@ -63,6 +63,45 @@ class RegimeFilter:
         self.w_persistence = float(cfg.get("weight_persistence", 0.25))
         self.w_slope = float(cfg.get("weight_slope", 0.15))
 
+        # --- Hysteresis (anti-thrash) ---
+        # Sep 29 produced 305 regime transitions on a choppy day because the raw score
+        # crossing a threshold flipped the regime on a single candle. Hysteresis adds
+        # (a) a deadband around each threshold so boundary jitter cannot flip state, and
+        # (b) an N-bar confirmation so a candidate regime must persist before it commits.
+        self.hysteresis_enabled = bool(cfg.get("hysteresis_enabled", True))
+        self.trending_exit_band = float(cfg.get("trending_exit_band", 5.0))
+        self.choppy_exit_band = float(cfg.get("choppy_exit_band", 5.0))
+        self.confirm_bars_trending = int(cfg.get("confirm_bars_trending", 2))
+        self.confirm_bars_relax = int(cfg.get("confirm_bars_relax", 1))
+        self.direction_min_slope = float(cfg.get("direction_min_slope", 0.05))
+
+        # --- Session net-change anchor ---
+        # The BULL/BEAR label used to be built purely from VWAP slope + which side of VWAP
+        # price sits, with NO awareness of the day's net move. That let a red day (gapped
+        # down, grinding up off the lows) read TRENDING_BULL. We now reconcile the direction
+        # against the session net-change: a directional trend label must AGREE with the sign
+        # of net-change (vs the reference: previous close if known, else session open), once
+        # net-change is meaningful (beyond a small deadband). If VWAP-derived direction
+        # conflicts with a clear net-change, we demote the regime to NEUTRAL rather than
+        # stamp a misleading trend.
+        self.net_change_anchor_enabled = bool(cfg.get("net_change_anchor_enabled", True))
+        # Net-change magnitude (as % of price) below which we don't enforce the anchor —
+        # a nearly-flat day has no meaningful bias to enforce.
+        self.net_change_deadband_pct = float(cfg.get("net_change_deadband_pct", 0.10))
+
+        # Session reference per instrument: prev close, session open, latest ltp.
+        self._session_ref: Dict[str, Dict[str, Any]] = {
+            "NIFTY": {"prev_close": 0.0, "session_open": 0.0, "ltp": 0.0},
+            "SENSEX": {"prev_close": 0.0, "session_open": 0.0, "ltp": 0.0},
+        }
+
+        # Pending-candidate tracker per instrument for confirmation-bar counting.
+        # { inst: {"candidate": <regime str>, "count": <int>} }
+        self._pending_change: Dict[str, Dict[str, Any]] = {
+            "NIFTY": {"candidate": None, "count": 0},
+            "SENSEX": {"candidate": None, "count": 0}
+        }
+
         # History per instrument: "NIFTY" and "SENSEX"
         self.candle_history: Dict[str, deque] = {
             "NIFTY": deque(maxlen=30),
@@ -103,6 +142,58 @@ class RegimeFilter:
             "is_choppy": False,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
+
+    def update_session_reference(self, inst: str, ltp: float, ts: float, prev_close: float = 0.0):
+        """
+        Records the session reference for the net-change anchor. Called on every spot tick
+        by the engine's regime driver.
+          - prev_close: previous session close (from the feed) when available; used as the
+            primary net-change reference.
+          - session_open: the first spot ltp seen this session (fallback reference / gap gauge).
+          - ltp: latest spot price.
+        Resets automatically at the start of a new IST trading day.
+        """
+        ref = self._session_ref.get(inst)
+        if ref is None:
+            return
+        # Reset session open on a new day (by IST date).
+        try:
+            cur_date = self.parse_ist_time(ts).date()
+        except Exception:
+            cur_date = None
+        if ref.get("date") != cur_date:
+            ref["date"] = cur_date
+            ref["session_open"] = ltp
+            ref["prev_close"] = 0.0
+        if ref.get("session_open", 0.0) <= 0.0:
+            ref["session_open"] = ltp
+        if prev_close and prev_close > 0.0:
+            ref["prev_close"] = prev_close
+        ref["ltp"] = ltp
+
+    def parse_ist_time(self, ts: float):
+        """Converts a unix timestamp to IST (mirrors BaseStrategy for standalone use)."""
+        from datetime import timedelta
+        ist = timezone(timedelta(hours=5, minutes=30))
+        return datetime.fromtimestamp(ts, tz=ist)
+
+    def _net_change_bias(self, inst: str) -> Tuple[str, float]:
+        """
+        Returns (bias, net_pct) where bias is BULL / BEAR / NEUTRAL based on the session
+        net-change vs the reference (previous close preferred, else session open). NEUTRAL
+        when net-change is within the deadband or no reference is available.
+        """
+        ref = self._session_ref.get(inst)
+        if not ref:
+            return "NEUTRAL", 0.0
+        ltp = ref.get("ltp", 0.0)
+        base = ref.get("prev_close", 0.0) or ref.get("session_open", 0.0)
+        if ltp <= 0.0 or base <= 0.0:
+            return "NEUTRAL", 0.0
+        net_pct = (ltp - base) / base * 100.0
+        if abs(net_pct) < self.net_change_deadband_pct:
+            return "NEUTRAL", net_pct
+        return ("BULL" if net_pct > 0 else "BEAR"), net_pct
 
     def calculate_adx_score(self, current_adx: float, prev_adx: Optional[float] = None) -> float:
         """
@@ -231,6 +322,158 @@ class RegimeFilter:
         scaled_score = min(100.0, (abs_slope / max(0.01, target_slope)) * 100.0)
         return slope, scaled_score
 
+    def _regime_family(self, regime: str) -> str:
+        """Collapse TRENDING_BULL / TRENDING_BEAR to the 'TRENDING' family for band logic."""
+        if "TRENDING" in regime:
+            return "TRENDING"
+        return regime  # "NEUTRAL" or "CHOPPY"
+
+    def _raw_regime_with_deadband(self, score: float, prior_regime: str) -> str:
+        """
+        Maps the composite score to a raw regime *family* (TRENDING / NEUTRAL / CHOPPY)
+        applying deadband hysteresis around each threshold.
+
+        Enter TRENDING at score >= trending_threshold; only LEAVE it once the score drops
+        below (trending_threshold - trending_exit_band). Symmetrically, enter CHOPPY at
+        score < neutral_threshold but only LEAVE it once score rises above
+        (neutral_threshold + choppy_exit_band). This kills boundary jitter (e.g. 64/66/64).
+        """
+        prior_family = self._regime_family(prior_regime)
+
+        if not self.hysteresis_enabled:
+            if score >= self.trending_threshold:
+                return "TRENDING"
+            if score >= self.neutral_threshold:
+                return "NEUTRAL"
+            return "CHOPPY"
+
+        trend_exit = self.trending_threshold - self.trending_exit_band
+        choppy_exit = self.neutral_threshold + self.choppy_exit_band
+
+        if prior_family == "TRENDING":
+            # Stay trending unless we fall clearly below the exit band.
+            if score >= trend_exit:
+                return "TRENDING"
+            # Dropped out of trending — is it neutral or all the way to choppy?
+            return "NEUTRAL" if score >= self.neutral_threshold else "CHOPPY"
+
+        if prior_family == "CHOPPY":
+            # Stay choppy unless we rise clearly above the exit band.
+            if score < choppy_exit:
+                return "CHOPPY"
+            # Climbed out of chop — neutral or straight to trending?
+            return "TRENDING" if score >= self.trending_threshold else "NEUTRAL"
+
+        # prior was NEUTRAL: standard thresholds decide the candidate.
+        if score >= self.trending_threshold:
+            return "TRENDING"
+        if score < self.neutral_threshold:
+            return "CHOPPY"
+        return "NEUTRAL"
+
+    def _resolve_direction(
+        self,
+        raw_family: str,
+        vwap_slope: float,
+        dom_side: str,
+        curr_close: float,
+        curr_vwap: float
+    ) -> str:
+        """
+        Resolves BULL / BEAR / NEUTRAL for a candidate TRENDING regime.
+
+        Direction is only meaningful when trending. It must be corroborated by the VWAP
+        slope sign (the drift of value) AND the persistence dominant side (where closes
+        actually sat). If slope and persistence disagree, or slope is flatter than
+        direction_min_slope, we do NOT stamp a directional trend — this is what prevents
+        the false 'TREND UP' badge on a flat/choppy day.
+        """
+        if raw_family != "TRENDING":
+            return "NEUTRAL"
+
+        slope_dir = "NEUTRAL"
+        if vwap_slope > self.direction_min_slope:
+            slope_dir = "BULL"
+        elif vwap_slope < -self.direction_min_slope:
+            slope_dir = "BEAR"
+
+        pers_dir = "NEUTRAL"
+        if dom_side == "ABOVE":
+            pers_dir = "BULL"
+        elif dom_side == "BELOW":
+            pers_dir = "BEAR"
+
+        # Both signals agree: confident direction.
+        if slope_dir != "NEUTRAL" and slope_dir == pers_dir:
+            return slope_dir
+
+        # Slope is decisive but persistence is neutral/unclear: trust the slope.
+        if slope_dir != "NEUTRAL" and pers_dir == "NEUTRAL":
+            return slope_dir
+
+        # Slope flat but persistence clear: trust persistence (slow grind trend).
+        if slope_dir == "NEUTRAL" and pers_dir != "NEUTRAL":
+            return pers_dir
+
+        # Slope and persistence actively CONFLICT (e.g. slope up but closes mostly below
+        # VWAP) — this is chop masquerading as trend. Fall back to the raw close-vs-VWAP
+        # only if slope is non-trivial; otherwise NEUTRAL.
+        if slope_dir != "NEUTRAL":
+            return slope_dir  # slope wins ties over stale persistence
+        return "NEUTRAL"
+
+    def _apply_hysteresis(
+        self,
+        inst: str,
+        candidate: str,
+        candidate_direction: str,
+        prior_regime: str,
+        prior_state: Dict[str, Any]
+    ) -> Tuple[str, str]:
+        """
+        Confirmation-bar gate. A candidate regime must persist for the required number of
+        consecutive candles before it is committed. Moving INTO trending needs
+        confirm_bars_trending bars; relaxing toward NEUTRAL/CHOPPY needs confirm_bars_relax.
+
+        Returns the (committed_regime, committed_direction).
+        """
+        if not self.hysteresis_enabled:
+            return candidate, candidate_direction
+
+        prior_direction = prior_state.get("direction", "NEUTRAL")
+
+        # No change candidate == prior: reset pending, keep prior. (Direction may still
+        # refine within the same trending family, so allow same-family direction update.)
+        if candidate == prior_regime:
+            self._pending_change[inst] = {"candidate": None, "count": 0}
+            return candidate, candidate_direction
+
+        # Same TRENDING family but only the direction label changed. Treat a direction flip
+        # (BULL<->BEAR) as a change needing trending confirmation; keep prior until confirmed.
+        prior_family = self._regime_family(prior_regime)
+        cand_family = self._regime_family(candidate)
+
+        # Determine how many confirmation bars this transition needs.
+        if cand_family == "TRENDING":
+            required = self.confirm_bars_trending
+        else:
+            required = self.confirm_bars_relax
+
+        pend = self._pending_change.get(inst, {"candidate": None, "count": 0})
+        if pend.get("candidate") == candidate:
+            pend["count"] += 1
+        else:
+            pend = {"candidate": candidate, "count": 1}
+
+        if pend["count"] >= required:
+            # Commit the change; clear pending.
+            self._pending_change[inst] = {"candidate": None, "count": 0}
+            return candidate, candidate_direction
+
+        # Not yet confirmed: hold the prior regime, but let the pending counter ride.
+        self._pending_change[inst] = pend
+        return prior_regime, prior_direction
+
     def update_candle(
         self,
         inst: str,
@@ -284,23 +527,44 @@ class RegimeFilter:
         curr_close = float(candle.get("close", 0.0))
         curr_vwap = float(vwap)
 
-        if composite_score >= self.trending_threshold:
-            # Bullish vs Bearish alignment
-            if curr_close >= curr_vwap and vwap_slope >= -0.05:
-                regime = "TRENDING_BULL"
-                direction = "BULL"
-            elif curr_close <= curr_vwap and vwap_slope <= 0.05:
-                regime = "TRENDING_BEAR"
-                direction = "BEAR"
+        prior = self.latest_regime.get(inst, self._default_regime_state(inst))
+        prior_regime = prior.get("regime", "NEUTRAL")
+
+        # 1. Raw candidate regime from the current score, using deadband bands so a score
+        #    hovering at a boundary does not flip the committed regime back and forth.
+        raw_regime = self._raw_regime_with_deadband(composite_score, prior_regime)
+
+        # 2. Direction only matters for a TRENDING regime, and must be corroborated by the
+        #    VWAP slope sign and the persistence dominant side, not an instantaneous
+        #    close-vs-VWAP snapshot (which is what mislabeled Sep 29 as "TREND UP").
+        direction = self._resolve_direction(raw_regime, vwap_slope, dom_side, curr_close, curr_vwap)
+        if raw_regime == "TRENDING":
+            if direction == "NEUTRAL":
+                # High score but no corroborated direction (flat slope + no dominant side):
+                # this is not a real trend. Demote to NEUTRAL rather than stamp a false trend.
+                raw_regime = "NEUTRAL"
             else:
-                direction = "BULL" if curr_close >= curr_vwap else "BEAR"
-                regime = f"TRENDING_{direction}"
-        elif composite_score >= self.neutral_threshold:
-            regime = "NEUTRAL"
-            direction = "NEUTRAL"
-        else:
-            regime = "CHOPPY"
-            direction = "NEUTRAL"
+                # Session net-change anchor: a directional trend must not fight the day's
+                # actual net move. If VWAP-derived direction conflicts with a clear
+                # net-change bias (e.g. slope says BULL but the day is clearly red), this is
+                # a counter-net-change reading — demote to NEUTRAL instead of a false trend.
+                if self.net_change_anchor_enabled:
+                    bias, net_pct = self._net_change_bias(inst)
+                    if bias != "NEUTRAL" and bias != direction:
+                        logger.info(
+                            f"🧭 [REGIME NET-CHANGE ANCHOR] {inst} demoting TRENDING_{direction} → NEUTRAL: "
+                            f"conflicts with session net-change {net_pct:+.2f}% ({bias})"
+                        )
+                        raw_regime = "NEUTRAL"
+                        direction = "NEUTRAL"
+                    else:
+                        raw_regime = f"TRENDING_{direction}"
+                else:
+                    raw_regime = f"TRENDING_{direction}"
+
+        # 3. Hysteresis confirmation: require the candidate to persist for N bars before
+        #    committing, so single-bar spikes cannot stamp a new regime.
+        regime, direction = self._apply_hysteresis(inst, raw_regime, direction, prior_regime, prior)
 
         state = {
             "instrument": inst,
@@ -398,6 +662,37 @@ class RegimeFilter:
         """
         return True, "Radar pre-alerts permitted across all regimes"
 
+    def allows_oi_squeeze(self, inst: str, direction: str) -> Tuple[bool, str]:
+        """
+        Evaluates whether an OI Squeeze signal in the given direction (CE/PE) is permitted.
+
+        The Sep 29 recorded-tick backtest showed OI Squeeze bleeds on counter-trend CE
+        spikes: on a bearish/choppy day it repeatedly bought call spikes that mean-reverted
+        (SENSEX: 6 CE trades -₹1,488 vs 3 PE trades +₹1,968). So:
+          - CHOPPY (< 45): full standdown — a price spike + OI unwind in chop is usually noise.
+          - TRENDING_BULL: allow CE only (block counter-trend PE).
+          - TRENDING_BEAR: allow PE only (block counter-trend CE).
+          - NEUTRAL: allow both — the middle ground; the directional gate only bites in the
+            clearer TRENDING regime where the counter-trend losses actually occurred.
+        """
+        if not self.enabled:
+            return True, "RegimeFilter disabled"
+
+        st = self.get_regime(inst)
+        regime = st.get("regime", "NEUTRAL")
+        score = st.get("score", 50.0)
+
+        if regime == "CHOPPY":
+            return False, f"OI Squeeze standdown: regime is CHOPPY (Score: {score:.1f} < {self.neutral_threshold})"
+
+        if regime == "TRENDING_BULL" and direction == "PE":
+            return False, f"OI Squeeze PE blocked: counter-trend in TRENDING_BULL (Score: {score:.1f})"
+
+        if regime == "TRENDING_BEAR" and direction == "CE":
+            return False, f"OI Squeeze CE blocked: counter-trend in TRENDING_BEAR (Score: {score:.1f})"
+
+        return True, f"OI Squeeze {direction} allowed in {regime} (Score: {score:.1f})"
+
     def seed_from_candles(self, inst: str, candles: List[Dict[str, Any]]):
         """
         Feeds historical candles to warm up the regime filter on startup.
@@ -410,6 +705,18 @@ class RegimeFilter:
 
         adx_ind = IncrementalADX(period=14)
         vwap_ind = IncrementalVWAP()
+
+        # Clear any pending hysteresis candidate so warmup starts from a clean slate.
+        self._pending_change[inst] = {"candidate": None, "count": 0}
+
+        # Seed the session net-change reference from the warm-up candles: the last candle's
+        # close is the best available "previous close" proxy until the live feed provides one.
+        ref = self._session_ref.get(inst)
+        if ref is not None and candles:
+            last_close = float(candles[-1].get("close", 0.0) or 0.0)
+            if last_close > 0.0:
+                ref["prev_close"] = last_close
+                ref["ltp"] = last_close
 
         logger.info(f"🔄 [REGIME_FILTER] Warming up {inst} with {len(candles)} historical candles...")
 
@@ -432,3 +739,27 @@ class RegimeFilter:
             f"(Score: {final_st['score']} | ADX: {final_st['adx_value']}, ER: {final_st['er_value']}, "
             f"Pers: {final_st['persistence_score']}, Slope: {final_st['vwap_slope']:+.2f})"
         )
+
+    def reset_session(self, inst: str):
+        """
+        Clears all session-scoped state for an instrument so the regime starts
+        clean for the next trading day. Called by the EOD sweep when the app runs
+        continuously across sessions without a restart.
+
+        Resets:
+          - Latest committed regime → default (NEUTRAL, score 50)
+          - Hysteresis pending candidate → empty
+          - Session net-change anchor (prev_close, session_open, ltp) → zeroed
+          - Candle / VWAP / ADX history deques → cleared
+        """
+        self.latest_regime[inst] = self._default_regime_state(inst)
+        self._pending_change[inst] = {"candidate": None, "count": 0}
+        self._session_ref[inst] = {"prev_close": 0.0, "session_open": 0.0, "ltp": 0.0}
+        if inst in self.candle_history:
+            self.candle_history[inst].clear()
+        if inst in self.vwap_history:
+            self.vwap_history[inst].clear()
+        if inst in self.adx_history:
+            self.adx_history[inst].clear()
+        logger.info(f"🔄 [REGIME_FILTER] {inst} session state reset for next trading day.")
+

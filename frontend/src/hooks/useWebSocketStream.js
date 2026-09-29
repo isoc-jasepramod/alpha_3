@@ -86,11 +86,12 @@ export function useWebSocketStream(onNewSignal, onSignalResolved, onRadarAlert) 
           } else if (data.event === 'RADAR_PRE_ALERT') {
             const alert = data.alert;
             setRadarAlerts((prev) => {
-              // Replace older alert for same instrument and alert type
+              // Replace older alert for same instrument and alert type (dedup)
               const filtered = prev.filter(
                 (a) => !(a.instrument === alert.instrument && a.alert_type === alert.alert_type)
               );
-              return [alert, ...filtered.slice(0, 2)]; // Keep at most 3 active alerts
+              // Keep a deeper buffer now that the banner groups them by category tier.
+              return [alert, ...filtered.slice(0, 11)]; // up to 12 active alerts across tiers
             });
             if (onRadarAlert) onRadarAlert(alert);
           }

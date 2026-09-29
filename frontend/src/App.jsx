@@ -37,11 +37,17 @@ export default function App() {
 
   const handleRadarAlert = useCallback(
     (alert) => {
-      if (soundEnabled) {
+      if (!soundEnabled) return;
+      // Play a tone for EVERY alert, but keep them distinguishable by tier: the prominent
+      // chime for ACTIONABLE, a softer tick for WATCH/CONTEXT — so nothing is missed while
+      // you can still tell a trade-ready cue from background context by ear.
+      if (alert?.category === 'ACTIONABLE') {
         playRadarAlertSound();
+      } else {
+        playChasePreventedSound();
       }
     },
-    [soundEnabled, playRadarAlertSound]
+    [soundEnabled, playRadarAlertSound, playChasePreventedSound]
   );
 
   const { connected, activeSignals, radarAlerts, dismissRadarAlert, telemetry, spotData, regimes } = useWebSocketStream(

@@ -27,6 +27,10 @@ start "Alpha Backend (Port 8001)" /min cmd /c "cd /d e:\Website\Alpha_3.0 && pyt
 :: Wait 4 seconds for backend to bind port 8001
 timeout /t 4 /nobreak >nul
 
+:: 2b. Launch Tick Recorder (captures real ticks to data/lake for faithful replay backtests)
+echo Starting Tick Recorder (data capture for replay)...
+start "Alpha Tick Recorder" /min cmd /c "cd /d e:\Website\Alpha_3.0 && python lab_services/tick_recorder.py"
+
 :: 3. Launch Frontend Dev Server on port 3000
 echo Starting Frontend UI on port 3000...
 start "Alpha Frontend (Port 3000)" /min cmd /c "cd /d e:\Website\Alpha_3.0\frontend && npm run dev"
