@@ -16,6 +16,10 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr :3000 ^| findstr LISTENING') 
     taskkill /f /pid %%a 2>nul
 )
 
+:: Stop the Tick Recorder (no port — kill by window title)
+echo Stopping Tick Recorder...
+taskkill /f /fi "WINDOWTITLE eq Alpha Tick Recorder*" 2>nul
+
 echo.
 echo [Project Alpha 2.0] System successfully stopped. All ports released.
 timeout /t 2 /nobreak >nul

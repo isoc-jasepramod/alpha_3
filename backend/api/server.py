@@ -23,6 +23,7 @@ from backend.strategies.vwap_ema import VWAPEMAAlignment
 from backend.strategies.gamma_scalp import ExpiryDayGammaScalp
 from backend.strategies.momentum_impulse import MomentumImpulseDetector
 from backend.strategies.regime_filter import RegimeFilter
+from backend.strategies.indicators import CandleAggregator, IncrementalVWAP, IncrementalADX
 from backend.strategies.iv_engine import IVEngine
 from backend.strategies.gex_engine import GEXEngine
 from backend.strategies.flow_engine import FlowEngine
@@ -54,6 +55,20 @@ class EngineCoordinator:
 
         # Shared Market Regime Filter
         self.regime_filter = RegimeFilter(strat_cfg.get("regime_filter"))
+
+        # Independent Regime Indicators & Candle Aggregators (driven directly by spot ticks)
+        self.regime_aggregators: Dict[str, CandleAggregator] = {
+            "NIFTY": CandleAggregator(timeframe_seconds=180),
+            "SENSEX": CandleAggregator(timeframe_seconds=180)
+        }
+        self.regime_vwap: Dict[str, IncrementalVWAP] = {
+            "NIFTY": IncrementalVWAP(),
+            "SENSEX": IncrementalVWAP()
+        }
+        self.regime_adx: Dict[str, IncrementalADX] = {
+            "NIFTY": IncrementalADX(period=14),
+            "SENSEX": IncrementalADX(period=14)
+        }
 
         # Core and Precursor Predictive Engines
         iv_engine = IVEngine(strat_cfg.get("iv_engine"))
@@ -255,6 +270,18 @@ class EngineCoordinator:
                 if candles:
                     try:
                         self.regime_filter.seed_from_candles(inst, candles)
+                        for c in candles:
+                            h = float(c.get("high", 0.0))
+                            l = float(c.get("low", 0.0))
+                            cl = float(c.get("close", 0.0))
+                            v = float(c.get("volume", 1000.0))
+                            if cl <= 0:
+                                continue
+                            typical = (h + l + cl) / 3.0
+                            if inst in self.regime_vwap:
+                                self.regime_vwap[inst].update(typical, v)
+                            if inst in self.regime_adx:
+                                self.regime_adx[inst].update(h, l, cl)
                     except Exception as e:
                         logger.warning(f"Failed to seed regime filter for {inst}: {e}")
                     for strat in self.strategies:
@@ -336,6 +363,7 @@ class EngineCoordinator:
         self.tasks.append(asyncio.create_task(self._tick_consumer_loop()))
         self.tasks.append(asyncio.create_task(self._throttle_broadcast_loop()))
         self.tasks.append(asyncio.create_task(self._signals_listener_loop()))
+        self.tasks.append(asyncio.create_task(self._eod_sweep_scheduler()))
         logger.info("Alpha 2.0 Engine background workers started.")
 
     async def stop_workers(self):
@@ -350,6 +378,106 @@ class EngineCoordinator:
             await self.telegram.close()
         await self.redis_bus.close()
         logger.info("Alpha 2.0 Engine stopped.")
+
+    async def _eod_sweep_scheduler(self):
+        """
+        Background scheduler that triggers at 15:25 IST every trading day.
+        Sweeps all ACTIVE signals, marks them EOD_EXPIRED, records last LTP
+        as exit price, persists PnL to database, and sends a Telegram summary.
+        Also resets the Risk Governor daily PnL counter.
+        """
+        from datetime import timedelta
+        IST = timezone(timedelta(hours=5, minutes=30))
+
+        while self.running:
+            try:
+                now_ist = datetime.now(IST)
+                # Calculate seconds until next 15:25:00 IST
+                target_today = now_ist.replace(hour=15, minute=25, second=0, microsecond=0)
+                if now_ist >= target_today:
+                    # Already past 15:25 today — schedule for tomorrow
+                    target_today += timedelta(days=1)
+                    # Skip weekends
+                    while target_today.weekday() >= 5:
+                        target_today += timedelta(days=1)
+
+                wait_seconds = (target_today - now_ist).total_seconds()
+                logger.info(f"⏰ [EOD SCHEDULER] Next sweep at {target_today.strftime('%Y-%m-%d %H:%M IST')} ({wait_seconds / 3600:.1f}h from now)")
+                await asyncio.sleep(wait_seconds)
+
+                if not self.running:
+                    break
+
+                logger.warning("🏁 [EOD SWEEP] Market closing in 5 minutes — sweeping active signals...")
+
+                # 1. Sweep all active signals
+                expired = await self.signal_tracker.sweep_eod_signals()
+
+                # 2. Send Telegram summary
+                if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
+                    try:
+                        if expired:
+                            total_pnl = sum(s.get("theoretical_pnl", 0) for s in expired)
+                            lines = [f"🏁 <b>END-OF-DAY SWEEP ({len(expired)} signals expired)</b>\n"]
+                            for s in expired:
+                                sym = s.get("option_symbol", "?")
+                                pnl = float(s.get("theoretical_pnl", 0))
+                                entry = float(s.get("entry_price", 0))
+                                exit_p = float(s.get("exit_price", 0))
+                                icon = "📈" if pnl >= 0 else "📉"
+                                lines.append(f"{icon} <code>{sym}</code>: ₹{entry:.2f} → ₹{exit_p:.2f} = <b>₹{pnl:+,.2f}</b>")
+                            lines.append(f"\n💰 <b>EOD Total PnL: ₹{total_pnl:+,.2f}</b>")
+                            await self.telegram.enqueue_message("\n".join(lines))
+                        else:
+                            await self.telegram.enqueue_message("🏁 <b>END-OF-DAY:</b> No active signals at market close. Clean session.")
+                    except Exception as e:
+                        logger.error(f"Telegram EOD summary error: {e}")
+
+                # 3. Reset daily PnL for next session
+                self.risk_governor.realized_daily_pnl = 0.0
+                self.risk_governor.circuit_breaker_tripped = False
+                self.risk_governor.circuit_breaker_time = None
+                logger.info("🔄 [EOD RESET] Risk Governor daily state reset for next session.")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"EOD sweep scheduler error: {e}")
+                await asyncio.sleep(60)  # Retry in 1 min if something fails
+
+    def _drive_regime(self, inst: str, ltp: float, tick: Dict[str, Any]):
+        """
+        Independently aggregates spot ticks into 3m candles and feeds RegimeFilter.
+        Operates directly in EngineCoordinator decoupled from any individual strategy.
+        """
+        if inst not in self.regime_aggregators:
+            return
+
+        try:
+            ts = float(tick.get("exchange_timestamp", 0.0)) or datetime.now(timezone.utc).timestamp()
+            vol = float(tick.get("volume", 1.0)) or 1.0
+
+            if inst in self.regime_vwap:
+                self.regime_vwap[inst].update(ltp, vol)
+
+            closed = self.regime_aggregators[inst].on_tick(ts, ltp, volume=vol)
+            if closed:
+                h = float(closed.get("high", ltp))
+                l = float(closed.get("low", ltp))
+                c = float(closed.get("close", ltp))
+
+                vwap_val = self.regime_vwap[inst].value if inst in self.regime_vwap else c
+                # Self-healing sanity anchor: an index VWAP cannot mathematically deviate > 2% from candle close
+                if c > 0 and abs(vwap_val - c) / c > 0.02:
+                    if inst in self.regime_vwap:
+                        self.regime_vwap[inst].seed(c, 5000.0)
+                    vwap_val = c
+
+                adx_val = self.regime_adx[inst].update(h, l, c) if inst in self.regime_adx else 20.0
+
+                self.regime_filter.update_candle(inst, closed, vwap_val, adx_val)
+        except Exception as e:
+            logger.error(f"Error updating independent regime for {inst}: {e}")
 
     async def _tick_consumer_loop(self):
         """
@@ -426,6 +554,9 @@ class EngineCoordinator:
                                     else:
                                         tokens_by_exch["nfo_fo"].append(t)
                             await self.ws_client.update_subscriptions(tokens_by_exch)
+
+                    # Independently drive session market regime filter from spot ticks
+                    self._drive_regime(inst, ltp, tick)
 
             # 1. Update Signal Tracker
             await self.signal_tracker.on_tick(tick)

@@ -76,7 +76,10 @@ class ExpiryDayGammaScalp(BaseStrategy):
 
         # WATCH alert tracking (avoid spamming)
         self._watch_emitted: Dict[str, float] = {}  # "NIFTY_CE" -> last_watch_ts
-        self._watch_cooldown_sec = 120  # 2 min between WATCH alerts
+        self._watch_cooldown_sec = 300  # 5 min between WATCH alerts per direction
+        # Global (cross-direction) rate-limit: prevents alternating CE/PE spam in a range
+        self._watch_global_emitted: Dict[str, float] = {}  # "NIFTY" -> last_watch_ts (any direction)
+        self._watch_global_cooldown_sec = 300  # 5 min between ANY gamma watch alert per instrument
 
     def _in_consolidation_window(self, dt: datetime) -> bool:
         t = dt.time()
@@ -200,8 +203,10 @@ class ExpiryDayGammaScalp(BaseStrategy):
                         if 0 < (h_mid - ltp) <= proximity_threshold and tick_vel > 0.02:
                             watch_key = f"{inst}_CE"
                             last_watch = self._watch_emitted.get(watch_key, 0)
-                            if ts - last_watch > self._watch_cooldown_sec:
+                            last_global = self._watch_global_emitted.get(inst, 0)
+                            if ts - last_watch > self._watch_cooldown_sec and ts - last_global > self._watch_global_cooldown_sec:
                                 self._watch_emitted[watch_key] = ts
+                                self._watch_global_emitted[inst] = ts
                                 logger.warning(
                                     f"👀 [GAMMA WATCH] {inst} spot {ltp:.1f} approaching H_mid {h_mid:.1f} "
                                     f"(gap: {h_mid - ltp:.1f} pts, velocity: +{tick_vel:.3f}%/30s). "
@@ -220,8 +225,10 @@ class ExpiryDayGammaScalp(BaseStrategy):
                         elif 0 < (ltp - l_mid) <= proximity_threshold and tick_vel < -0.02:
                             watch_key = f"{inst}_PE"
                             last_watch = self._watch_emitted.get(watch_key, 0)
-                            if ts - last_watch > self._watch_cooldown_sec:
+                            last_global = self._watch_global_emitted.get(inst, 0)
+                            if ts - last_watch > self._watch_cooldown_sec and ts - last_global > self._watch_global_cooldown_sec:
                                 self._watch_emitted[watch_key] = ts
+                                self._watch_global_emitted[inst] = ts
                                 logger.warning(
                                     f"👀 [GAMMA WATCH] {inst} spot {ltp:.1f} approaching L_mid {l_mid:.1f} "
                                     f"(gap: {ltp - l_mid:.1f} pts, velocity: {tick_vel:.3f}%/30s). "

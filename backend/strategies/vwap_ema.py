@@ -168,11 +168,9 @@ class VWAPEMAAlignment(BaseStrategy):
         logger.info(f"⚡ [VWAP_EMA] Pre-seeded {inst} indicators from spot quote: LTP={ltp}, VWAP={typical_price:.1f}, EMA9={ltp:.1f}, EMA21={(ltp+op)/2.0:.1f}, DayHi={hi:.1f}, DayLo={lo:.1f}")
 
     def seed_from_candles(self, inst: str, candles: List[Dict[str, Any]]):
-        """Feeds historical 3-minute candles to fully warm up VWAP, EMAs, RSI, ADX, and RegimeFilter."""
+        """Feeds historical 3-minute candles to fully warm up VWAP, EMAs, RSI, and ADX."""
         if not candles:
             return
-        if self.regime_filter:
-            self.regime_filter.seed_from_candles(inst, candles)
         logger.info(f"🔄 [VWAP_EMA] Warming up {inst} indicators with {len(candles)} historical candles...")
         for c in candles:
             hi = float(c.get("high", 0.0))
@@ -360,10 +358,6 @@ class VWAPEMAAlignment(BaseStrategy):
                 v_contact_ema9_ce = self.contact_detectors[inst].check_contact(closed, ema9_val, "EMA9", direction="CE")
                 v_contact_vwap_pe = self.contact_detectors[inst].check_contact(closed, vwap_val, "VWAP", direction="PE")
                 v_contact_ema9_pe = self.contact_detectors[inst].check_contact(closed, ema9_val, "EMA9", direction="PE")
-
-                # Update shared Session Regime Filter with closed 3-minute candle
-                if self.regime_filter:
-                    self.regime_filter.update_candle(inst, closed, vwap_val, adx_val)
 
                 # 1. Check if we were awaiting confirmation from prior rejection candle
                 awaiting = self.awaiting_confirmation[inst]
