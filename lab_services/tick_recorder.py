@@ -72,14 +72,19 @@ class TickRecorder:
             filepath = os.path.join(partition_dir, filename)
 
             # Convert to PyArrow Table
-            # Normalize schema fields
+            # Normalize schema fields. Captures last_traded_qty + best-5 depth so FlowEngine v2
+            # (quote-based trade classification: P>=ask buy / P<=bid sell) can be backtested on
+            # recorded data. Depth is flattened into bid1-5/ask1-5 price/qty/orders columns.
             records = []
             for t in ticks:
-                records.append({
+                rec = {
                     "token": str(t.get("token", "")),
                     "exchange": str(t.get("exchange", "")),
                     "ltp": float(t.get("ltp", 0.0)),
+                    "last_traded_qty": float(t.get("last_traded_qty", 0.0)),
                     "volume": float(t.get("volume", 0.0)),
+                    "total_buy_qty": float(t.get("total_buy_qty", 0.0)),
+                    "total_sell_qty": float(t.get("total_sell_qty", 0.0)),
                     "open_interest": float(t.get("open_interest", 0.0)),
                     "open": float(t.get("open", 0.0)),
                     "high": float(t.get("high", 0.0)),
@@ -87,7 +92,20 @@ class TickRecorder:
                     "close": float(t.get("close", 0.0)),
                     "exchange_timestamp": int(t.get("exchange_timestamp", 0)),
                     "received_at": str(t.get("received_at", datetime.now(timezone.utc).isoformat()))
-                })
+                }
+                depth = t.get("depth") or {}
+                bids = depth.get("bids", [])
+                asks = depth.get("asks", [])
+                for lvl in range(5):
+                    b = bids[lvl] if lvl < len(bids) else {}
+                    a = asks[lvl] if lvl < len(asks) else {}
+                    rec[f"bid{lvl+1}_price"] = float(b.get("price", 0.0))
+                    rec[f"bid{lvl+1}_qty"] = float(b.get("qty", 0.0))
+                    rec[f"bid{lvl+1}_orders"] = int(b.get("orders", 0))
+                    rec[f"ask{lvl+1}_price"] = float(a.get("price", 0.0))
+                    rec[f"ask{lvl+1}_qty"] = float(a.get("qty", 0.0))
+                    rec[f"ask{lvl+1}_orders"] = int(a.get("orders", 0))
+                records.append(rec)
 
             table = pa.Table.from_pylist(records)
             pq.write_table(table, filepath, compression="snappy")

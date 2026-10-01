@@ -33,6 +33,39 @@ class SmartAPIWebSocketClient:
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.subscribed_tokens: Dict[str, List[str]] = {} # exchange -> [tokens]
         self._task: Optional[asyncio.Task] = None
+        # One-shot depth-offset verification: on the first real Mode-3 SnapQuote packet with
+        # depth, run verify_depth_offsets() on the raw bytes, write a report, then disable.
+        # Confirms the FlowEngine v2 best-5 byte offsets on LIVE data (no second WS session).
+        self._depth_verify_done = False
+
+    def _verify_depth_once(self, raw_packet: bytes):
+        """
+        One-shot: run verify_depth_offsets() on the first live Mode-3 depth packet, log the
+        result, and write it to logs/<date>/depth_verify.json. Confirms the FlowEngine v2
+        best-5 byte offsets decode correctly on REAL data. Self-disables after one run.
+        """
+        self._depth_verify_done = True  # set first so a parse error can't retrigger a loop
+        try:
+            import os, json
+            from datetime import datetime, timezone
+            rep = SmartAPIBinaryParser.verify_depth_offsets(raw_packet)
+            status = "PASS" if rep.get("ok") else "FAIL"
+            logger.warning(
+                f"🔎 [DEPTH VERIFY] {status} offsets check on live packet "
+                f"(ltp={rep.get('ltp')} bid1={rep.get('bid1')} ask1={rep.get('ask1')}) checks={rep.get('checks')}"
+            )
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            out_dir = os.path.join("logs", today)
+            os.makedirs(out_dir, exist_ok=True)
+            rep_out = dict(rep)
+            rep_out["packet_len"] = len(raw_packet)
+            rep_out["written_at"] = datetime.now(timezone.utc).isoformat()
+            rep_out["raw_hex"] = raw_packet.hex()
+            with open(os.path.join(out_dir, "depth_verify.json"), "w") as f:
+                json.dump(rep_out, f, indent=2, default=str)
+            logger.warning(f"🔎 [DEPTH VERIFY] report written to {os.path.join(out_dir, 'depth_verify.json')}")
+        except Exception as e:
+            logger.warning(f"🔎 [DEPTH VERIFY] failed: {e}")
 
     def set_tokens(self, subscription_dict: Dict[str, List[str]]):
         """
@@ -119,6 +152,11 @@ class SmartAPIWebSocketClient:
                         if not self.running:
                             break
                         if isinstance(message, bytes):
+                            # One-shot live depth-offset verification (self-disabling).
+                            # Only on OPTION packets (exchange 2=NFO/4=BFO); index has no book.
+                            if (not self._depth_verify_done and len(message) >= 355
+                                    and message[0] == 3 and message[1] in (2, 4)):
+                                self._verify_depth_once(message)
                             tick = SmartAPIBinaryParser.parse_packet(message)
                             if tick:
                                 await self.redis_bus.publish_tick(tick)

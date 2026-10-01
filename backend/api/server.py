@@ -26,6 +26,7 @@ from backend.strategies.regime_filter import RegimeFilter
 from backend.strategies.iv_engine import IVEngine
 from backend.strategies.gex_engine import GEXEngine
 from backend.strategies.flow_engine import FlowEngine
+from backend.strategies.flow_engine_v2 import FlowEngineV2
 from backend.strategies.squeeze_detector import SqueezeDetector
 from backend.core.chain_poller import OptionChainPoller
 from backend.core.telegram_notifier import TelegramNotifier
@@ -58,6 +59,7 @@ class EngineCoordinator:
         iv_engine = IVEngine(strat_cfg.get("iv_engine"))
         gex_engine = GEXEngine(iv_engine=iv_engine, config=strat_cfg.get("gex_engine"))
         flow_engine = FlowEngine(strat_cfg.get("flow_engine"))
+        flow_v2_engine = FlowEngineV2(strat_cfg.get("flow_v2"))
         squeeze_detector = SqueezeDetector(strat_cfg.get("squeeze_detector"))
 
         self.chain_poller = OptionChainPoller(
@@ -79,8 +81,10 @@ class EngineCoordinator:
             iv_engine,
             gex_engine,
             flow_engine,
+            flow_v2_engine,
             squeeze_detector
         ]
+        self.flow_v2_engine = flow_v2_engine  # estimated order-flow (disabled until validated)
 
 
         self.running = False

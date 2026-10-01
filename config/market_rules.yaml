@@ -28,6 +28,29 @@ trading_hours:
   master_sync_time: "08:30:00"
 
 strategies:
+  flow_v2:
+    # Estimated order-flow engine (quote-based trade classification via best-5 depth +
+    # estimated delta/CVD/pressure/depth-imbalance/absorption -> FlowIndex). Depth decode is
+    # live-verified. Ships DISABLED until validated on multiple days of recorded depth data.
+    enabled: false
+    start_time: "09:20:00"
+    end_time: "15:25:00"
+    window_sec: 60.0
+    z_window: 200
+    z_min_samples: 30
+    depth_weights: [1.0, 0.75, 0.50, 0.30, 0.15]
+    weights:                        # STARTING config, NOT validated — tune via backtest
+      delta: 0.30
+      delta_velocity: 0.20
+      pressure: 0.15
+      depth: 0.10
+      oi: 0.10
+      volume: 0.10
+      efficiency: 0.05
+    absorption_delta_z: 0.5
+    absorption_price_z: 0.3
+    absorption_min_persist: 2
+
   oi_squeeze:
     enabled: true
     start_time: "09:15:00"
