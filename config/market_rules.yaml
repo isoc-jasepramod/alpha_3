@@ -28,6 +28,13 @@ trading_hours:
   master_sync_time: "08:30:00"
 
 strategies:
+  flow_engine:
+    # DORMANT. Legacy CVD/absorption engine. Validated against Oct 1 recorded ticks:
+    # the deque(maxlen=120) truncates the intended 90s CVD-surge window ~99.9% of the time,
+    # and the alerts it does emit are uncalibrated, single-signed (morning CE) and reinforced
+    # that day's losing bias. Superseded by flow_v2. Keep disabled; use flow_v2 for order flow.
+    enabled: false
+
   flow_v2:
     # Estimated order-flow engine (quote-based trade classification via best-5 depth +
     # estimated delta/CVD/pressure/depth-imbalance/absorption -> FlowIndex). Depth decode is
@@ -71,7 +78,8 @@ strategies:
     orb_window_start: "09:15:00"
     orb_window_end: "09:30:00"
     buffer_margin_factor: 0.0003
-    min_rvol: 1.50
+    min_rvol: 1.80          # reconciled with code default; on corrected delta volume ~15% of
+                            # 5m candles clear this (a genuine 1.8x surge vs 20-candle baseline)
     candle_timeframe_min: 5
     max_gap_pct: 0.40
     extreme_gap_pct: 1.50

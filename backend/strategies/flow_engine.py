@@ -14,6 +14,11 @@ class FlowEngine(BaseStrategy):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(name="FLOW_ENGINE")
         cfg = config or {}
+        # DORMANT: validated against Oct 1 recorded ticks and found broken/misleading —
+        # the deque(maxlen=120) truncates the "90s CVD surge" window ~99.9% of the time,
+        # and the few alerts it does emit are uncalibrated single-signed morning CE calls.
+        # Superseded by FlowEngineV2. Ships disabled; set flow_engine.enabled: true to revive.
+        self.enabled = bool(cfg.get("enabled", False))
         self.start_time = cfg.get("start_time", "09:15:00")
         self.end_time = cfg.get("end_time", "15:25:00")
         self.absorption_window_sec = cfg.get("absorption_window_sec", 180) # 3 min
@@ -48,6 +53,8 @@ class FlowEngine(BaseStrategy):
                 self.spot_prices[inst] = cl
 
     async def on_tick(self, tick: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
         token = str(tick.get("token", ""))
         ltp = float(tick.get("ltp", 0.0))
         vol = float(tick.get("volume", 0.0))

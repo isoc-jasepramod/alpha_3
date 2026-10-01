@@ -44,7 +44,9 @@ async def test_gex_engine():
 
 @pytest.mark.asyncio
 async def test_flow_engine_absorption():
-    flow = FlowEngine()
+    # Legacy FlowEngine ships dormant (enabled defaults to False); enable it explicitly
+    # to validate the underlying CVD computation still works when opted in.
+    flow = FlowEngine({"enabled": True})
     # 1727241000 is 2024-09-25 10:40:00 IST (in-session)
     base_ts = 1727241000.0
     flow.update_spot("NIFTY", 24000.0, base_ts)

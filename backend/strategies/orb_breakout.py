@@ -62,9 +62,21 @@ class VolumeBackedORB(BaseStrategy):
             "SENSEX": VolumeDryUpDetector(lookback_period=10, min_dry_bars=cfg.get("min_dry_bars", 2), ignition_multiplier=cfg.get("ignition_multiplier", 1.8))
         }
 
-        # Option volume tracking for RVOL calculation
-        self.opt_5m_volumes: Dict[str, deque] = {} # token -> deque of volumes
+        # Option volume tracking for RVOL calculation.
+        # 5m is the preferred (stable) baseline; a faster 1m baseline bridges tokens that
+        # were subscribed late (e.g. a new ATM strike after mid-morning migration) and whose
+        # 5m deque hasn't filled 3 candles yet — so we confirm with real volume instead of
+        # blindly passing. Verified on recorded data: 1m baseline warms ~5 min after a token's
+        # first tick; 5m ~8 min.
+        self.opt_5m_volumes: Dict[str, deque] = {} # token -> deque of 5m candle volumes
         self.opt_aggregators: Dict[str, CandleAggregator] = {}
+        self.opt_1m_volumes: Dict[str, deque] = {} # token -> deque of 1m candle volumes
+        self.opt_1m_aggregators: Dict[str, CandleAggregator] = {}
+        # Broker 'volume' is the CUMULATIVE session total (monotonic). Verified on recorded
+        # data that summing it per candle inflates volume 350x-5000x and drifts all day,
+        # making RVOL ~3x too permissive. We convert cumulative -> per-tick DELTA volume
+        # (mirrors FlowEngine) so the aggregator sees real interval volume.
+        self.opt_prev_cum_vol: Dict[str, float] = {}  # token -> last cumulative volume
 
 
     def _get_range_limits(self, inst: str) -> tuple[float, float]:
@@ -183,10 +195,22 @@ class VolumeBackedORB(BaseStrategy):
                 l_orb = self.orb_ranges[inst]["low"]
                 orb_range = h_orb - l_orb
 
-                # Evaluate spot volume dynamics (Volume Dry-Up & Contact)
-                v_dryup = self.spot_dryup_detectors[inst].update(closed_spot_candle)
-                v_contact_h = self.spot_contact_detectors[inst].check_contact(closed_spot_candle, h_orb, "ORB_HIGH", direction="CE") if h_orb > 0 else {"is_contact": False, "boost_score": 0}
-                v_contact_l = self.spot_contact_detectors[inst].check_contact(closed_spot_candle, l_orb, "ORB_LOW", direction="PE") if l_orb < 1e9 else {"is_contact": False, "boost_score": 0}
+                # Spot volume dynamics are DISABLED: index spot ticks carry no traded volume
+                # (verified on recorded data: NIFTY/SENSEX spot volume is identically 0 all day),
+                # so dry-up/contact detection and their confidence bonuses would run on nothing.
+                # The breakout now rests on price/range/gap + corrected option RVOL confirmation.
+                # (If a volume-bearing spot proxy is wired later, re-enable the two calls below.)
+                _SPOT_HAS_VOLUME = False
+                neutral_vol = {"is_contact": False, "is_ignition": False, "is_dry_up": False,
+                               "dry_bars": 0, "ignition_ratio": 1.0, "boost_score": 0}
+                if _SPOT_HAS_VOLUME:
+                    v_dryup = self.spot_dryup_detectors[inst].update(closed_spot_candle)
+                    v_contact_h = self.spot_contact_detectors[inst].check_contact(closed_spot_candle, h_orb, "ORB_HIGH", direction="CE") if h_orb > 0 else dict(neutral_vol)
+                    v_contact_l = self.spot_contact_detectors[inst].check_contact(closed_spot_candle, l_orb, "ORB_LOW", direction="PE") if l_orb < 1e9 else dict(neutral_vol)
+                else:
+                    v_dryup = dict(neutral_vol)
+                    v_contact_h = dict(neutral_vol)
+                    v_contact_l = dict(neutral_vol)
 
                 if v_dryup["is_ignition"]:
                     logger.info(f"🔥 [ORB DRY-UP IGNITION] {inst} 5m spot breakout ignition after {v_dryup['dry_bars']} dry bars! Ratio: {v_dryup['ignition_ratio']:.2f}x")
@@ -304,23 +328,56 @@ class VolumeBackedORB(BaseStrategy):
         symbol = meta.get("symbol", "")
         is_atm = (meta.get("offset") == 0)
 
-        # Track 5m option volume for RVOL
+        # Track option volume for RVOL (both 5m preferred and 1m bridge timeframes)
         if token not in self.opt_aggregators:
             self.opt_aggregators[token] = CandleAggregator(timeframe_seconds=300)
             self.opt_5m_volumes[token] = deque(maxlen=20)
+            self.opt_1m_aggregators[token] = CandleAggregator(timeframe_seconds=60)
+            self.opt_1m_volumes[token] = deque(maxlen=20)
 
-        closed_opt_candle = self.opt_aggregators[token].on_tick(ts, ltp, volume=vol)
+        # Cumulative -> delta volume. First tick (no prior) and exchange resyncs
+        # (cumulative drop) both clamp to 0 so a stale/huge cumulative value can't leak in.
+        prev_cum = self.opt_prev_cum_vol.get(token)
+        delta_vol = 0.0 if prev_cum is None else max(0.0, vol - prev_cum)
+        self.opt_prev_cum_vol[token] = vol
+
+        closed_opt_candle = self.opt_aggregators[token].on_tick(ts, ltp, volume=delta_vol)
         if closed_opt_candle:
             self.opt_5m_volumes[token].append(closed_opt_candle.get("volume", 0.0))
+
+        closed_opt_1m = self.opt_1m_aggregators[token].on_tick(ts, ltp, volume=delta_vol)
+        if closed_opt_1m:
+            self.opt_1m_volumes[token].append(closed_opt_1m.get("volume", 0.0))
 
         # Check if there is a pending breakout on Spot that matches this ATM option
         pending = self.orb_ranges.get(inst, {}).get("pending_signal")
         if pending and is_atm and pending["direction"] == opt_type:
-            vols = list(self.opt_5m_volumes.get(token, []))
-            rvol = 1.85 # Default pass if early in session
-            if len(vols) >= 3:
-                avg_vol = sum(vols) / len(vols)
-                rvol = (closed_opt_candle["volume"] / avg_vol) if (closed_opt_candle and avg_vol > 0) else 1.85
+            # Tiered RVOL baseline so breakouts are confirmed with REAL volume as early as
+            # possible instead of being rubber-stamped:
+            #   1) >=3 closed 5m candles -> 5m RVOL (preferred, most stable)
+            #   2) else >=3 closed 1m candles -> 1m RVOL (bridges late-subscribed tokens,
+            #      e.g. a new ATM strike after mid-morning migration)
+            #   3) else (token genuinely cold, no baseline on either timeframe) -> pass at
+            #      threshold. This now only applies in a token's first ~3 min of ticks.
+            # Compare the MOST RECENT closed candle's volume to the baseline of prior candles.
+            # Using the deque's last element (not only a candle that closed on THIS exact tick)
+            # means a warm token keeps a valid RVOL between candle closes, instead of silently
+            # dropping to the cold-pass value whenever a confirming tick lands mid-candle.
+            vols_5m = list(self.opt_5m_volumes.get(token, []))
+            vols_1m = list(self.opt_1m_volumes.get(token, []))
+            rvol = self.min_rvol
+            rvol_src = "COLD_PASS"
+            if len(vols_5m) >= 4:
+                # last candle vs the mean of the preceding ones (exclude current from baseline)
+                baseline = sum(vols_5m[:-1]) / (len(vols_5m) - 1)
+                if baseline > 0:
+                    rvol = vols_5m[-1] / baseline
+                    rvol_src = "5m"
+            elif len(vols_1m) >= 4:
+                baseline = sum(vols_1m[:-1]) / (len(vols_1m) - 1)
+                if baseline > 0:
+                    rvol = vols_1m[-1] / baseline
+                    rvol_src = "1m"
 
             if rvol >= self.min_rvol:
                 min_rng, max_rng = self._get_range_limits(inst)
@@ -343,7 +400,7 @@ class VolumeBackedORB(BaseStrategy):
                 sig_key = f"ORB_{inst}_{opt_type}_{strike}"
                 if self.can_trigger(sig_key, ts):
                     self.orb_ranges[inst]["pending_signal"] = None
-                    logger.info(f"⚡ [ORB BREAKOUT] Triggered for {symbol} ({opt_type})! RVOL: {rvol:.2f}, Confidence: {confidence}%, Spot: {pending['close']}")
+                    logger.info(f"⚡ [ORB BREAKOUT] Triggered for {symbol} ({opt_type})! RVOL: {rvol:.2f} [{rvol_src}], Confidence: {confidence}%, Spot: {pending['close']}")
 
                     return self.build_signal_payload(
                         instrument=inst,
@@ -359,6 +416,7 @@ class VolumeBackedORB(BaseStrategy):
                         custom_sl_spot=pending.get("adaptive_sl"),
                         meta_details={
                             "rvol": round(rvol, 2),
+                            "rvol_source": rvol_src,
                             "h_orb": pending.get("h_orb"),
                             "l_orb": pending.get("l_orb"),
                             "orb_range": round(pending.get("orb_range", 0.0), 1),
