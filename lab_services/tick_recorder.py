@@ -1,4 +1,9 @@
 import os
+import sys
+# Allow running standalone (python lab_services/tick_recorder.py) without a 'backend' import
+# error — insert the project root on the path before importing backend.*.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import time
 from datetime import datetime, timezone, date
@@ -16,6 +21,13 @@ class TickRecorder:
     Apache Parquet files every 60 seconds without blocking the live engine.
     """
 
+    # Known index spot tokens (no order book / not options).
+    SPOT_TOKENS = {
+        "99926000": {"name": "NIFTY", "is_spot": True, "exchange": "nse_cm"},
+        "26000": {"name": "NIFTY", "is_spot": True, "exchange": "nse_cm"},
+        "99919000": {"name": "SENSEX", "is_spot": True, "exchange": "bse_cm"},
+    }
+
     def __init__(self, data_lake_dir: str = "data/lake", flush_interval_sec: int = 60):
         self.data_lake_dir = data_lake_dir
         self.flush_interval = flush_interval_sec
@@ -23,10 +35,79 @@ class TickRecorder:
         self.redis_bus = RedisBus.from_config()
         self.running = False
         os.makedirs(self.data_lake_dir, exist_ok=True)
+        # token -> metadata (strike/option_type/name/lot_size/is_spot). Built from the
+        # instrument master so the FlowEngine v2 backtest can map recorded tokens to
+        # contracts. Without this sidecar the per-tick numbers are un-interpretable.
+        self._token_meta: Dict[str, Dict[str, Any]] = {}
+        self._seen_tokens: set = set()
+        self._master_index: Dict[str, Dict[str, Any]] = {}
+
+    def _build_master_index(self):
+        """Load the instrument master once and build a token -> contract-metadata reverse index."""
+        try:
+            from backend.core.instrument_manager import InstrumentManager
+            mgr = InstrumentManager()
+            # Load from cache if present; the live app refreshes it daily.
+            mgr._load_from_cache()
+            for item in getattr(mgr, "instruments", []) or []:
+                # Only NIFTY/SENSEX index options — the only option tokens we ever subscribe.
+                if item.get("name") not in ("NIFTY", "SENSEX"):
+                    continue
+                if item.get("instrumenttype") not in ("OPTIDX", "OPTFUT", "FUTIDX"):
+                    continue
+                tok = str(item.get("token", ""))
+                if not tok:
+                    continue
+                sym = item.get("symbol", "")
+                opt_type = "CE" if sym.endswith("CE") else ("PE" if sym.endswith("PE") else None)
+                raw_strike = 0.0
+                try:
+                    raw_strike = float(item.get("strike", 0.0))
+                except (TypeError, ValueError):
+                    raw_strike = 0.0
+                strike_val = raw_strike / 100.0 if raw_strike > 100000 else raw_strike
+                self._master_index[tok] = {
+                    "name": item.get("name", ""),
+                    "symbol": sym,
+                    "strike": strike_val,
+                    "option_type": opt_type,
+                    "expiry": item.get("expiry", ""),
+                    "lot_size": int(float(item.get("lotsize", 0) or 0)),
+                    "instrumenttype": item.get("instrumenttype", ""),
+                    "is_spot": False,
+                }
+            logger.info(f"Tick Recorder: indexed {len(self._master_index)} instruments for token metadata.")
+        except Exception as e:
+            logger.warning(f"Tick Recorder: could not build master index ({e}); metadata sidecar will be sparse.")
+
+    def _resolve_meta(self, token: str) -> Dict[str, Any]:
+        """Resolve a token to its metadata (spot tokens first, then the master index)."""
+        if token in self.SPOT_TOKENS:
+            return dict(self.SPOT_TOKENS[token])
+        m = self._master_index.get(token)
+        if m:
+            return dict(m)
+        return {"name": "", "is_spot": False, "unresolved": True}
+
+    def _write_token_metadata(self):
+        """Write/refresh token_meta.json for all tokens seen so far (survives hard kill)."""
+        try:
+            import json
+            today_str = date.today().strftime("%Y-%m-%d")
+            partition_dir = os.path.join(self.data_lake_dir, f"date={today_str}")
+            os.makedirs(partition_dir, exist_ok=True)
+            for tok in self._seen_tokens:
+                if tok not in self._token_meta:
+                    self._token_meta[tok] = self._resolve_meta(tok)
+            with open(os.path.join(partition_dir, "token_meta.json"), "w") as f:
+                json.dump(self._token_meta, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"Tick Recorder: failed to write token_meta.json ({e}).")
 
     async def start(self):
         self.running = True
         logger.info(f"Tick Recorder started. Flush interval: {self.flush_interval}s. Target: {self.data_lake_dir}")
+        self._build_master_index()
         await self.redis_bus.connect()
 
         # Start flush loop
@@ -36,12 +117,16 @@ class TickRecorder:
             async for tick in self.redis_bus.subscribe(self.redis_bus.market_channel):
                 if not self.running:
                     break
+                tok = str(tick.get("token", ""))
+                if tok:
+                    self._seen_tokens.add(tok)
                 self.buffer.append(tick)
         except asyncio.CancelledError:
             pass
         finally:
             flush_task.cancel()
             await self._flush_buffer_to_parquet()
+            self._write_token_metadata()
             await self.redis_bus.close()
             logger.info("Tick Recorder stopped.")
 
@@ -49,6 +134,9 @@ class TickRecorder:
         while self.running:
             await asyncio.sleep(self.flush_interval)
             await self._flush_buffer_to_parquet()
+            # Rewrite the metadata sidecar each flush so it survives a hard kill (taskkill
+            # from stop_app.bat); the FlowEngine v2 backtest needs it to map tokens.
+            self._write_token_metadata()
 
     async def _flush_buffer_to_parquet(self):
         if not self.buffer:
