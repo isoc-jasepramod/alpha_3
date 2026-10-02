@@ -59,6 +59,15 @@ class VWAPEMAAlignment(BaseStrategy):
         self.min_vol_ratio = cfg.get("min_vol_ratio", 1.20)
         self.min_adx = cfg.get("min_adx", 22.0)
         self.min_vwap_slope = cfg.get("min_vwap_slope", 0.35)
+        # Real-volume confirmation. Index SPOT carries no traded volume (verified: 0% across
+        # all recorded days), so the spot vol_ratio/contact/dry-up run on a tick-count proxy,
+        # not real volume. We add a REAL volume gate on the matching ATM OPTION (which has true
+        # traded volume) at the moment it confirms the spot setup. Option 'volume' is the
+        # broker's CUMULATIVE session total, converted to per-tick delta (same as ORB).
+        self.min_opt_rvol = cfg.get("min_opt_rvol", 1.20)
+        self.opt_3m_aggregators: Dict[str, CandleAggregator] = {}  # token -> 3m aggregator
+        self.opt_3m_vols: Dict[str, deque] = {}                    # token -> deque of 3m vols
+        self.opt_prev_cum_vol: Dict[str, float] = {}               # token -> last cumulative vol
 
         # Anti-chop filter parameters
         self.exhaustion_atr_multiplier = cfg.get("exhaustion_atr_multiplier", 2.0)
@@ -347,10 +356,16 @@ class VWAPEMAAlignment(BaseStrategy):
                 vh = list(self.spot_vwap_history[inst])
                 vwap_slope = ((vh[-1] - vh[0]) / (len(vh) - 1)) if len(vh) >= 3 else 0.0
 
+                # NOTE: spot candle "volume" here is a TICK-COUNT proxy (each spot tick adds
+                # volume=1.0) because the index carries no traded volume. So vol_ratio below is
+                # a tick-ACTIVITY ratio — "more quote updates than usual" — NOT a traded-volume
+                # ratio. It is kept only as a secondary activity hint. The REAL volume
+                # authority is the ATM-option RVOL gate at confirmation (see option tick path).
                 self.spot_3m_vols[inst].append(closed["volume"])
                 vols = list(self.spot_3m_vols[inst])
-                avg_vol = (sum(vols[:-1]) / len(vols[:-1])) if len(vols) > 1 else closed["volume"]
-                vol_ratio = (closed["volume"] / avg_vol) if avg_vol > 0 else 1.25
+                avg_activity = (sum(vols[:-1]) / len(vols[:-1])) if len(vols) > 1 else closed["volume"]
+                tick_activity_ratio = (closed["volume"] / avg_activity) if avg_activity > 0 else 1.25
+                vol_ratio = tick_activity_ratio  # alias: downstream keys/logic unchanged, honest name above
 
                 # Evaluate Volume Dynamics Detectors
                 v_dryup = self.dryup_detectors[inst].update(closed)
@@ -476,11 +491,11 @@ class VWAPEMAAlignment(BaseStrategy):
                     and abs(c - vwap_val) / vwap_val <= 0.003
                 ):
                     self.emit_radar_alert(
-                        alert_type="VOLUME_DRYUP_SQUEEZE",
+                        alert_type="ACTIVITY_DRYUP_SQUEEZE",
                         instrument=inst,
                         direction="CE" if c >= vwap_val else "PE",
-                        title=f"🪫 {inst} Volume Dry-Up Squeeze",
-                        message=f"{inst} volume dried up for {v_dryup['dry_bars']} consecutive bars near VWAP ({vwap_val:.1f}). Range compressing — watch for ignition!",
+                        title=f"🪫 {inst} Tick-Activity Dry-Up Squeeze",
+                        message=f"{inst} tick-activity dried up for {v_dryup['dry_bars']} consecutive bars near VWAP ({vwap_val:.1f}) (index has no traded volume). Range compressing — watch for ignition!",
                         meta_details=v_dryup,
                         now_ts=ts
                     )
@@ -495,24 +510,24 @@ class VWAPEMAAlignment(BaseStrategy):
                         if (tested_ema9 or tested_vwap) and (bottom_wick >= self.min_bottom_wick):
                             if self.rsi_ce_min <= rsi_val <= self.rsi_ce_max:
                                 if contact_ce["is_contact"]:
-                                    logger.info(f"🎯 [VWAP_EMA CONTACT] {inst} CE tested {contact_ce['level_name']} ({contact_ce['level_price']:.1f}) with {contact_ce['vol_ratio']:.2f}x volume! Wick: {contact_ce['rejection_wick']:.2f}")
+                                    logger.info(f"🎯 [VWAP_EMA CONTACT] {inst} CE tested {contact_ce['level_name']} ({contact_ce['level_price']:.1f}) with {contact_ce['vol_ratio']:.2f}x tick-activity! Wick: {contact_ce['rejection_wick']:.2f}")
                                     self.emit_radar_alert(
-                                        alert_type="VOLUME_CONTACT",
+                                        alert_type="ACTIVITY_CONTACT",
                                         instrument=inst,
                                         direction="CE",
-                                        title=f"⚡ {inst} Institutional Volume Defense",
-                                        message=f"{inst} defended {contact_ce['level_name']} ({contact_ce['level_price']:.1f}) with {contact_ce['vol_ratio']:.1f}x volume! Bullish bounce forming.",
+                                        title=f"⚡ {inst} Level Defense (tick-activity)",
+                                        message=f"{inst} defended {contact_ce['level_name']} ({contact_ce['level_price']:.1f}) with {contact_ce['vol_ratio']:.1f}x tick-activity (index has no traded volume). Bullish bounce forming; real volume confirmed on the ATM option at entry.",
                                         meta_details=contact_ce,
                                         now_ts=ts
                                     )
                                 elif v_dryup["is_ignition"]:
-                                    logger.info(f"🔥 [VWAP_EMA DRY-UP IGNITION] {inst} CE ignition after {v_dryup['dry_bars']} dry bars! Ratio: {v_dryup['ignition_ratio']:.2f}x")
+                                    logger.info(f"🔥 [VWAP_EMA DRY-UP IGNITION] {inst} CE ignition after {v_dryup['dry_bars']} dry bars! Activity ratio: {v_dryup['ignition_ratio']:.2f}x")
                                     self.emit_radar_alert(
                                         alert_type="DRYUP_IGNITION",
                                         instrument=inst,
                                         direction="CE",
-                                        title=f"🔥 {inst} Volume Dry-Up Ignition",
-                                        message=f"{inst} broke out after {v_dryup['dry_bars']} dry bars with {v_dryup['ignition_ratio']:.1f}x volume! Bullish expansion underway.",
+                                        title=f"🔥 {inst} Tick-Activity Dry-Up Ignition",
+                                        message=f"{inst} broke out after {v_dryup['dry_bars']} dry bars with {v_dryup['ignition_ratio']:.1f}x tick-activity (index has no traded volume); real volume confirmed on the ATM option at entry. Bullish expansion underway.",
                                         meta_details=v_dryup,
                                         now_ts=ts
                                     )
@@ -591,24 +606,24 @@ class VWAPEMAAlignment(BaseStrategy):
                         if ((tested_ema9 or tested_vwap) and (top_wick >= 0.15)) or is_bearish_breakdown:
                             if self.rsi_pe_min <= rsi_val <= self.rsi_pe_max:
                                 if contact_pe["is_contact"]:
-                                    logger.info(f"🎯 [VWAP_EMA CONTACT] {inst} PE tested {contact_pe['level_name']} ({contact_pe['level_price']:.1f}) with {contact_pe['vol_ratio']:.2f}x volume! Wick: {contact_pe['rejection_wick']:.2f}")
+                                    logger.info(f"🎯 [VWAP_EMA CONTACT] {inst} PE tested {contact_pe['level_name']} ({contact_pe['level_price']:.1f}) with {contact_pe['vol_ratio']:.2f}x tick-activity! Wick: {contact_pe['rejection_wick']:.2f}")
                                     self.emit_radar_alert(
-                                        alert_type="VOLUME_CONTACT",
+                                        alert_type="ACTIVITY_CONTACT",
                                         instrument=inst,
                                         direction="PE",
-                                        title=f"⚡ {inst} Institutional Volume Attack",
-                                        message=f"{inst} rejected at {contact_pe['level_name']} ({contact_pe['level_price']:.1f}) with {contact_pe['vol_ratio']:.1f}x volume! Bearish breakdown forming.",
+                                        title=f"⚡ {inst} Level Rejection (tick-activity)",
+                                        message=f"{inst} rejected at {contact_pe['level_name']} ({contact_pe['level_price']:.1f}) with {contact_pe['vol_ratio']:.1f}x tick-activity (index has no traded volume). Bearish breakdown forming; real volume confirmed on the ATM option at entry.",
                                         meta_details=contact_pe,
                                         now_ts=ts
                                     )
                                 elif v_dryup["is_ignition"]:
-                                    logger.info(f"🔥 [VWAP_EMA DRY-UP IGNITION] {inst} PE ignition after {v_dryup['dry_bars']} dry bars! Ratio: {v_dryup['ignition_ratio']:.2f}x")
+                                    logger.info(f"🔥 [VWAP_EMA DRY-UP IGNITION] {inst} PE ignition after {v_dryup['dry_bars']} dry bars! Activity ratio: {v_dryup['ignition_ratio']:.2f}x")
                                     self.emit_radar_alert(
                                         alert_type="DRYUP_IGNITION",
                                         instrument=inst,
                                         direction="PE",
-                                        title=f"🔥 {inst} Volume Dry-Up Ignition",
-                                        message=f"{inst} broke down after {v_dryup['dry_bars']} dry bars with {v_dryup['ignition_ratio']:.1f}x volume! Bearish expansion underway.",
+                                        title=f"🔥 {inst} Tick-Activity Dry-Up Ignition",
+                                        message=f"{inst} broke down after {v_dryup['dry_bars']} dry bars with {v_dryup['ignition_ratio']:.1f}x tick-activity (index has no traded volume); real volume confirmed on the ATM option at entry. Bearish expansion underway.",
                                         meta_details=v_dryup,
                                         now_ts=ts
                                     )
@@ -689,14 +704,45 @@ class VWAPEMAAlignment(BaseStrategy):
         lot_size = int(meta.get("lot_size", 50))
         symbol = meta.get("symbol", "")
         is_atm = (meta.get("offset") == 0)
+        vol = float(tick.get("volume", 0.0))
+
+        # Track REAL option volume (cumulative -> per-tick delta) into 3m candles for every
+        # ATM option tick, so a volume baseline exists before a setup needs confirming.
+        option_rvol = None
+        if is_atm:
+            if token not in self.opt_3m_aggregators:
+                self.opt_3m_aggregators[token] = CandleAggregator(timeframe_seconds=180)
+                self.opt_3m_vols[token] = deque(maxlen=20)
+            prev_cum = self.opt_prev_cum_vol.get(token)
+            delta_vol = 0.0 if prev_cum is None else max(0.0, vol - prev_cum)
+            self.opt_prev_cum_vol[token] = vol
+            closed_opt = self.opt_3m_aggregators[token].on_tick(ts, ltp, volume=delta_vol)
+            if closed_opt:
+                self.opt_3m_vols[token].append(closed_opt.get("volume", 0.0))
+            # RVOL = most recent closed candle vs mean of prior candles (needs >=4 to be real)
+            ov = list(self.opt_3m_vols[token])
+            if len(ov) >= 4:
+                baseline = sum(ov[:-1]) / (len(ov) - 1)
+                if baseline > 0:
+                    option_rvol = ov[-1] / baseline
 
         pending = self.pending_signal.get(inst)
         if pending and is_atm and pending["direction"] == opt_type:
+            # REAL volume gate: require genuine ATM-option participation. If the baseline isn't
+            # warm yet (option_rvol is None), pass rather than block a legitimate early setup.
+            if option_rvol is not None and option_rvol < self.min_opt_rvol:
+                logger.info(
+                    f"🚧 [VWAP_EMA OPT-VOLUME] {symbol} ({opt_type}) confirmation held: option RVOL "
+                    f"{option_rvol:.2f} < {self.min_opt_rvol} (no real volume participation)."
+                )
+                return None
+
             sig_key = f"VWAP_EMA_{inst}_{opt_type}_{strike}"
             if self.can_trigger(sig_key, ts):
                 self.pending_signal[inst] = None
                 conf = pending.get("confidence", 75)
-                logger.info(f"⚡ [VWAP & EMA] Confirmed Trigger for {symbol} ({opt_type})! Confidence: {conf}%, Spot: {pending['spot_close']:.1f}, SL: {pending.get('custom_sl'):.1f}")
+                rvol_txt = f"{option_rvol:.2f}" if option_rvol is not None else "warming"
+                logger.info(f"⚡ [VWAP & EMA] Confirmed Trigger for {symbol} ({opt_type})! Confidence: {conf}%, OptRVOL: {rvol_txt}, Spot: {pending['spot_close']:.1f}, SL: {pending.get('custom_sl'):.1f}")
 
                 regime_st = self.regime_filter.get_regime(inst) if self.regime_filter else {}
                 return self.build_signal_payload(
@@ -716,6 +762,7 @@ class VWAPEMAAlignment(BaseStrategy):
                         "rsi": round(pending.get("rsi", 50.0), 1),
                         "custom_sl": round(pending.get("custom_sl", 0.0), 1),
                         "confidence": conf,
+                        "option_rvol": round(option_rvol, 2) if option_rvol is not None else None,
                         "volume_contact": pending.get("volume_contact"),
                         "volume_dryup": pending.get("volume_dryup"),
                         "regime": regime_st.get("regime", "UNKNOWN"),

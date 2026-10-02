@@ -104,6 +104,9 @@ strategies:
     rsi_ce_max: 72.0
     rsi_pe_min: 18.0
     rsi_pe_max: 52.0
+    min_opt_rvol: 1.20              # REAL volume gate on the matching ATM option at confirmation
+                                    # (index spot has no volume; option volume is genuine). Passes
+                                    # if the option volume baseline isn't warm yet.
 
 
   gamma_scalp:
