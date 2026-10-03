@@ -62,10 +62,16 @@ strategies:
     enabled: true
     start_time: "09:15:00"
     end_time: "15:30:00"
-    lookback_window_sec: 300
+    # OI from the broker refreshes only ~every 162s (verified on recorded data), so a 300s
+    # window captured only ~2 OI data points and the -2% early threshold sat BELOW the median
+    # single-refresh step (~2.87%) — OI quantization noise alone could trip it. 600s spans
+    # ~4 refreshes (a real ΔOI slope) and -4% clears the 600s noise floor (~4.1% median |ΔOI|).
+    # Measured effect: expectancy -2.23% -> -1.10%/trade (partial fix; price-spike term still
+    # dominates signal selection — exit redesign + exhaustion filter are the larger levers).
+    lookback_window_sec: 600
     min_oi_drop_pct: -5.0
     min_price_spike_pct: 3.0
-    early_ignition_oi_drop_pct: -2.0
+    early_ignition_oi_drop_pct: -4.0
     early_ignition_price_spike_pct_expiry: 8.0     # 0-DTE / high gamma
     early_ignition_price_spike_pct_standard: 12.0  # non-expiry day
     vol_multiplier: 2.0
