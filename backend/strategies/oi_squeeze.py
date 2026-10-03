@@ -34,6 +34,14 @@ class OISqueezeSentinel(BaseStrategy):
         # 1-min candle volume history (last 20 candles) per option token
         self.volume_history_1m: Dict[str, deque] = {}
 
+        # ---- v1.1 MEASUREMENT-ONLY state (local to OI Squeeze; does NOT gate any signal) ----
+        # Per-token sampled OI-change observations for an OI Z-score. We sample on each OI
+        # refresh (OI from the broker updates only ~every 162s), so this captures how unusual
+        # the current OI unwind is vs this option's own recent OI behaviour.
+        self.oi_change_samples: Dict[str, deque] = {}   # token -> deque of per-refresh ΔOI
+        self.last_oi_for_sample: Dict[str, float] = {}  # token -> last OI value seen
+        self.last_oi_ts: Dict[str, float] = {}          # token -> ts of last OI refresh
+
         # Spot tracking
         self.spot_prices: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
         self.spot_ema20: Dict[str, IncrementalEMA] = {
@@ -109,6 +117,134 @@ class OISqueezeSentinel(BaseStrategy):
 
         return self.early_ignition_price_spike_pct_expiry if is_expiry_today else self.early_ignition_price_spike_pct_standard
 
+    def _compute_v11_features(
+        self, token: str, inst: str, opt_type: str, hist: "deque", ltp: float, oi: float,
+        vol: float, delta_oi_pct: float, delta_price_pct: float, time_span: float,
+        tick: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        v1.1 MEASUREMENT-ONLY feature pack. Computed at signal time and attached to the
+        signal's meta_details for later backtest analysis. These values DO NOT affect whether
+        a signal fires — no caller gates on them. Everything here is local to OI Squeeze.
+        """
+        import statistics as _stats
+
+        feats: Dict[str, Any] = {}
+
+        # --- multi-horizon price velocity (pts%/sec) + acceleration from the tau window ---
+        def price_at_or_before(sec_ago: float):
+            target = hist[-1][0] - sec_ago
+            chosen = None
+            for (t, p, _o, _v) in hist:
+                if t <= target:
+                    chosen = p
+                else:
+                    break
+            return chosen
+
+        last_ts = hist[-1][0]
+        p_now = ltp
+        horizons = {}
+        for label, sec in (("30s", 30.0), ("60s", 60.0), ("120s", 120.0), ("300s", 300.0)):
+            p_old = price_at_or_before(sec)
+            if p_old and p_old > 0:
+                horizons[label] = round((p_now - p_old) / p_old * 100.0, 2)
+        feats["price_move_by_horizon_pct"] = horizons
+        # velocity = full-window price %move / elapsed; acceleration = recent vs earlier half
+        feats["price_velocity_pct_per_s"] = round(delta_price_pct / max(time_span, 1.0), 4)
+        half = horizons.get("60s")
+        full = horizons.get("300s")
+        if half is not None and full is not None:
+            feats["price_acceleration"] = round(half - (full - half), 2)
+
+        # --- OI velocity (%/min over the window) + absolute OI change ---
+        old_oi = hist[0][2] if hist else oi
+        feats["abs_oi_change"] = round(oi - old_oi, 0)
+        feats["oi_velocity_pct_per_min"] = round(delta_oi_pct / max(time_span / 60.0, 0.1), 3)
+
+        # --- OI Z-score: how unusual is this OI unwind vs this option's own refresh steps ---
+        samples = list(self.oi_change_samples.get(token, []))
+        if len(samples) >= 5:
+            mu = _stats.mean(samples)
+            sd = _stats.pstdev(samples)
+            cur_step = oi - old_oi
+            feats["oi_zscore"] = round((cur_step - mu) / sd, 2) if sd > 1e-9 else None
+        else:
+            feats["oi_zscore"] = None
+
+        # --- Volume Z-score from the 1m candle-volume history (option volume is real) ---
+        vols = list(self.volume_history_1m.get(token, []))
+        if len(vols) >= 5:
+            mu_v = _stats.mean(vols)
+            sd_v = _stats.pstdev(vols)
+            window_vol = vol - hist[0][3] if hist else 0.0
+            feats["volume_zscore"] = round((window_vol - mu_v) / sd_v, 2) if sd_v > 1e-9 else None
+            feats["window_volume"] = round(window_vol, 0)
+        else:
+            feats["volume_zscore"] = None
+
+        # --- spread % from best bid/ask if present on the tick ---
+        bid = tick.get("best_bid")
+        ask = tick.get("best_ask")
+        if bid and ask and bid > 0 and ask > 0 and ask >= bid:
+            mid = (ask + bid) / 2.0
+            feats["spread_pct"] = round((ask - bid) / mid * 100.0, 3) if mid > 0 else None
+        else:
+            feats["spread_pct"] = None
+
+        # --- underlying (spot) confirmation: return + velocity over the window ---
+        spot = self.spot_prices.get(inst, 0.0)
+        ema20 = self.spot_ema20.get(inst).value if self.spot_ema20.get(inst) else None
+        feats["spot"] = round(spot, 1) if spot else None
+        feats["spot_vs_ema20_pct"] = round((spot - ema20) / ema20 * 100.0, 3) if (ema20 and spot > 0) else None
+        # directional agreement: CE wants spot above EMA20, PE below
+        if ema20 and spot > 0:
+            feats["spot_confirms_direction"] = bool(
+                (opt_type == "CE" and spot >= ema20) or (opt_type == "PE" and spot <= ema20)
+            )
+        else:
+            feats["spot_confirms_direction"] = None
+
+        # --- option-vs-underlying efficiency: actual option %move / delta-expected %move ---
+        # Expected premium %move ≈ (ATM delta ~0.5 * |spot %move|) * (spot/premium leverage).
+        # We approximate leverage with spot/premium; large ratio => move exceeds pure-delta,
+        # suggesting gamma/IV/demand/short-covering (a squeeze-strength hint, not a gate).
+        spot_move_pct = feats.get("spot_vs_ema20_pct")
+        if spot and ltp > 0 and spot_move_pct is not None and abs(spot_move_pct) > 1e-6:
+            delta_atm = 0.5
+            expected_opt_pct = abs(spot_move_pct) * delta_atm * (spot / ltp)
+            if expected_opt_pct > 1e-6:
+                feats["option_spot_efficiency"] = round(abs(delta_price_pct) / expected_opt_pct, 2)
+            else:
+                feats["option_spot_efficiency"] = None
+        else:
+            feats["option_spot_efficiency"] = None
+
+        # --- squeeze score (0-100), LOGGED ONLY, never gates (per v1.1 plan) ---
+        # Weights per the analysis: OI unwind 25, price accel 20, underlying confirm 20,
+        # volume abnormality 15, option/spot efficiency 10, flow 10 (flow unavailable -> 0).
+        score = 0.0
+        # OI unwind strength (25): scale |ΔOI%| from 0 at 2% to full at 10%
+        score += max(0.0, min(1.0, (abs(delta_oi_pct) - 2.0) / 8.0)) * 25.0
+        # price acceleration (20): scale 0..1 over 0..10 (pct)
+        pa = feats.get("price_acceleration")
+        if pa is not None:
+            score += max(0.0, min(1.0, pa / 10.0)) * 20.0
+        # underlying confirmation (20): full if direction confirmed
+        if feats.get("spot_confirms_direction"):
+            score += 20.0
+        # volume abnormality (15): scale z 0..3
+        vz = feats.get("volume_zscore")
+        if vz is not None:
+            score += max(0.0, min(1.0, vz / 3.0)) * 15.0
+        # option/spot efficiency (10): >1 means move exceeds pure-delta; scale 1..3
+        eff = feats.get("option_spot_efficiency")
+        if eff is not None:
+            score += max(0.0, min(1.0, (eff - 1.0) / 2.0)) * 10.0
+        # flow (10): unavailable (no real CVD) -> 0, by design
+        feats["squeeze_score"] = round(score, 1)
+        return feats
+
     async def on_tick(self, tick: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
         Expects tick with 'token', 'ltp', 'volume', 'open_interest', 'exchange_timestamp'.
@@ -170,6 +306,17 @@ class OISqueezeSentinel(BaseStrategy):
         # Evict ticks older than tau = 300s
         while hist and (ts - hist[0][0]) > self.tau:
             hist.popleft()
+
+        # v1.1 measurement: sample an OI-change observation whenever OI actually refreshes
+        # (broker OI updates ~every 162s). Purely for the OI Z-score feature; gates nothing.
+        if token not in self.oi_change_samples:
+            self.oi_change_samples[token] = deque(maxlen=40)
+        prev_oi_s = self.last_oi_for_sample.get(token)
+        if prev_oi_s is not None and oi != prev_oi_s:
+            self.oi_change_samples[token].append(oi - prev_oi_s)
+            self.last_oi_ts[token] = ts
+        if prev_oi_s is None or oi != prev_oi_s:
+            self.last_oi_for_sample[token] = oi
 
         # Compare oldest in window vs latest
         old_ts, old_ltp, old_oi, old_vol = hist[0]
@@ -272,7 +419,34 @@ class OISqueezeSentinel(BaseStrategy):
             return None
 
         squeeze_label = "EARLY IGNITION" if is_early_ignition else "STANDARD SQUEEZE"
-        logger.info(f"⚡ [OI SQUEEZE - {squeeze_label}] Triggered for {symbol} ({opt_type})! dOI: {delta_oi_pct:.1f}%, dPrice: +{delta_price_pct:.1f}%, Confidence: {confidence}%, ADX: {adx_val:.1f}")
+
+        # v1.1 MEASUREMENT-ONLY: compute the feature pack AFTER all gates have passed, so it
+        # cannot influence whether this signal fires. Attached to meta for backtest analysis.
+        v11 = self._compute_v11_features(
+            token=token, inst=inst, opt_type=opt_type, hist=hist, ltp=ltp, oi=oi, vol=vol,
+            delta_oi_pct=delta_oi_pct, delta_price_pct=delta_price_pct,
+            time_span=time_span, tick=tick,
+        )
+        logger.info(
+            f"⚡ [OI SQUEEZE - {squeeze_label}] Triggered for {symbol} ({opt_type})! "
+            f"dOI: {delta_oi_pct:.1f}%, dPrice: +{delta_price_pct:.1f}%, Confidence: {confidence}%, "
+            f"ADX: {adx_val:.1f} | [v1.1] squeeze_score={v11.get('squeeze_score')}, "
+            f"oi_z={v11.get('oi_zscore')}, vol_z={v11.get('volume_zscore')}, "
+            f"spot_confirms={v11.get('spot_confirms_direction')}, eff={v11.get('option_spot_efficiency')}, "
+            f"spread%={v11.get('spread_pct')}"
+        )
+
+        meta_details = {
+            "squeeze_type": "EARLY_IGNITION" if is_early_ignition else "STANDARD_SQUEEZE",
+            "delta_oi_pct": round(delta_oi_pct, 2),
+            "delta_price_pct": round(delta_price_pct, 2),
+            "spot": spot,
+            "spot_ema20": round(ema20, 2),
+            "adx": round(adx_val, 1),
+            "lookback_tau_sec": self.tau,
+            "confidence": confidence,
+            "v11": v11,  # measurement-only feature pack (does not affect signal firing)
+        }
 
         return self.build_signal_payload(
             instrument=inst,
@@ -285,14 +459,5 @@ class OISqueezeSentinel(BaseStrategy):
             entry_price=ltp,
             lot_size=lot_size,
             confidence=confidence,
-            meta_details={
-                "squeeze_type": "EARLY_IGNITION" if is_early_ignition else "STANDARD_SQUEEZE",
-                "delta_oi_pct": round(delta_oi_pct, 2),
-                "delta_price_pct": round(delta_price_pct, 2),
-                "spot": spot,
-                "spot_ema20": round(ema20, 2),
-                "adx": round(adx_val, 1),
-                "lookback_tau_sec": self.tau,
-                "confidence": confidence
-            }
+            meta_details=meta_details,
         )
