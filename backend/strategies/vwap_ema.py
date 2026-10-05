@@ -211,7 +211,13 @@ class VWAPEMAAlignment(BaseStrategy):
                 cur_vwap = self.spot_vwap[inst].value
                 self.spot_vwap_history[inst].append(cur_vwap)
 
-        logger.info(f"✅ [VWAP_EMA] {inst} warmed up! VWAP={self.spot_vwap[inst].value:.1f}, EMA9={self.spot_ema9[inst].value:.1f}, EMA21={self.spot_ema21[inst].value:.1f}, RSI={self.spot_rsi[inst].value:.1f}, ADX={self.spot_adx[inst].value:.1f}")
+        def _f(x):  # None-safe formatter: indicators return None until they reach their period
+            return f"{x:.1f}" if isinstance(x, (int, float)) else "warming"
+        logger.info(
+            f"✅ [VWAP_EMA] {inst} warmed up! VWAP={_f(self.spot_vwap[inst].value)}, "
+            f"EMA9={_f(self.spot_ema9[inst].value)}, EMA21={_f(self.spot_ema21[inst].value)}, "
+            f"RSI={_f(self.spot_rsi[inst].value)}, ADX={_f(self.spot_adx[inst].value)}"
+        )
 
 
     def _check_exhaustion_filter(self, inst: str, direction: str, spot: float, adx: float = 0.0, vwap_slope: float = 0.0) -> bool:

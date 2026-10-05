@@ -210,12 +210,18 @@ class EngineCoordinator:
         from datetime import datetime, timedelta
         now = datetime.now()
         today_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        if now < today_start:
-            from_dt = (today_start - timedelta(days=1)).strftime("%Y-%m-%d 09:15")
-            to_dt = (today_start - timedelta(days=1)).strftime("%Y-%m-%d 15:30")
-        else:
-            from_dt = today_start.strftime("%Y-%m-%d %H:%M")
-            to_dt = now.strftime("%Y-%m-%d %H:%M")
+        # Warmup needs a FULL prior session so EMA21/ADX14/RSI14 can actually warm. Before
+        # 09:15 (or with little data today) we must look back to the last TRADING day — a
+        # fixed "yesterday" lands on weekends/holidays and returns ~0 candles (the bug that
+        # starved VWAP_EMA/OI_Squeeze and the regime filter). Request a 5-calendar-day window
+        # back from now; AngelOne returns only actual trading candles, and the strategies'
+        # seeders keep their own rolling windows, so extra history is harmless.
+        # Look back 5 calendar days to guarantee at least one full prior trading session,
+        # through 'now' so today's candles (if any) are included. AngelOne returns only real
+        # trading candles; the strategy seeders keep their own rolling windows so extra bars
+        # are harmless but ensure EMA21/ADX14/RSI14 are actually warm at startup.
+        from_dt = (now - timedelta(days=5)).strftime("%Y-%m-%d 09:15")
+        to_dt = now.strftime("%Y-%m-%d %H:%M")
 
         param = {
             "exchange": exchange,

@@ -90,7 +90,9 @@ class OISqueezeSentinel(BaseStrategy):
                     self.spot_ema20[inst].update(cl)
                 if inst in self.spot_adx:
                     self.spot_adx[inst].update(hi, lo, cl)
-        logger.info(f"✅ [OI_SQUEEZE] {inst} warmed up! EMA20={self.spot_ema20[inst].value:.1f}, ADX={self.spot_adx[inst].value:.1f}")
+        def _f(x):  # None-safe: EMA20/ADX return None until they reach their period
+            return f"{x:.1f}" if isinstance(x, (int, float)) else "warming"
+        logger.info(f"✅ [OI_SQUEEZE] {inst} warmed up! EMA20={_f(self.spot_ema20[inst].value)}, ADX={_f(self.spot_adx[inst].value)}")
 
     def _get_early_ignition_price_threshold(self, inst: str, now_dt: datetime, meta: Optional[Dict[str, Any]] = None) -> float:
         """
