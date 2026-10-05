@@ -363,25 +363,54 @@ class EngineCoordinator:
         if auth_res.get("status"):
             await self._fetch_spot_quotes()
 
-            # Warm-up indicators with real historical candles
-            nifty_candles = await self._fetch_historical_candles("NSE", "99926000", "THREE_MINUTE")
-            sensex_candles = await self._fetch_historical_candles("BSE", "99919000", "THREE_MINUTE")
+        # Warmup ALWAYS runs (even if auth failed): the REST fetch returns [] without a live
+        # session and the local-tick fallback then supplies candles, so we never skip warmup
+        # silently. This block is intentionally outside the auth gate.
+        if True:
+            # Warm-up indicators with real historical candles (empty if REST unavailable)
+            nifty_candles = await self._fetch_historical_candles("NSE", "99926000", "THREE_MINUTE") if auth_res.get("status") else []
+            sensex_candles = await self._fetch_historical_candles("BSE", "99919000", "THREE_MINUTE") if auth_res.get("status") else []
             candles_map = {"NIFTY": nifty_candles, "SENSEX": sensex_candles}
 
             # NO COLD START guarantee: if REST history couldn't supply enough candles for an
             # instrument, rebuild warmup from the most recent locally-recorded session.
             min_candles = getattr(self, "MIN_WARMUP_CANDLES", 30)
+            warmup_source = {}  # inst -> "LIVE_REST" | "LOCAL_TICKS" | "INSUFFICIENT"
             for inst in ("NIFTY", "SENSEX"):
-                if len(candles_map.get(inst) or []) < min_candles:
+                rest_n = len(candles_map.get(inst) or [])
+                warmup_source[inst] = "LIVE_REST" if rest_n >= min_candles else None
+                if rest_n < min_candles:
                     fallback = self._warmup_from_local_lake(inst, min_candles)
-                    if len(fallback) > len(candles_map.get(inst) or []):
+                    if len(fallback) > rest_n:
                         candles_map[inst] = fallback
-                if len(candles_map.get(inst) or []) < min_candles:
+                        warmup_source[inst] = "LOCAL_TICKS"
+                final_n = len(candles_map.get(inst) or [])
+                if final_n < min_candles:
+                    warmup_source[inst] = "INSUFFICIENT"
                     logger.error(
-                        f"🚨 [COLD START RISK] {inst}: only {len(candles_map.get(inst) or [])} warmup "
-                        f"candles from REST+local fallback (need >= {min_candles}). Trend/regime "
-                        f"indicators will under-warm until live candles accumulate."
+                        f"🚨 [COLD START RISK] {inst}: only {final_n} warmup candles from "
+                        f"REST+local fallback (need >= {min_candles}). Trend/regime indicators "
+                        f"will under-warm until live candles accumulate."
                     )
+
+            # Single authoritative summary so the warmup source is unambiguous in the log.
+            _src_label = {
+                "LIVE_REST": "✅ LIVE historical REST data",
+                "LOCAL_TICKS": "🩹 LOCAL recorded tick data (REST unavailable/insufficient)",
+                "INSUFFICIENT": "🚨 INSUFFICIENT — starting under-warmed (COLD RISK)",
+            }
+            logger.info("──────── WARMUP SUMMARY ────────")
+            for inst in ("NIFTY", "SENSEX"):
+                src = warmup_source.get(inst, "INSUFFICIENT")
+                n = len(candles_map.get(inst) or [])
+                first_ts = (candles_map[inst][0]["timestamp"][:16] if candles_map.get(inst) else "-")
+                last_ts = (candles_map[inst][-1]["timestamp"][:16] if candles_map.get(inst) else "-")
+                logger.info(
+                    f"   {inst}: {n} candles  source={_src_label.get(src, src)}  span[{first_ts} → {last_ts}]"
+                )
+            overall = ("WARM" if all(warmup_source.get(i) in ("LIVE_REST", "LOCAL_TICKS")
+                                     for i in ("NIFTY", "SENSEX")) else "DEGRADED")
+            logger.info(f"──────── WARMUP {overall} ────────")
 
             for inst, candles in candles_map.items():
                 if candles:
