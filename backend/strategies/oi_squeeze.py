@@ -31,7 +31,10 @@ class OISqueezeSentinel(BaseStrategy):
         # main source of today's CE bias and losses. When enabled, a signal requires spot to be
         # clearly on the correct side of EMA20 by spot_confirm_margin_pct. Backtest showed
         # non-confirming signals averaged -10.45%/trade vs +0.73% for confirming ones.
-        self.require_spot_confirmation = bool(cfg.get("require_spot_confirmation", True))
+        # Default False to MATCH the shipped config (gate unvalidated on 3-day backtest). The
+        # code default must equal the conservative shipped state so any caller that doesn't pass
+        # full config (e.g. a backtest harness) doesn't silently enable an unvalidated gate.
+        self.require_spot_confirmation = bool(cfg.get("require_spot_confirmation", False))
         self.spot_confirm_margin_pct = float(cfg.get("spot_confirm_margin_pct", 0.05))  # % of spot
 
         # Rolling history per option token: deque of (ts, ltp, oi, cumulative_vol)

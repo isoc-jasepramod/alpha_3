@@ -678,8 +678,14 @@ class EngineCoordinator:
                         spot_entry["open"] = float(tick["open"])
 
                     atm = self.instrument_mgr.calculate_atm_strike(inst, ltp)
-                    spot_entry["atm"] = atm
-                    self.instrument_mgr.current_atm[inst] = atm
+                    spot_entry["atm"] = atm  # for UI/telemetry display only
+                    # DO NOT set instrument_mgr.current_atm here: detect_atm_migration() compares
+                    # the live ATM against current_atm to decide if a migration occurred, and it
+                    # updates current_atm itself when one does. Writing current_atm = atm on every
+                    # tick (as before) made that comparison always equal -> migration NEVER fired,
+                    # freezing option subscriptions at the startup ATM even as spot moved far away
+                    # (e.g. SENSEX subscribed ~74000 at the gap-up open, traded all day at ~72200
+                    # on stale ~1700pt-OTM strikes). Let detect_atm_migration own current_atm.
 
                     if inst == "NIFTY":
                         self.nifty_spot = ltp
