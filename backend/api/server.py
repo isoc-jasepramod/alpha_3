@@ -34,6 +34,11 @@ from backend.core.telegram_notifier import TelegramNotifier
 from backend.api.routes import router, app_state
 
 class EngineCoordinator:
+    # Minimum historical candles required to consider indicators "warm" (EMA21 needs 21;
+    # ADX14 settles by ~28). Below this, warmup widens its lookback and finally falls back
+    # to locally recorded sessions — the system must never start cold.
+    MIN_WARMUP_CANDLES = 30
+
     def __init__(self):
         self.redis_bus = RedisBus.from_config()
         self.instrument_mgr = InstrumentManager()
@@ -209,47 +214,138 @@ class EngineCoordinator:
             return []
         from datetime import datetime, timedelta
         now = datetime.now()
-        today_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        # Warmup needs a FULL prior session so EMA21/ADX14/RSI14 can actually warm. Before
-        # 09:15 (or with little data today) we must look back to the last TRADING day — a
-        # fixed "yesterday" lands on weekends/holidays and returns ~0 candles (the bug that
-        # starved VWAP_EMA/OI_Squeeze and the regime filter). Request a 5-calendar-day window
-        # back from now; AngelOne returns only actual trading candles, and the strategies'
-        # seeders keep their own rolling windows, so extra history is harmless.
-        # Look back 5 calendar days to guarantee at least one full prior trading session,
-        # through 'now' so today's candles (if any) are included. AngelOne returns only real
-        # trading candles; the strategy seeders keep their own rolling windows so extra bars
-        # are harmless but ensure EMA21/ADX14/RSI14 are actually warm at startup.
-        from_dt = (now - timedelta(days=5)).strftime("%Y-%m-%d 09:15")
-        to_dt = now.strftime("%Y-%m-%d %H:%M")
-
-        param = {
-            "exchange": exchange,
-            "symboltoken": symboltoken,
-            "interval": interval,
-            "fromdate": from_dt,
-            "todate": to_dt
-        }
         loop = asyncio.get_running_loop()
-        try:
-            res = await loop.run_in_executor(None, lambda: self.auth.smart_connect.getCandleData(param))
-            if res and res.get("status") and res.get("data"):
-                raw_candles = res["data"]
+
+        # NO COLD START: progressively widen the lookback until we have enough candles to
+        # actually warm EMA21/ADX14/RSI14. A fixed window can underflow on weekends/holiday
+        # clusters or a degenerate API response (the 1-candle bug that started strategies
+        # blind). AngelOne returns only real trading candles, so widening the calendar window
+        # transparently reaches back past any number of non-trading days to the last sessions.
+        min_candles = getattr(self, "MIN_WARMUP_CANDLES", 30)  # EMA21 needs 21, ADX14 ~28 to settle
+        best: List[Dict[str, Any]] = []
+        for lookback_days in (5, 10, 20, 40):
+            from_dt = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d 09:15")
+            to_dt = now.strftime("%Y-%m-%d %H:%M")
+            param = {
+                "exchange": exchange,
+                "symboltoken": symboltoken,
+                "interval": interval,
+                "fromdate": from_dt,
+                "todate": to_dt,
+            }
+            try:
+                res = await loop.run_in_executor(
+                    None, lambda: self.auth.smart_connect.getCandleData(param)
+                )
                 candles = []
-                for item in raw_candles:
-                    if len(item) >= 5:
-                        candles.append({
-                            "timestamp": str(item[0]),
-                            "open": float(item[1]),
-                            "high": float(item[2]),
-                            "low": float(item[3]),
-                            "close": float(item[4]),
-                            "volume": float(item[5]) if len(item) > 5 else 1000.0
-                        })
-                logger.info(f"Retrieved {len(candles)} historical {interval} candles for {exchange}:{symboltoken} from AngelOne REST.")
+                if res and res.get("status") and res.get("data"):
+                    for item in res["data"]:
+                        if len(item) >= 5:
+                            candles.append({
+                                "timestamp": str(item[0]),
+                                "open": float(item[1]),
+                                "high": float(item[2]),
+                                "low": float(item[3]),
+                                "close": float(item[4]),
+                                "volume": float(item[5]) if len(item) > 5 else 1000.0,
+                            })
+                if len(candles) > len(best):
+                    best = candles
+                if len(candles) >= min_candles:
+                    logger.info(
+                        f"Retrieved {len(candles)} historical {interval} candles for "
+                        f"{exchange}:{symboltoken} (lookback {lookback_days}d). Indicators WARM."
+                    )
+                    return candles
+                logger.warning(
+                    f"Warmup underflow for {exchange}:{symboltoken}: only {len(candles)} "
+                    f"candles at {lookback_days}d lookback (need >= {min_candles}). Widening..."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Historical fetch error for {exchange}:{symboltoken} at {lookback_days}d: {e}. Retrying wider..."
+                )
+            await asyncio.sleep(0.5)  # gentle spacing to avoid REST rate limits between retries
+
+        # Exhausted all lookbacks without reaching the minimum — return the best we got but
+        # make the degraded state LOUD so a cold/partial start is never silent.
+        if best:
+            logger.error(
+                f"⚠️ WARMUP DEGRADED for {exchange}:{symboltoken}: only {len(best)} candles after "
+                f"widening to 40d (need >= {min_candles}). Indicators may start under-warmed."
+            )
+        else:
+            logger.error(
+                f"🚨 WARMUP FAILED for {exchange}:{symboltoken}: 0 candles after all retries. "
+                f"Indicators would start COLD — strategies relying on EMA21/ADX14/VWAP will be blind."
+            )
+        return best
+
+    def _warmup_from_local_lake(self, inst: str, min_candles: int = 30) -> List[Dict[str, Any]]:
+        """
+        LAST-RESORT warmup source so we NEVER start cold: if the AngelOne REST history is
+        unavailable, rebuild 3-minute candles from the most recent recorded session in the
+        local data lake (the tick recorder writes spot ticks daily). Returns [] only if there
+        is genuinely no recorded spot data at all.
+        """
+        import glob
+        from datetime import datetime, timezone, timedelta
+        try:
+            import pyarrow.parquet as pq
+        except Exception:
+            return []
+
+        spot_tokens = {"NIFTY": ("26000", "99926000"), "SENSEX": ("99919000",)}.get(inst, ())
+        if not spot_tokens:
+            return []
+        lake_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data", "lake")
+        day_dirs = sorted(glob.glob(os.path.join(lake_dir, "date=*")), reverse=True)
+        IST = timezone(timedelta(hours=5, minutes=30))
+
+        for day_dir in day_dirs:
+            ticks = []  # (ts_seconds, ltp)
+            for fp in sorted(glob.glob(os.path.join(day_dir, "ticks_*.parquet"))):
+                try:
+                    have = set(pq.read_table(fp).schema.names)
+                    cols = [c for c in ("token", "ltp", "exchange_timestamp") if c in have]
+                    d = pq.read_table(fp, columns=cols).to_pydict()
+                    for i in range(len(d.get("token", []))):
+                        if str(d["token"][i]) in spot_tokens:
+                            ts = float(d["exchange_timestamp"][i])
+                            ts = ts / 1000.0 if ts > 1e11 else ts
+                            lt = float(d["ltp"][i])
+                            if lt > 0:
+                                ticks.append((ts, lt))
+                except Exception:
+                    continue
+            if len(ticks) < 50:
+                continue  # not a real session; try an older day
+            ticks.sort(key=lambda x: x[0])
+            # aggregate into 3-minute OHLC candles, trading hours only (09:15-15:30 IST)
+            candles = []
+            cur = None
+            for ts, lt in ticks:
+                dt = datetime.fromtimestamp(ts, tz=IST)
+                if dt.hour < 9 or (dt.hour == 9 and dt.minute < 15) or dt.hour > 15 or (dt.hour == 15 and dt.minute > 30):
+                    continue
+                slot = int(ts // 180) * 180
+                if cur is None or slot != cur["_slot"]:
+                    if cur is not None:
+                        candles.append({k: cur[k] for k in ("timestamp", "open", "high", "low", "close", "volume")})
+                    cur = {"_slot": slot, "timestamp": datetime.fromtimestamp(slot, tz=IST).isoformat(),
+                           "open": lt, "high": lt, "low": lt, "close": lt, "volume": 1000.0}
+                else:
+                    cur["high"] = max(cur["high"], lt)
+                    cur["low"] = min(cur["low"], lt)
+                    cur["close"] = lt
+            if cur is not None:
+                candles.append({k: cur[k] for k in ("timestamp", "open", "high", "low", "close", "volume")})
+            if len(candles) >= min_candles:
+                logger.warning(
+                    f"🩹 [WARMUP FALLBACK] {inst}: rebuilt {len(candles)} 3m candles from local "
+                    f"recorded session {os.path.basename(day_dir)} (REST history unavailable)."
+                )
                 return candles
-        except Exception as e:
-            logger.warning(f"Could not fetch historical candles for {exchange}:{symboltoken}: {e}")
         return []
 
     async def initialize(self):
@@ -271,6 +367,21 @@ class EngineCoordinator:
             nifty_candles = await self._fetch_historical_candles("NSE", "99926000", "THREE_MINUTE")
             sensex_candles = await self._fetch_historical_candles("BSE", "99919000", "THREE_MINUTE")
             candles_map = {"NIFTY": nifty_candles, "SENSEX": sensex_candles}
+
+            # NO COLD START guarantee: if REST history couldn't supply enough candles for an
+            # instrument, rebuild warmup from the most recent locally-recorded session.
+            min_candles = getattr(self, "MIN_WARMUP_CANDLES", 30)
+            for inst in ("NIFTY", "SENSEX"):
+                if len(candles_map.get(inst) or []) < min_candles:
+                    fallback = self._warmup_from_local_lake(inst, min_candles)
+                    if len(fallback) > len(candles_map.get(inst) or []):
+                        candles_map[inst] = fallback
+                if len(candles_map.get(inst) or []) < min_candles:
+                    logger.error(
+                        f"🚨 [COLD START RISK] {inst}: only {len(candles_map.get(inst) or [])} warmup "
+                        f"candles from REST+local fallback (need >= {min_candles}). Trend/regime "
+                        f"indicators will under-warm until live candles accumulate."
+                    )
 
             for inst, candles in candles_map.items():
                 if candles:
