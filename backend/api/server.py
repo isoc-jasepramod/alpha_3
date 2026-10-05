@@ -22,6 +22,7 @@ from backend.strategies.orb_breakout import VolumeBackedORB
 from backend.strategies.vwap_ema import VWAPEMAAlignment
 from backend.strategies.gamma_scalp import ExpiryDayGammaScalp
 from backend.strategies.momentum_impulse import MomentumImpulseDetector
+from backend.strategies.simplified_engine import SimplifiedPriceActionEngine
 from backend.strategies.regime_filter import RegimeFilter
 from backend.strategies.indicators import CandleAggregator, IncrementalVWAP, IncrementalADX
 from backend.strategies.iv_engine import IVEngine
@@ -90,6 +91,7 @@ class EngineCoordinator:
 
         vwap_ema_strat = VWAPEMAAlignment(strat_cfg.get("vwap_ema"), regime_filter=self.regime_filter)
         momentum_strat = MomentumImpulseDetector(strat_cfg.get("momentum_impulse"), regime_filter=self.regime_filter)
+        simplified_strat = SimplifiedPriceActionEngine(strat_cfg.get("simplified_price_action"))
 
         # Strategy instances with configured rules
         self.strategies = [
@@ -98,6 +100,7 @@ class EngineCoordinator:
             vwap_ema_strat,
             ExpiryDayGammaScalp(strat_cfg.get("gamma_scalp")),
             momentum_strat,
+            simplified_strat,
             iv_engine,
             gex_engine,
             flow_engine,
@@ -454,7 +457,17 @@ class EngineCoordinator:
                 self.signal_tracker.register_resolution_callback(strat.notify_resolution)
                 logger.info(f"Registered resolution feedback callback for {strat.name}")
 
-        # Build initial token map based on current spot prices
+        # Build initial token map based on current spot prices.
+        # HARDENING: before 09:15 the AngelOne LTP quote can be a STALE pre-open print (this is
+        # how NIFTY subscribed strikes off ~22183 and SENSEX off ~74081 while the real opens were
+        # ~22518 / ~72259 — then the migration bug froze those wrong strikes all day). Prefer the
+        # last warmup candle's close as the spot anchor for the INITIAL strike band, since it is a
+        # real traded price; fall back to the LTP quote only if no candles are available. The ATM
+        # migration logic then keeps strikes tracking spot once the live session begins.
+        nifty_anchor = self._anchor_spot_for_subscription("NIFTY", candles_map, self.nifty_spot)
+        sensex_anchor = self._anchor_spot_for_subscription("SENSEX", candles_map, self.sensex_spot)
+        self.nifty_spot = nifty_anchor or self.nifty_spot
+        self.sensex_spot = sensex_anchor or self.sensex_spot
         self._update_token_cache(self.nifty_spot, self.sensex_spot)
 
         if auth_res.get("status"):
@@ -482,6 +495,41 @@ class EngineCoordinator:
         app_state.risk_governor = self.risk_governor
         app_state.signal_tracker = self.signal_tracker
         app_state.regime_filter = self.regime_filter
+
+    def _anchor_spot_for_subscription(self, inst: str, candles_map: Dict[str, Any], ltp_spot: float) -> float:
+        """
+        Pick a RELIABLE spot anchor for the INITIAL option-strike subscription.
+        Prefers the last warmup candle close (a real traded price) over the startup LTP quote,
+        which pre-09:15 can be a stale pre-open print that subscribes the wrong strike band.
+        Falls back to the LTP quote if candles are missing or look inconsistent.
+        """
+        candles = (candles_map or {}).get(inst) or []
+        candle_close = 0.0
+        if candles:
+            try:
+                candle_close = float(candles[-1].get("close", 0.0))
+            except (TypeError, ValueError, AttributeError):
+                candle_close = 0.0
+
+        ltp_spot = float(ltp_spot or 0.0)
+
+        # If we have a sane candle close, prefer it. Sanity: positive, and (when both exist)
+        # within 3% of the LTP quote so a corrupt candle can't pick an absurd strike band.
+        if candle_close > 0:
+            if ltp_spot <= 0 or abs(candle_close - ltp_spot) / candle_close <= 0.03:
+                if ltp_spot > 0 and abs(candle_close - ltp_spot) / candle_close > 0.003:
+                    logger.info(
+                        f"🔧 [SUBSCRIBE ANCHOR] {inst}: using warmup candle close {candle_close:.1f} "
+                        f"instead of startup LTP {ltp_spot:.1f} (likely pre-open) for initial strikes."
+                    )
+                return candle_close
+            # candle and LTP disagree by >3%: trust whichever is non-stale is ambiguous, so keep
+            # LTP but log loudly — migration will correct within minutes of the real open.
+            logger.warning(
+                f"⚠️ [SUBSCRIBE ANCHOR] {inst}: warmup close {candle_close:.1f} and startup LTP "
+                f"{ltp_spot:.1f} differ >3%. Using LTP; ATM migration will correct post-open."
+            )
+        return ltp_spot if ltp_spot > 0 else candle_close
 
     def _update_token_cache(self, nifty_spot: float, sensex_spot: float):
         nifty_wings = self.instrument_mgr.get_atm_and_wings("NIFTY", nifty_spot)
