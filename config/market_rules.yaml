@@ -76,6 +76,12 @@ strategies:
     early_ignition_price_spike_pct_standard: 12.0  # non-expiry day
     vol_multiplier: 2.0
     strikes_monitored: [-2, -1, 0, 1, 2] # ATM-2 to ATM+2
+    require_spot_confirmation: false  # HARD directional gate (spot must be clearly on the correct
+                                      # side of EMA20). SHIPPED DISABLED: backtest on 3 days did NOT
+                                      # validate it as a clean filter (non-monotonic; only looked good
+                                      # at a 2-trade sample). Mechanism kept for future tuning once
+                                      # more live days accumulate. Set true to re-enable.
+    spot_confirm_margin_pct: 0.05     # required distance of spot from EMA20, as % of spot
   
   orb_breakout:
     enabled: true

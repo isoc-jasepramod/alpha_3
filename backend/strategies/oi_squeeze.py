@@ -26,6 +26,13 @@ class OISqueezeSentinel(BaseStrategy):
         self.early_ignition_price_spike_pct_standard = cfg.get("early_ignition_price_spike_pct_standard", 12.0) # +12.0% for non-expiry
         self.vol_multiplier = cfg.get("vol_multiplier", 2.0)
         self.min_adx = cfg.get("min_adx", 20.0)
+        # HARD directional confirmation vs EMA20. The old gate used a loose +/-0.05% tolerance
+        # (allowed CE even slightly BELOW EMA20), which let CE fire in a down/choppy tape — the
+        # main source of today's CE bias and losses. When enabled, a signal requires spot to be
+        # clearly on the correct side of EMA20 by spot_confirm_margin_pct. Backtest showed
+        # non-confirming signals averaged -10.45%/trade vs +0.73% for confirming ones.
+        self.require_spot_confirmation = bool(cfg.get("require_spot_confirmation", True))
+        self.spot_confirm_margin_pct = float(cfg.get("spot_confirm_margin_pct", 0.05))  # % of spot
 
         # Rolling history per option token: deque of (ts, ltp, oi, cumulative_vol)
         self.token_history: Dict[str, deque] = {}
@@ -369,19 +376,34 @@ class OISqueezeSentinel(BaseStrategy):
         if delta_oi_pct <= -4.0 or delta_price_pct >= 2.5:
             logger.debug(f"[OI DEBUG] {token} ({symbol}): dOI={delta_oi_pct:.2f}%, dP={delta_price_pct:.2f}%, span={time_span:.0f}s, old_oi={old_oi}, cur_oi={oi}, old_ltp={old_ltp}, cur_ltp={ltp}")
 
-        # 3. Spot vs EMA20
+        # 3. Spot vs EMA20 — HARD directional confirmation
         spot = self.spot_prices.get(inst, 0.0)
         ema20 = self.spot_ema20.get(inst).value if self.spot_ema20.get(inst) else None
-        
-        # Directional validation:
-        # If EMA20 is available, verify directional alignment. If in fast path, allow slight tolerance.
-        if ema20 and spot > 0:
-            is_bullish_ce = (opt_type == "CE" and spot >= ema20 * 0.9995)
-            is_bearish_pe = (opt_type == "PE" and spot <= ema20 * 1.0005)
-            if not (is_bullish_ce or is_bearish_pe):
-                return None
-        elif spot <= 0:
+
+        if spot <= 0:
             return None
+        if ema20 and ema20 > 0:
+            if self.require_spot_confirmation:
+                # Require spot CLEARLY on the correct side of EMA20 by a positive margin.
+                # CE: spot must be above EMA20 by >= margin; PE: below by >= margin.
+                margin = ema20 * (self.spot_confirm_margin_pct / 100.0)
+                confirms = (
+                    (opt_type == "CE" and spot >= ema20 + margin)
+                    or (opt_type == "PE" and spot <= ema20 - margin)
+                )
+                if not confirms:
+                    logger.info(
+                        f"🚫 [OI SQUEEZE DIR-GATE] {symbol} ({opt_type}) blocked: spot {spot:.1f} not "
+                        f"clearly {'above' if opt_type=='CE' else 'below'} EMA20 {ema20:.1f} "
+                        f"(margin {self.spot_confirm_margin_pct:.2f}%). Underlying does not confirm direction."
+                    )
+                    return None
+            else:
+                # Legacy loose band (kept for reversibility if confirmation is disabled)
+                is_bullish_ce = (opt_type == "CE" and spot >= ema20 * 0.9995)
+                is_bearish_pe = (opt_type == "PE" and spot <= ema20 * 1.0005)
+                if not (is_bullish_ce or is_bearish_pe):
+                    return None
 
         # 4. ADX Filter: Ensure market is trending (ADX >= 20)
         # Fast-Path Exception: Early ignition or extreme squeezes breaking out of tight compression
