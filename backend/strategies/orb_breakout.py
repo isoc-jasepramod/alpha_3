@@ -1,6 +1,6 @@
 from collections import deque
 from datetime import datetime, timezone, time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from loguru import logger
 from backend.strategies.base_strategy import BaseStrategy
 from backend.strategies.indicators import (
@@ -45,6 +45,10 @@ class VolumeBackedORB(BaseStrategy):
             "NIFTY": {"date": None, "day_open": None, "prev_close": None, "excessive_gap": False, "gap_dir": None, "gap_pct": 0.0},
             "SENSEX": {"date": None, "day_open": None, "prev_close": None, "excessive_gap": False, "gap_dir": None, "gap_pct": 0.0}
         }
+        # Gap derived from warmup candles (real prior close vs real 09:15 open) — used instead
+        # of a stale pre-open tick. Set via seed_from_candles() at startup. None = unavailable.
+        self.seeded_prev_close: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+        self._seeded_gap: Dict[str, Optional[Dict[str, Any]]] = {"NIFTY": None, "SENSEX": None}
 
         # 5-min candle aggregators on Spot
         self.spot_5m_aggregators: Dict[str, CandleAggregator] = {
@@ -121,6 +125,46 @@ class VolumeBackedORB(BaseStrategy):
                 rng["finalized"] = True
                 logger.info(f"⚡ [ORB_BREAKOUT] Pre-seeded {inst} ORB range: High={rng['high']}, Low={rng['low']}")
 
+    def seed_from_candles(self, inst: str, candles: List[Dict[str, Any]]):
+        """
+        Capture the PRIOR SESSION's real close for the gap calculation. The warmup candles
+        span the last few sessions through today-so-far; we take the close of the last candle
+        dated before today. This replaces the stale pre-open tick that previously corrupted the
+        gap (e.g. SENSEX read a 09:00 pre-open print ~73164 vs the real ~72382 close -> bogus
+        -0.82% gap-down that suppressed every valid CE breakout on a +0.7% up day).
+        """
+        if not candles:
+            return
+        try:
+            today_str = self.parse_ist_time(datetime.now(timezone.utc).timestamp()).date().isoformat()
+            valid = [c for c in candles if float(c.get("close", 0.0)) > 0]
+            prior = [c for c in valid if str(c.get("timestamp", ""))[:10] < today_str]
+            today_c = [c for c in valid if str(c.get("timestamp", ""))[:10] == today_str]
+
+            prev_close = float(prior[-1]["close"]) if prior else 0.0
+            # real session open = open of today's first candle (09:15 bar); if the app started
+            # before any today candle exists, leave the gap unseeded and let on_tick fall back.
+            today_open = float(today_c[0].get("open", 0.0)) if today_c else 0.0
+
+            if prev_close > 0:
+                self.seeded_prev_close[inst] = prev_close
+            if prev_close > 0 and today_open > 0:
+                gap_diff = today_open - prev_close
+                gap_pct = abs(gap_diff) / prev_close * 100.0
+                self._seeded_gap[inst] = {
+                    "gap_pct": gap_pct,
+                    "gap_dir": "UP" if gap_diff > 0 else "DOWN",
+                    "excessive": gap_pct > self.extreme_gap_pct,
+                }
+                logger.info(
+                    f"⚡ [ORB_BREAKOUT] {inst} candle-derived gap: prev_close {prev_close:.1f} -> "
+                    f"open {today_open:.1f} = {gap_diff:+.1f} ({gap_pct:.2f}% {self._seeded_gap[inst]['gap_dir']})."
+                )
+            elif prev_close > 0:
+                logger.info(f"⚡ [ORB_BREAKOUT] {inst} seeded prior close {prev_close:.1f}; gap pending first 09:15 candle.")
+        except Exception as e:
+            logger.warning(f"ORB seed_from_candles failed for {inst}: {e}")
+
     async def on_tick(self, tick: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         raw_ts = tick.get("exchange_timestamp") or datetime.now(timezone.utc).timestamp()
         ts = float(raw_ts) if raw_ts > 1e11 else float(raw_ts)
@@ -147,7 +191,13 @@ class VolumeBackedORB(BaseStrategy):
             # Track new day session and gap
             dt_info = self.day_tracking[inst]
             if dt_info["date"] != today:
-                dt_info["prev_close"] = ltp if dt_info["date"] is None else dt_info.get("last_close", ltp)
+                # Prefer the real prior-session close from warmup candles; fall back to the
+                # carried last_close, then the current tick, only if no seed is available.
+                seeded = self.seeded_prev_close.get(inst, 0.0)
+                if seeded > 0:
+                    dt_info["prev_close"] = seeded
+                else:
+                    dt_info["prev_close"] = ltp if dt_info["date"] is None else dt_info.get("last_close", ltp)
                 dt_info["date"] = today
                 dt_info["day_open"] = None
                 dt_info["excessive_gap"] = False
@@ -161,18 +211,41 @@ class VolumeBackedORB(BaseStrategy):
             if self._in_orb_window(now_dt):
                 if dt_info["day_open"] is None:
                     dt_info["day_open"] = ltp
-                    if dt_info["prev_close"] and dt_info["prev_close"] > 0:
+                    # Prefer the gap computed from WARMUP CANDLES (real prior close vs real
+                    # 09:15 candle open) over a live tick that can still carry a stale pre-open
+                    # LTP into the 09:15 window. Fall back to the tick-based calc only if the
+                    # candle-derived gap is unavailable.
+                    if self._seeded_gap.get(inst) is not None:
+                        g = self._seeded_gap[inst]
+                        dt_info["gap_pct"] = g["gap_pct"]
+                        dt_info["gap_dir"] = g["gap_dir"]
+                        dt_info["excessive_gap"] = g["excessive"]
+                        if g["excessive"]:
+                            logger.warning(f"⚠️ [ORB GAP FILTER] {inst} opened with extreme {g['gap_pct']:.2f}% gap (candle-derived). ORB Breakouts suppressed today.")
+                        elif g["gap_pct"] > self.max_gap_pct:
+                            logger.info(f"🚀 [ORB GAP-AND-GO] {inst} opened {g['gap_pct']:.2f}% gap {g['gap_dir']} (candle-derived). CE/PE bias applied.")
+                    elif dt_info["prev_close"] and dt_info["prev_close"] > 0:
                         gap_diff = dt_info["day_open"] - dt_info["prev_close"]
                         gap_pct = abs(gap_diff) / dt_info["prev_close"] * 100.0
                         gap_dir = "UP" if gap_diff > 0 else "DOWN"
-                        dt_info["gap_pct"] = gap_pct
-                        dt_info["gap_dir"] = gap_dir
-
-                        if gap_pct > self.extreme_gap_pct:
-                            dt_info["excessive_gap"] = True
-                            logger.warning(f"⚠️ [ORB GAP FILTER] {inst} opened with extreme {gap_pct:.2f}% gap (> {self.extreme_gap_pct}%). ORB Breakouts suppressed today.")
-                        elif gap_pct > self.max_gap_pct:
-                            logger.info(f"🚀 [ORB GAP-AND-GO] {inst} opened with {gap_pct:.2f}% gap {gap_dir} (> {self.max_gap_pct}%). Enabling Gap-and-Go continuation breakouts for {'CE' if gap_dir == 'UP' else 'PE'} only.")
+                        # SAFETY: without a candle-derived gap we can't fully trust the open tick
+                        # (it may be a stale pre-open print). A >3% "gap" is far more likely a bad
+                        # tick than a real overnight move on an index — treat it as no-gap rather
+                        # than wrongly suppress a whole direction (the bug that killed SENSEX ORB).
+                        if gap_pct > 3.0:
+                            logger.warning(
+                                f"⚠️ [ORB_BREAKOUT] {inst} implausible tick-gap {gap_pct:.2f}% "
+                                f"(open {dt_info['day_open']:.1f} vs prev_close {dt_info['prev_close']:.1f}) "
+                                f"— treating as NO gap (likely stale open tick)."
+                            )
+                        else:
+                            dt_info["gap_pct"] = gap_pct
+                            dt_info["gap_dir"] = gap_dir
+                            if gap_pct > self.extreme_gap_pct:
+                                dt_info["excessive_gap"] = True
+                                logger.warning(f"⚠️ [ORB GAP FILTER] {inst} opened with extreme {gap_pct:.2f}% gap (> {self.extreme_gap_pct}%). ORB Breakouts suppressed today.")
+                            elif gap_pct > self.max_gap_pct:
+                                logger.info(f"🚀 [ORB GAP-AND-GO] {inst} opened with {gap_pct:.2f}% gap {gap_dir} (> {self.max_gap_pct}%). Enabling Gap-and-Go continuation breakouts for {'CE' if gap_dir == 'UP' else 'PE'} only.")
 
                 rng = self.orb_ranges[inst]
                 if ltp > rng["high"]:
