@@ -47,7 +47,7 @@ export function SignalHistoryTable() {
           <table className="journal-table">
             <thead>
               <tr>
-                <th>Time (IST)</th>
+                <th>Date & Time (IST)</th>
                 <th>Signal ID</th>
                 <th>Instrument</th>
                 <th>Strategy</th>
@@ -72,10 +72,26 @@ export function SignalHistoryTable() {
                 const t1 = item.details?.target_1r;
                 const tgtDisplay = t1 ? `₹${t1.toFixed(1)} / ₹${item.target.toFixed(1)}` : `₹${item.target.toFixed(2)}`;
 
+                // Format entry date & time in IST
+                const createdDate = item.created_at ? new Date(item.created_at) : null;
+                const dateStr = createdDate && !isNaN(createdDate.getTime())
+                  ? createdDate.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' })
+                  : '-';
+                const timeStr = createdDate && !isNaN(createdDate.getTime())
+                  ? createdDate.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' })
+                  : '-';
+
+                // Format exit / resolved time in IST if available
+                const resolvedDate = item.resolved_at ? new Date(item.resolved_at) : null;
+                const exitTimeStr = resolvedDate && !isNaN(resolvedDate.getTime())
+                  ? resolvedDate.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' })
+                  : null;
+
                 return (
                   <tr key={item.signal_id}>
                     <td style={{ color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
-                      {new Date(item.created_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}
+                      <div style={{ color: 'var(--text-primary)', fontWeight: '600', fontSize: '0.78rem' }}>{dateStr}</div>
+                      <div style={{ color: 'var(--text-muted)', fontSize: '0.72rem' }}>{timeStr}</div>
                     </td>
                     <td style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{item.signal_id}</td>
                     <td>
@@ -89,7 +105,12 @@ export function SignalHistoryTable() {
                     <td style={{ color: 'var(--pe-red)' }}>₹{item.stop_loss.toFixed(2)}</td>
                     <td style={{ color: 'var(--ce-green)' }}>{tgtDisplay}</td>
                     <td style={{ color: item.exit_price ? (item.exit_price > item.entry_price ? 'var(--ce-green)' : 'var(--pe-red)') : 'var(--text-muted)' }}>
-                      {item.exit_price ? `₹${item.exit_price.toFixed(2)}` : '-'}
+                      <div>{item.exit_price ? `₹${item.exit_price.toFixed(2)}` : '-'}</div>
+                      {exitTimeStr && (
+                        <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }} title={`Exit time: ${exitTimeStr}`}>
+                          @{exitTimeStr}
+                        </div>
+                      )}
                     </td>
                     <td style={{ fontSize: '0.75rem' }}>
                       {item.quantity} ({item.quantity / (item.lot_size || 1)}L)
