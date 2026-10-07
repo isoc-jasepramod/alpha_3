@@ -31,6 +31,17 @@ class GEXEngine(BaseStrategy):
         # Rolling GEX regime tracking
         self.prev_regimes: Dict[str, str] = {"NIFTY": "NEUTRAL", "SENSEX": "NEUTRAL"}
         self.last_eval_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+
+        # EDGE-TRIGGER state for proximity alerts. "Near a gamma wall" is a persistent STATE —
+        # firing every eval (throttled only by the 75s cooldown) spams near-identical heads-ups
+        # while spot lingers. We instead alert only on the OUTSIDE->INSIDE transition per zone,
+        # and only re-arm once spot has clearly LEFT the zone (proximity + hysteresis buffer).
+        # Key = f"{inst}_{zone}" (zone in CALL_WALL / PUT_WALL / CONFLUENCE_CE / CONFLUENCE_PE).
+        self._zone_inside: Dict[str, bool] = {}
+        # Hysteresis: spot must exit beyond (proximity + buffer) to re-arm, so oscillation right
+        # at the boundary doesn't produce repeat alerts.
+        self.zone_exit_buffer_nifty = cfg.get("zone_exit_buffer_nifty", 15.0)
+        self.zone_exit_buffer_sensex = cfg.get("zone_exit_buffer_sensex", 45.0)
         self.latest_gex: Dict[str, Dict[str, Any]] = {
             "NIFTY": {"net_gex": 0.0, "regime": "NEUTRAL", "regime_detail": "NEUTRAL", "call_wall": 0.0, "put_wall": 0.0, "call_gex": 0.0, "put_gex": 0.0},
             "SENSEX": {"net_gex": 0.0, "regime": "NEUTRAL", "regime_detail": "NEUTRAL", "call_wall": 0.0, "put_wall": 0.0, "call_gex": 0.0, "put_gex": 0.0}
@@ -46,6 +57,23 @@ class GEXEngine(BaseStrategy):
             "call_gex": 0.0,
             "put_gex": 0.0
         })
+
+    def _zone_edge_enter(self, inst: str, zone: str, is_near: bool, has_exited: bool) -> bool:
+        """
+        Edge-trigger gate for proximity alerts.
+          is_near    : spot is currently within the alert's proximity threshold.
+          has_exited : spot is beyond proximity + hysteresis buffer (clearly out of the zone).
+        Returns True ONLY on an outside->inside transition (fire once on approach).
+        Re-arms the zone once spot has clearly exited, so it can alert again on a fresh approach.
+        """
+        key = f"{inst}_{zone}"
+        inside = self._zone_inside.get(key, False)
+        if is_near and not inside:
+            self._zone_inside[key] = True
+            return True            # fresh entry into the zone -> emit
+        if has_exited and inside:
+            self._zone_inside[key] = False   # left the zone -> re-arm for next approach
+        return False
 
     def _get_time_to_expiry_years(self, ts: float, inst: str = "NIFTY") -> float:
         dt = self.parse_ist_time(ts)
@@ -205,20 +233,49 @@ class GEXEngine(BaseStrategy):
         target_1_pts = 35.0 if inst == "NIFTY" else 100.0
         target_2_pts = 75.0 if inst == "NIFTY" else 220.0
 
+        # Hysteresis exit buffer: spot must leave the zone by this much to re-arm the edge trigger.
+        exit_buf = self.zone_exit_buffer_nifty if inst == "NIFTY" else self.zone_exit_buffer_sensex
+        # Plain proximity threshold for the squeeze/cascade heads-ups.
+        squeeze_prox = 30.0 if inst == "NIFTY" else 90.0
+
+        skew_call_ok = (delta_skew is not None and delta_skew >= 1.5) or (current_skew is not None and current_skew >= 2.0)
+        skew_put_ok = (delta_skew is not None and delta_skew <= -1.5) or (current_skew is not None and current_skew <= -2.0)
+
         is_call_confluence = (
-            call_wall_strike > 0 and 
+            call_wall_strike > 0 and
             0 < (call_wall_strike - spot) <= proximity_pts and
-            ((delta_skew is not None and delta_skew >= 1.5) or (current_skew is not None and current_skew >= 2.0))
+            skew_call_ok
         )
 
         is_put_confluence = (
-            put_wall_strike > 0 and 
+            put_wall_strike > 0 and
             0 < (spot - put_wall_strike) <= proximity_pts and
-            ((delta_skew is not None and delta_skew <= -1.5) or (current_skew is not None and current_skew <= -2.0))
+            skew_put_ok
         )
 
+        # EDGE-TRIGGER gates: fire once on fresh approach; re-arm only after spot clearly exits.
+        # "has_exited" = spot beyond proximity + hysteresis buffer (or wall not present).
+        conf_ce_exited = not (call_wall_strike > 0 and (call_wall_strike - spot) <= proximity_pts + exit_buf)
+        conf_pe_exited = not (put_wall_strike > 0 and (spot - put_wall_strike) <= proximity_pts + exit_buf)
+        sqz_exited = not (call_wall_strike > 0 and (call_wall_strike - spot) <= squeeze_prox + exit_buf)
+        casc_exited = not (put_wall_strike > 0 and (spot - put_wall_strike) <= squeeze_prox + exit_buf)
+
+        fire_call_confluence = is_call_confluence and self._zone_edge_enter(inst, "CONFLUENCE_CE", True, conf_ce_exited)
+        fire_put_confluence = is_put_confluence and self._zone_edge_enter(inst, "CONFLUENCE_PE", True, conf_pe_exited)
+        # keep edge-state fresh even when skew isn't confirmed (so exit re-arms): if not near-with-skew,
+        # still advance the exit side of the state machine.
+        if not is_call_confluence:
+            self._zone_edge_enter(inst, "CONFLUENCE_CE", False, conf_ce_exited)
+        if not is_put_confluence:
+            self._zone_edge_enter(inst, "CONFLUENCE_PE", False, conf_pe_exited)
+
+        near_call_wall = call_wall_strike > 0 and 0 < (call_wall_strike - spot) <= squeeze_prox
+        near_put_wall = put_wall_strike > 0 and 0 < (spot - put_wall_strike) <= squeeze_prox
+        fire_squeeze = self._zone_edge_enter(inst, "CALL_WALL", near_call_wall, sqz_exited)
+        fire_cascade = self._zone_edge_enter(inst, "PUT_WALL", near_put_wall, casc_exited)
+
         # Elevated Confluence Alert (CE): Call Gamma Wall + Institutional Call IV Skew Surge
-        if is_call_confluence:
+        if fire_call_confluence:
             spot_sl = spot - sl_pts
             t1 = call_wall_strike + target_1_pts
             t2 = call_wall_strike + target_2_pts
@@ -243,7 +300,7 @@ class GEXEngine(BaseStrategy):
                 now_ts=ts
             )
         # Elevated Confluence Alert (PE): Put Gamma Wall + Institutional Put IV Skew Surge
-        elif is_put_confluence:
+        elif fire_put_confluence:
             spot_sl = spot + sl_pts
             t1 = put_wall_strike - target_1_pts
             t2 = put_wall_strike - target_2_pts
@@ -268,8 +325,8 @@ class GEXEngine(BaseStrategy):
                 now_ts=ts
             )
         # Alert 2: Proximity to Call Wall under Short Gamma (Classic Gamma Squeeze Setup)
-        elif call_wall_strike > 0 and 0 < (call_wall_strike - spot) <= (30.0 if inst == "NIFTY" else 90.0):
-            # Spot is within 30 points of Call Wall
+        elif fire_squeeze:
+            # Spot freshly entered proximity of the Call Wall
             self.emit_radar_alert(
                 alert_type="GAMMA_SQUEEZE_PRE_ALERT",
                 instrument=inst,
@@ -280,7 +337,7 @@ class GEXEngine(BaseStrategy):
                 now_ts=ts
             )
         # Alert 3: Proximity to Put Wall (Downside Cascade)
-        elif put_wall_strike > 0 and 0 < (spot - put_wall_strike) <= (30.0 if inst == "NIFTY" else 90.0):
+        elif fire_cascade:
             self.emit_radar_alert(
                 alert_type="GAMMA_CASCADE_PE_ALERT",
                 instrument=inst,
