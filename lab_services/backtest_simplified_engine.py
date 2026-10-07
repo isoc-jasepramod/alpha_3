@@ -51,6 +51,15 @@ class SimplifiedEngineBacktester:
         self.current_spot = {"NIFTY": 22530.0, "SENSEX": 72300.0}
         self.latest_ltp: Dict[str, float] = {}
 
+        self.token_meta = {}
+        tm_path = os.path.join(self.lake_dir, "token_meta.json")
+        if os.path.exists(tm_path):
+            try:
+                with open(tm_path, "r", encoding="utf-8") as f:
+                    self.token_meta = json.load(f)
+            except Exception as e:
+                print(f"  [Init] Could not load token_meta.json: {e}")
+
         self.signals: List[Dict[str, Any]] = []
         self.active_trades: Dict[str, Dict[str, Any]] = {}
         self.resolved_trades: List[Dict[str, Any]] = []
@@ -131,49 +140,46 @@ class SimplifiedEngineBacktester:
         if token == "99919000":
             return {"is_spot": True, "name": "SENSEX", "exchange": "bse_cm"}
 
-        if token in self.master_data:
-            m = self.master_data[token]
-            inst = m.get("name")
-            if inst not in ("NIFTY", "SENSEX") or m.get("instrumenttype") != "OPTIDX":
-                return None
-            exp = m.get("expiry", "")
-            if not ((inst == "NIFTY" and exp == "06OCT2026") or (inst == "SENSEX" and exp == "08OCT2026")):
-                return None
+        m = self.token_meta.get(token) or self.master_data.get(token)
+        if not m:
+            return None
 
-            sym = m.get("symbol", "")
-            opt_type = "CE" if sym.endswith("CE") else ("PE" if sym.endswith("PE") else "")
-            raw_strike = float(m.get("strike", 0))
-            strike = raw_strike / 100.0 if raw_strike > 100000 else raw_strike
-            step = 50.0 if inst == "NIFTY" else 100.0
-            spot = self.current_spot.get(inst, strike)
-            atm = round(spot / step) * step
-            offset = int(round((strike - atm) / step))
+        inst = m.get("name")
+        if inst not in ("NIFTY", "SENSEX"):
+            return None
 
-            # In lake partition, handle boundary strikes if spot moves outside available range
-            is_closest = False
-            if inst == "NIFTY":
-                if spot >= 22650.0 and strike == 22650.0:
-                    is_closest = True
-                elif spot <= 22150.0 and strike == 22150.0:
-                    is_closest = True
-                elif strike == 22300.0: # Fallback for Oct 05 lake
-                    is_closest = True
-            elif inst == "SENSEX":
-                if strike == 73900.0:
-                    is_closest = True
+        sym = m.get("symbol", "")
+        opt_type = m.get("option_type") or ("CE" if sym.endswith("CE") else ("PE" if sym.endswith("PE") else ""))
+        if not opt_type:
+            return None
 
-            return {
-                "is_spot": False,
-                "name": inst,
-                "symbol": sym,
-                "strike": strike,
-                "option_type": opt_type,
-                "lot_size": int(m.get("lotsize", 50)),
-                "offset": offset,
-                "is_closest_lake": is_closest,
-                "expiry": exp
-            }
-        return None
+        raw_strike = float(m.get("strike", 0))
+        strike = raw_strike / 100.0 if raw_strike > 100000 else raw_strike
+        step = 50.0 if inst == "NIFTY" else 100.0
+        spot = self.current_spot.get(inst, strike)
+        atm = round(spot / step) * step
+        offset = int(round((strike - atm) / step))
+        is_closest = False
+        if inst == "NIFTY":
+            if spot >= 22300.0 and strike == 22300.0:
+                is_closest = True
+            elif spot <= 22100.0 and strike == 22100.0:
+                is_closest = True
+        elif inst == "SENSEX":
+            if spot <= 73900.0 and strike == 73900.0:
+                is_closest = True
+        lot_sz = int(m.get("lot_size") or m.get("lotsize") or (20 if inst == "SENSEX" else 65))
+        return {
+            "is_spot": False,
+            "name": inst,
+            "symbol": sym,
+            "strike": strike,
+            "option_type": opt_type,
+            "lot_size": lot_sz,
+            "offset": offset,
+            "is_closest_lake": is_closest,
+            "expiry": m.get("expiry", "")
+        }
 
     async def run(self):
         IST = timezone(timedelta(hours=5, minutes=30))
