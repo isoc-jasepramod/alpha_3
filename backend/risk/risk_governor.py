@@ -161,21 +161,29 @@ class RiskGovernor:
         if risk_per_lot <= 0:
             return None
 
-        lots_count = math.floor(max_trade_risk / risk_per_lot)
-        # Position sizing safety cap: Maximum allowed lots per trade (never over-leverage)
-        max_lots_cap = 2 if inst == "SENSEX" else 3
-        if lots_count > max_lots_cap:
-            logger.warning(
-                f"🛡️ [LOT SIZING CAP] Calculated {lots_count} lots for {inst} capped to max {max_lots_cap} lots."
-            )
-            lots_count = max_lots_cap
-        elif lots_count < 1:
-            # Capital is insufficient for 1 lot at 1.0% risk limit
-            logger.warning(
-                f"Capital guard: Risk/lot ₹{risk_per_lot:.2f} exceeds 1% equity ₹{max_trade_risk:.2f}. "
-                f"Sizing defaulted to minimum 1 lot ({lot_size} shares) with advisory warning."
-            )
-            lots_count = 1
+        strat_name = raw_signal.get("strategy", "")
+
+        # EXCLUSIVE RULE FOR OI_SQUEEZE:
+        # Scale-and-trail requires exactly 2 lots (1 lot books at Target 1, 1 lot trails with Breakeven SL).
+        # Untouched for all other strategies.
+        if strat_name == "OI_SQUEEZE":
+            lots_count = 2
+        else:
+            lots_count = math.floor(max_trade_risk / risk_per_lot)
+            # Position sizing safety cap: Maximum allowed lots per trade (never over-leverage)
+            max_lots_cap = 2 if inst == "SENSEX" else 3
+            if lots_count > max_lots_cap:
+                logger.warning(
+                    f"🛡️ [LOT SIZING CAP] Calculated {lots_count} lots for {inst} capped to max {max_lots_cap} lots."
+                )
+                lots_count = max_lots_cap
+            elif lots_count < 1:
+                # Capital is insufficient for 1 lot at 1.0% risk limit
+                logger.warning(
+                    f"Capital guard: Risk/lot ₹{risk_per_lot:.2f} exceeds 1% equity ₹{max_trade_risk:.2f}. "
+                    f"Sizing defaulted to minimum 1 lot ({lot_size} shares) with advisory warning."
+                )
+                lots_count = 1
 
         quantity = lots_count * lot_size
         total_risk_amount = round(quantity * risk_per_share, 2)

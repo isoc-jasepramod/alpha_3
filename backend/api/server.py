@@ -97,7 +97,7 @@ class EngineCoordinator:
 
         # Strategy instances with configured rules
         self.strategies = [
-            OISqueezeSentinel(strat_cfg.get("oi_squeeze")),
+            OISqueezeSentinel(strat_cfg.get("oi_squeeze"), regime_filter=self.regime_filter),
             VolumeBackedORB(strat_cfg.get("orb_breakout")),
             vwap_ema_strat,
             ExpiryDayGammaScalp(strat_cfg.get("gamma_scalp")),

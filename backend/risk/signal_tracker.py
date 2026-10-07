@@ -151,27 +151,97 @@ class SignalTracker:
                 resolved_signals.append((sig_id, sig, 0.0))
                 continue
 
-            # 2. Target Hit
-            if ltp >= tgt:
-                logger.success(f"🎯 [TARGET HIT] Signal {sig_id} hit Target ₹{tgt} at LTP ₹{ltp}!")
-                pnl = (tgt - entry) * qty
-                sig["status"] = "TARGET_HIT"
-                sig["exit_price"] = tgt
-                sig["theoretical_pnl"] = round(pnl, 2)
-                sig["resolved_ts"] = now_ts
-                resolved_signals.append((sig_id, sig, pnl))
-                continue
+            # Check strategy-specific scale-and-trail (EXCLUSIVELY for OI_SQUEEZE with >= 2 lots)
+            is_oi_squeeze = (sig.get("strategy") == "OI_SQUEEZE")
+            lot_size = int(sig.get("lot_size", 1))
+            can_scale = is_oi_squeeze and qty >= (2 * lot_size)
 
-            # 3. Stop Hit
-            if ltp <= sl:
-                logger.error(f"🛑 [STOP HIT] Signal {sig_id} hit SL ₹{sl} at LTP ₹{ltp}!")
-                pnl = (sl - entry) * qty # negative
-                sig["status"] = "STOP_HIT"
-                sig["exit_price"] = sl
-                sig["theoretical_pnl"] = round(pnl, 2)
-                sig["resolved_ts"] = now_ts
-                resolved_signals.append((sig_id, sig, pnl))
-                continue
+            if can_scale:
+                tgt_1r = float(sig.get("target_1r") or (entry + (tgt - entry) / 2.0))
+                # 2a. Target 1 Reached: Book 1 Lot (50%), move remaining Stop to Breakeven
+                if ltp >= tgt_1r and not sig.get("target_1_hit"):
+                    sig["target_1_hit"] = True
+                    booked_qty = lot_size
+                    pnl_1 = round((tgt_1r - entry) * booked_qty, 2)
+                    sig["partial_pnl"] = pnl_1
+                    sig["remaining_quantity"] = qty - booked_qty
+                    sig["stop_loss"] = entry  # Move SL of remaining lot to Breakeven
+                    sig["partial_exit_guidance"] = (
+                        f"Target 1 hit (+₹{pnl_1:.0f} booked). "
+                        f"Trailing remaining 1 lot to Target 2 with SL at Breakeven (₹{entry:.2f})."
+                    )
+                    logger.success(
+                        f"🎯 [OI_SQUEEZE T1 BOOKED] {sig_id}: Booked 1 lot (+₹{pnl_1:.2f}) at ₹{tgt_1r}! "
+                        f"Stop moved to Breakeven ₹{entry}."
+                    )
+                    await self.redis_bus.publish_signal({
+                        "event": "SIGNAL_PARTIAL_PROFIT",
+                        "signal": sig
+                    })
+
+                # 2b. Full Target 2 Hit
+                if ltp >= tgt:
+                    logger.success(f"🎯 [TARGET HIT] Signal {sig_id} hit Target ₹{tgt} at LTP ₹{ltp}!")
+                    if sig.get("target_1_hit"):
+                        rem_qty = int(sig.get("remaining_quantity", qty - lot_size))
+                        pnl_2 = (tgt - entry) * rem_qty
+                        total_pnl = round(sig.get("partial_pnl", 0.0) + pnl_2, 2)
+                    else:
+                        total_pnl = round((tgt - entry) * qty, 2)
+                    sig["status"] = "TARGET_HIT"
+                    sig["exit_price"] = tgt
+                    sig["theoretical_pnl"] = total_pnl
+                    sig["resolved_ts"] = now_ts
+                    resolved_signals.append((sig_id, sig, total_pnl))
+                    continue
+
+                # 2c. Stop Hit (If T1 was hit, this is Breakeven Stop -> Locks in Net Profit!)
+                if ltp <= sl:
+                    if sig.get("target_1_hit"):
+                        rem_qty = int(sig.get("remaining_quantity", qty - lot_size))
+                        pnl_2 = (sl - entry) * rem_qty
+                        total_pnl = round(sig.get("partial_pnl", 0.0) + pnl_2, 2)
+                        sig["status"] = "TARGET_HIT"  # Displays as Green Win on UI
+                        sig["exit_price"] = sl
+                        sig["theoretical_pnl"] = total_pnl
+                        sig["resolved_ts"] = now_ts
+                        logger.success(
+                            f"🛡️ [OI_SQUEEZE BE EXIT] Signal {sig_id} stopped at Breakeven ₹{sl}. "
+                            f"Total Net PnL Secured: +₹{total_pnl:.2f}!"
+                        )
+                        resolved_signals.append((sig_id, sig, total_pnl))
+                    else:
+                        pnl = (sl - entry) * qty
+                        sig["status"] = "STOP_HIT"
+                        sig["exit_price"] = sl
+                        sig["theoretical_pnl"] = round(pnl, 2)
+                        sig["resolved_ts"] = now_ts
+                        logger.error(f"🛑 [STOP HIT] Signal {sig_id} hit SL ₹{sl} at LTP ₹{ltp}!")
+                        resolved_signals.append((sig_id, sig, pnl))
+                    continue
+
+            else:
+                # Standard Target Hit for all other strategies (and single-lot trades)
+                if ltp >= tgt:
+                    logger.success(f"🎯 [TARGET HIT] Signal {sig_id} hit Target ₹{tgt} at LTP ₹{ltp}!")
+                    pnl = (tgt - entry) * qty
+                    sig["status"] = "TARGET_HIT"
+                    sig["exit_price"] = tgt
+                    sig["theoretical_pnl"] = round(pnl, 2)
+                    sig["resolved_ts"] = now_ts
+                    resolved_signals.append((sig_id, sig, pnl))
+                    continue
+
+                # Standard Stop Hit for all other strategies (and single-lot trades)
+                if ltp <= sl:
+                    logger.error(f"🛑 [STOP HIT] Signal {sig_id} hit SL ₹{sl} at LTP ₹{ltp}!")
+                    pnl = (sl - entry) * qty # negative
+                    sig["status"] = "STOP_HIT"
+                    sig["exit_price"] = sl
+                    sig["theoretical_pnl"] = round(pnl, 2)
+                    sig["resolved_ts"] = now_ts
+                    resolved_signals.append((sig_id, sig, pnl))
+                    continue
 
         # Process resolutions - keep in active_signals so card stays displayed on screen!
         for sig_id, sig, pnl in resolved_signals:
@@ -235,7 +305,11 @@ class SignalTracker:
             entry = float(sig.get("entry_price", 0.0))
             last_ltp = float(sig.get("live_ltp", entry))
             qty = int(sig.get("quantity", 1))
-            pnl = round((last_ltp - entry) * qty, 2)
+            if sig.get("target_1_hit"):
+                rem_qty = int(sig.get("remaining_quantity", qty // 2))
+                pnl = round(sig.get("partial_pnl", 0.0) + (last_ltp - entry) * rem_qty, 2)
+            else:
+                pnl = round((last_ltp - entry) * qty, 2)
 
             sig["status"] = "EOD_EXPIRED"
             sig["exit_price"] = last_ltp

@@ -153,3 +153,57 @@ async def test_resolution_callback_fired():
 
     assert len(callback_signals) == 1
     assert callback_signals[0]["status"] == "STOP_HIT"
+
+
+@pytest.mark.asyncio
+async def test_oi_squeeze_scale_and_trail():
+    """Verify that OI_SQUEEZE with 2 lots executes scale-and-trail: locks T1 and trails BE."""
+    redis_bus = RedisBus()
+    published_events = []
+    async def mock_publish(payload, *args, **kwargs):
+        published_events.append(payload)
+    redis_bus.publish_signal = mock_publish
+    redis_bus.publish_tick = mock_publish
+
+    gov = RiskGovernor()
+    tracker = SignalTracker(redis_bus, gov)
+
+    # 1. Register 2-lot OI_SQUEEZE signal on SENSEX (2 lots = 40 shares, lot_size = 20)
+    sig_oi = {
+        "signal_id": "TEST-OI-SCALE",
+        "instrument": "SENSEX",
+        "strategy": "OI_SQUEEZE",
+        "direction": "PE",
+        "option_type": "PE",
+        "option_token": "888001",
+        "option_symbol": "SENSEX73000PE",
+        "entry_price": 300.0,
+        "stop_loss": 250.0,      # 50 pt SL (-₹2,000 across 2 lots)
+        "target": 400.0,         # Target 2 (+100 pts)
+        "target_1r": 350.0,      # Target 1 (+50 pts)
+        "quantity": 40,
+        "lot_size": 20,
+        "status": "ACTIVE"
+    }
+    tracker.register_signal(sig_oi)
+    # Simulate elapsed time past runaway window
+    tracker.active_signals["TEST-OI-SCALE"]["registered_ts"] = datetime.now(timezone.utc).timestamp() - 60
+
+    # 2. Tick reaches Target 1 (351.0 >= 350.0)
+    await tracker.on_tick({"token": "888001", "ltp": 351.0})
+
+    active = tracker.active_signals["TEST-OI-SCALE"]
+    assert active["status"] == "ACTIVE" # Still active waiting for T2
+    assert active["target_1_hit"] is True
+    assert active["partial_pnl"] == (350.0 - 300.0) * 20 # +₹1,000 booked
+    assert active["remaining_quantity"] == 20 # 1 lot remaining
+    assert active["stop_loss"] == 300.0 # Stop moved to Breakeven!
+
+    # 3. Market reverses and drops to Breakeven (299.0 <= 300.0)
+    await tracker.on_tick({"token": "888001", "ltp": 299.0})
+
+    # Resolved as a WIN with secured profit
+    assert active["status"] == "TARGET_HIT"
+    assert active["exit_price"] == 300.0
+    assert active["theoretical_pnl"] == 1000.0 # Kept the +₹1,000 profit!
+

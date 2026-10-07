@@ -13,8 +13,9 @@ class OISqueezeSentinel(BaseStrategy):
     PE Trigger: Delta OI <= -5.0%, Delta Price >= +3.0%, Spot < EMA20, ADX >= 20, Option Vol >= 2x 20-period avg.
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, regime_filter: Optional[Any] = None):
         super().__init__(name="OI_SQUEEZE")
+        self.regime_filter = regime_filter
         cfg = config or {}
         self.start_time = cfg.get("start_time", "09:15:00")
         self.end_time = cfg.get("end_time", "15:30:00")
@@ -26,16 +27,9 @@ class OISqueezeSentinel(BaseStrategy):
         self.early_ignition_price_spike_pct_standard = cfg.get("early_ignition_price_spike_pct_standard", 12.0) # +12.0% for non-expiry
         self.vol_multiplier = cfg.get("vol_multiplier", 2.0)
         self.min_adx = cfg.get("min_adx", 20.0)
-        # HARD directional confirmation vs EMA20. The old gate used a loose +/-0.05% tolerance
-        # (allowed CE even slightly BELOW EMA20), which let CE fire in a down/choppy tape — the
-        # main source of today's CE bias and losses. When enabled, a signal requires spot to be
-        # clearly on the correct side of EMA20 by spot_confirm_margin_pct. Backtest showed
-        # non-confirming signals averaged -10.45%/trade vs +0.73% for confirming ones.
-        # Default False to MATCH the shipped config (gate unvalidated on 3-day backtest). The
-        # code default must equal the conservative shipped state so any caller that doesn't pass
-        # full config (e.g. a backtest harness) doesn't silently enable an unvalidated gate.
-        self.require_spot_confirmation = bool(cfg.get("require_spot_confirmation", False))
-        self.spot_confirm_margin_pct = float(cfg.get("spot_confirm_margin_pct", 0.05))  # % of spot
+        # Directional confirmation vs EMA20. Require spot to confirm the squeeze direction.
+        self.require_spot_confirmation = bool(cfg.get("require_spot_confirmation", True))
+        self.spot_confirm_margin_pct = float(cfg.get("spot_confirm_margin_pct", 0.03))  # % of spot
 
         # Rolling history per option token: deque of (ts, ltp, oi, cumulative_vol)
         self.token_history: Dict[str, deque] = {}
@@ -69,12 +63,18 @@ class OISqueezeSentinel(BaseStrategy):
 
     def update_spot(self, instrument: str, price: float, ts: float, vol: float = 1.0):
         self.spot_prices[instrument] = price
-        if instrument in self.spot_ema20:
-            self.spot_ema20[instrument].update(price)
+        if instrument in self.spot_ema20 and self.spot_ema20[instrument].ema is None:
+            self.spot_ema20[instrument].seed(price)
+
         if instrument in self.spot_aggregators:
             closed = self.spot_aggregators[instrument].on_tick(ts, price, vol)
-            if closed and instrument in self.spot_adx:
-                self.spot_adx[instrument].update(closed["high"], closed["low"], closed["close"])
+            if closed:
+                if instrument in self.spot_ema20:
+                    self.spot_ema20[instrument].update(closed["close"])
+                if instrument in self.spot_adx:
+                    self.spot_adx[instrument].update(closed["high"], closed["low"], closed["close"])
+        elif instrument in self.spot_ema20:
+            self.spot_ema20[instrument].update(price)
 
     def seed_from_spot(self, inst: str, spot_info: Dict[str, Any]):
         """Seeds spot price and EMA20 baseline from current spot quote."""
@@ -379,6 +379,20 @@ class OISqueezeSentinel(BaseStrategy):
         if delta_oi_pct <= -4.0 or delta_price_pct >= 2.5:
             logger.debug(f"[OI DEBUG] {token} ({symbol}): dOI={delta_oi_pct:.2f}%, dP={delta_price_pct:.2f}%, span={time_span:.0f}s, old_oi={old_oi}, cur_oi={oi}, old_ltp={old_ltp}, cur_ltp={ltp}")
 
+        # Macro Regime alignment filter
+        if self.regime_filter:
+            try:
+                reg_info = self.regime_filter.get_regime(inst)
+                regime = reg_info.get("regime", "NEUTRAL")
+                if regime == "TRENDING_BEAR" and opt_type == "CE":
+                    logger.info(f"🚫 [OI SQUEEZE REGIME-GATE] {symbol} CE blocked: Macro regime is TRENDING_BEAR ({reg_info.get('score', 0):.1f}).")
+                    return None
+                elif regime == "TRENDING_BULL" and opt_type == "PE":
+                    logger.info(f"🚫 [OI SQUEEZE REGIME-GATE] {symbol} PE blocked: Macro regime is TRENDING_BULL ({reg_info.get('score', 0):.1f}).")
+                    return None
+            except Exception as e:
+                logger.warning(f"Error querying regime filter in OI Squeeze: {e}")
+
         # 3. Spot vs EMA20 — HARD directional confirmation
         spot = self.spot_prices.get(inst, 0.0)
         ema20 = self.spot_ema20.get(inst).value if self.spot_ema20.get(inst) else None
@@ -426,8 +440,12 @@ class OISqueezeSentinel(BaseStrategy):
             vol_confirmed = (avg_vol > 0 and window_vol >= (self.vol_multiplier * avg_vol))
 
         # 6. Confidence Scoring
+        spot_confirms_trend = (
+            (opt_type == "CE" and spot > (ema20 or spot))
+            or (opt_type == "PE" and spot < (ema20 or spot))
+        )
         conditions = {
-            "trend_alignment": True,
+            "trend_alignment": spot_confirms_trend,
             "volume_confirmation": vol_confirmed or is_early_ignition,
             "momentum_strength": 1.0 if is_early_ignition else min(1.0, delta_price_pct / 6.0),
             "time_quality": self.is_time_gated(now_dt, "09:30:00", "15:00:00"),
