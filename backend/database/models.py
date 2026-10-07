@@ -61,6 +61,7 @@ class Signal(Base):
             "risk_amount": self.risk_amount,
             "status": self.status,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "resolved_ts": self.resolved_at.timestamp() if self.resolved_at else None,
             "exit_price": self.exit_price,
             "theoretical_pnl": self.theoretical_pnl,
             "details": self.details or {}

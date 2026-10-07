@@ -54,6 +54,32 @@ class SignalTracker:
         """Register a callback that gets called with (signal_dict) when a signal resolves."""
         self._resolution_callbacks.append(callback)
 
+    async def restore_from_db(self):
+        """Restores recent signals created today so active cards and recent outcomes survive server restarts."""
+        try:
+            async with AsyncSessionLocal() as session:
+                today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                stmt = select(Signal).where(Signal.created_at >= today_start).order_by(Signal.created_at.desc()).limit(20)
+                res = await session.execute(stmt)
+                records = res.scalars().all()
+                restored_count = 0
+                now_ts = datetime.now(timezone.utc).timestamp()
+                for rec in reversed(records):
+                    d = rec.to_dict()
+                    sig_id = d["signal_id"]
+                    status = d.get("status", "ACTIVE")
+                    res_ts = rec.resolved_at.timestamp() if rec.resolved_at else d.get("resolved_ts")
+                    if status == "ACTIVE" or (res_ts and (now_ts - res_ts) <= 1800):
+                        d["resolved_ts"] = res_ts
+                        d["registered_ts"] = d.get("registered_ts") or (rec.created_at.timestamp() if rec.created_at else now_ts)
+                        d["live_ltp"] = d.get("exit_price") or d.get("entry_price")
+                        self.active_signals[sig_id] = d
+                        restored_count += 1
+                if restored_count > 0:
+                    logger.info(f"🔄 Restored {restored_count} today's signal(s) from database into live tracker.")
+        except Exception as e:
+            logger.warning(f"Could not restore signals from database: {e}")
+
     def _get_runaway_params(self, sig: Dict[str, Any]) -> tuple:
         """Return (surge_pct, window_sec) based on the signal's strategy."""
         strategy = sig.get("strategy", "default")

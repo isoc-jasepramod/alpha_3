@@ -163,3 +163,24 @@ strategies:
     weight_persistence: 0.25        # VWAP Persistence weight (25%)
     weight_slope: 0.15              # VWAP Slope weight (15%)
 
+  simplified_price_action:
+    enabled: true
+    start_time: "09:15:00"
+    end_time: "15:15:00"
+    cooldown_sec: 180.0
+    min_adx: 22.0
+    rsi_ce_min: 50.0
+    rsi_ce_max: 66.0
+    rsi_pe_min: 34.0
+    rsi_pe_max: 50.0
+    min_bottom_wick_ratio: 0.35
+    min_top_wick_ratio: 0.15
+    min_opt_rvol: 1.20
+    require_opt_rvol: true
+    max_ema21_dist_nifty: 35.0
+    max_ema21_dist_sensex: 100.0
+    max_consecutive_stops_dir: 2
+    stop_pause_sec: 900.0
+
+
+

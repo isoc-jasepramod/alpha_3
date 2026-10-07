@@ -56,6 +56,9 @@ risk:
     MOMENTUM_IMPULSE:
       surge_pct: 0.10               # +10.0% — fast impulse moves expand rapidly
       time_window_sec: 15
+    SIMPLIFIED_VWAP_EMA:
+      surge_pct: 0.05               # +5.0% — standard VWAP pullback surge tolerance
+      time_window_sec: 25
 
 telegram:
   enabled: true

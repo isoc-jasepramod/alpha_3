@@ -32,10 +32,10 @@ class RiskGovernor:
         self.circuit_breaker_tripped = False
         self.circuit_breaker_time: Optional[datetime] = None
 
-        # Spot ATR14 trackers
+        # Spot ATR14 trackers with index-realistic default baseline
         self.spot_atr: Dict[str, IncrementalATR] = {
-            "NIFTY": IncrementalATR(period=14),
-            "SENSEX": IncrementalATR(period=14)
+            "NIFTY": IncrementalATR(period=14, default_atr=32.0),
+            "SENSEX": IncrementalATR(period=14, default_atr=160.0)
         }
 
         self._load_config(config_path)
@@ -59,6 +59,10 @@ class RiskGovernor:
     def update_spot_bar(self, instrument: str, high: float, low: float, close: float):
         if instrument in self.spot_atr:
             self.spot_atr[instrument].update(high, low, close)
+
+    def on_spot_candle(self, instrument: str, high: float, low: float, close: float):
+        """Alias for update_spot_bar to consume 1m / 3m closed spot candles."""
+        self.update_spot_bar(instrument, high, low, close)
 
     def record_trade_result(self, pnl: float):
         """Updates realized daily PnL and evaluates circuit breaker."""
@@ -92,10 +96,16 @@ class RiskGovernor:
             logger.warning(f"Invalid pricing values for signal {raw_signal.get('signal_id')}")
             return None
 
-        # 1. Spot ATR14
-        atr_val = self.spot_atr.get(inst, IncrementalATR()).value
-        if atr_val <= 0.0:
-            atr_val = spot_entry * 0.005 # Fallback ~0.5% ATR
+        # 1. Spot ATR14: live calculated value or index-calibrated baseline fallback
+        min_atr_floor = 80.0 if inst == "SENSEX" else 20.0
+        atr_obj = self.spot_atr.get(inst)
+        if atr_obj and atr_obj.atr is not None:
+            atr_val = max(min_atr_floor, atr_obj.atr)
+        else:
+            default_fallback = 160.0 if inst == "SENSEX" else 32.0
+            pct_rate = 0.0022 if inst == "SENSEX" else 0.0014
+            pct_fallback = spot_entry * pct_rate if spot_entry > 0 else default_fallback
+            atr_val = max(min_atr_floor, default_fallback * 0.75, pct_fallback)
 
         # 2. Synthetic Spot Stop Loss (SL_spot)
         custom_sl_spot = raw_signal.get("custom_sl_spot")
@@ -123,6 +133,17 @@ class RiskGovernor:
         # Ensure SL is strictly below Entry and > 0
         sl_opt = max(round(sl_opt, 2), round(p_entry * 0.50, 2))
         risk_per_share = p_entry - sl_opt
+
+        # Minimum Option Risk Buffer:
+        # SENSEX options fluctuate 5-10 points on normal tick spread alone.
+        # An SL under 25 points on SENSEX or under 8 points on NIFTY is noise suicide.
+        min_risk_points = 25.0 if inst == "SENSEX" else 8.0
+        min_risk_points = min(min_risk_points, max(4.0, p_entry * 0.25))
+        if risk_per_share < min_risk_points:
+            risk_per_share = min_risk_points
+            sl_opt = round(p_entry - risk_per_share, 2)
+            sl_rule_applied = f"{sl_rule_applied}+MIN_RISK_FLOOR"
+
         if risk_per_share <= 0.20:
             risk_per_share = p_entry * 0.10
             sl_opt = round(p_entry - risk_per_share, 2)
@@ -141,7 +162,14 @@ class RiskGovernor:
             return None
 
         lots_count = math.floor(max_trade_risk / risk_per_lot)
-        if lots_count < 1:
+        # Position sizing safety cap: Maximum allowed lots per trade (never over-leverage)
+        max_lots_cap = 2 if inst == "SENSEX" else 3
+        if lots_count > max_lots_cap:
+            logger.warning(
+                f"🛡️ [LOT SIZING CAP] Calculated {lots_count} lots for {inst} capped to max {max_lots_cap} lots."
+            )
+            lots_count = max_lots_cap
+        elif lots_count < 1:
             # Capital is insufficient for 1 lot at 1.0% risk limit
             logger.warning(
                 f"Capital guard: Risk/lot ₹{risk_per_lot:.2f} exceeds 1% equity ₹{max_trade_risk:.2f}. "

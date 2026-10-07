@@ -239,6 +239,12 @@ body {
   letter-spacing: 0.05em;
 }
 
+.spot-header-tags {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
 .spot-atm-tag {
   font-size: 0.65rem;
   font-weight: 700;
@@ -247,6 +253,40 @@ body {
   padding: 1px 6px;
   border-radius: 3px;
   border: 1px solid rgba(0, 240, 255, 0.25);
+}
+
+.spot-gamma-tag {
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.02em;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  cursor: help;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.spot-gamma-tag.gamma-pos {
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  box-shadow: 0 0 6px rgba(16, 185, 129, 0.15);
+}
+
+.spot-gamma-tag.gamma-neg {
+  color: #c084fc;
+  background: rgba(192, 132, 252, 0.12);
+  border: 1px solid rgba(192, 132, 252, 0.35);
+  box-shadow: 0 0 6px rgba(192, 132, 252, 0.15);
+}
+
+.spot-gamma-tag.gamma-neutral {
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 
 .spot-body {

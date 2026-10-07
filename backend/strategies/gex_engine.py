@@ -31,6 +31,21 @@ class GEXEngine(BaseStrategy):
         # Rolling GEX regime tracking
         self.prev_regimes: Dict[str, str] = {"NIFTY": "NEUTRAL", "SENSEX": "NEUTRAL"}
         self.last_eval_ts: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+        self.latest_gex: Dict[str, Dict[str, Any]] = {
+            "NIFTY": {"net_gex": 0.0, "regime": "NEUTRAL", "regime_detail": "NEUTRAL", "call_wall": 0.0, "put_wall": 0.0, "call_gex": 0.0, "put_gex": 0.0},
+            "SENSEX": {"net_gex": 0.0, "regime": "NEUTRAL", "regime_detail": "NEUTRAL", "call_wall": 0.0, "put_wall": 0.0, "call_gex": 0.0, "put_gex": 0.0}
+        }
+
+    def get_gamma_profile(self, inst: str) -> Dict[str, Any]:
+        return self.latest_gex.get(inst, {
+            "net_gex": 0.0,
+            "regime": "NEUTRAL",
+            "regime_detail": "NEUTRAL",
+            "call_wall": 0.0,
+            "put_wall": 0.0,
+            "call_gex": 0.0,
+            "put_gex": 0.0
+        })
 
     def _get_time_to_expiry_years(self, ts: float, inst: str = "NIFTY") -> float:
         dt = self.parse_ist_time(ts)
@@ -154,6 +169,18 @@ class GEXEngine(BaseStrategy):
         # Net GEX = Call GEX - Put GEX
         net_gex = total_call_gex - total_put_gex
         current_regime = "SHORT_GAMMA_AMPLIFIER" if net_gex < -5.0 else ("LONG_GAMMA_DAMPENER" if net_gex > 5.0 else "NEUTRAL")
+        gamma_direction = "NEGATIVE" if net_gex < -5.0 else ("POSITIVE" if net_gex > 5.0 else "NEUTRAL")
+
+        self.latest_gex[inst] = {
+            "net_gex": round(net_gex, 1),
+            "regime": gamma_direction,
+            "regime_detail": current_regime,
+            "call_wall": call_wall_strike,
+            "put_wall": put_wall_strike,
+            "call_gex": round(total_call_gex, 1),
+            "put_gex": round(total_put_gex, 1),
+            "updated_at": ts
+        }
 
         prev = self.prev_regimes.get(inst, "NEUTRAL")
         self.prev_regimes[inst] = current_regime

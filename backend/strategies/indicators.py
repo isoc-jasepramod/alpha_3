@@ -116,8 +116,9 @@ class IncrementalRSI:
 
 class IncrementalATR:
     """Computes Average True Range over N periods."""
-    def __init__(self, period: int = 14):
+    def __init__(self, period: int = 14, default_atr: Optional[float] = None):
         self.period = period
+        self.default_atr = default_atr
         self.prev_close: Optional[float] = None
         self.atr: Optional[float] = None
         self.tr_history = deque(maxlen=period)
@@ -147,7 +148,11 @@ class IncrementalATR:
 
     @property
     def value(self) -> float:
-        return self.atr if self.atr is not None else 10.0
+        if self.atr is not None:
+            return self.atr
+        if self.default_atr is not None:
+            return self.default_atr
+        return 10.0
 
 
 class IncrementalADX:

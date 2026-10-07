@@ -4,6 +4,7 @@ import { Activity, ShieldAlert, Volume2, VolumeX, PlayCircle, Layers } from 'luc
 export function HeaderTelemetry({
   telemetry,
   spotData = {},
+  gammaData = {},
   connected,
   soundEnabled,
   onToggleSound,
@@ -33,6 +34,31 @@ export function HeaderTelemetry({
   const sensexChange = sensexData.change ?? 0.0;
   const sensexChangePct = sensexData.change_pct ?? 0.0;
 
+  // Gamma Exposure Resolution
+  const niftyGamma = niftyData.gamma || gammaData?.NIFTY || {};
+  const niftyNetGex = niftyGamma.net_gex ?? 0.0;
+  const niftyGammaRegime = niftyGamma.regime || (niftyNetGex > 5 ? 'POSITIVE' : niftyNetGex < -5 ? 'NEGATIVE' : 'NEUTRAL');
+  const niftyCallWall = niftyGamma.call_wall || 0;
+  const niftyPutWall = niftyGamma.put_wall || 0;
+  const niftyGammaBadge = niftyGammaRegime === 'POSITIVE'
+    ? `+Γ DAMPENER`
+    : niftyGammaRegime === 'NEGATIVE'
+    ? `-Γ AMPLIFIER`
+    : `Γ NEUTRAL`;
+  const niftyGammaTitle = `NIFTY Gamma: ${niftyGammaRegime} (${niftyNetGex > 0 ? '+' : ''}${niftyNetGex} Cr) | Call Wall: ${niftyCallWall || 'N/A'} | Put Wall: ${niftyPutWall || 'N/A'}`;
+
+  const sensexGamma = sensexData.gamma || gammaData?.SENSEX || {};
+  const sensexNetGex = sensexGamma.net_gex ?? 0.0;
+  const sensexGammaRegime = sensexGamma.regime || (sensexNetGex > 5 ? 'POSITIVE' : sensexNetGex < -5 ? 'NEGATIVE' : 'NEUTRAL');
+  const sensexCallWall = sensexGamma.call_wall || 0;
+  const sensexPutWall = sensexGamma.put_wall || 0;
+  const sensexGammaBadge = sensexGammaRegime === 'POSITIVE'
+    ? `+Γ DAMPENER`
+    : sensexGammaRegime === 'NEGATIVE'
+    ? `-Γ AMPLIFIER`
+    : `Γ NEUTRAL`;
+  const sensexGammaTitle = `SENSEX Gamma: ${sensexGammaRegime} (${sensexNetGex > 0 ? '+' : ''}${sensexNetGex} Cr) | Call Wall: ${sensexCallWall || 'N/A'} | Put Wall: ${sensexPutWall || 'N/A'}`;
+
   return (
     <header className="glass-panel telemetry-bar">
       <div className="telemetry-left">
@@ -60,7 +86,15 @@ export function HeaderTelemetry({
         <div className="spot-card" title={`NIFTY 50 Spot | High: ${niftyData.high || niftyLtp} | Low: ${niftyData.low || niftyLtp}`}>
           <div className="spot-header">
             <span className="spot-name">NIFTY 50</span>
-            <span className="spot-atm-tag mono">ATM {niftyAtm}</span>
+            <div className="spot-header-tags">
+              <span className="spot-atm-tag mono">ATM {niftyAtm}</span>
+              <span
+                className={`spot-gamma-tag mono ${niftyGammaRegime === 'POSITIVE' ? 'gamma-pos' : niftyGammaRegime === 'NEGATIVE' ? 'gamma-neg' : 'gamma-neutral'}`}
+                title={niftyGammaTitle}
+              >
+                {niftyGammaBadge}
+              </span>
+            </div>
           </div>
           <div className="spot-body">
             <span className={`spot-ltp mono ${niftyChange >= 0 ? 'price-up' : 'price-down'}`}>
@@ -76,7 +110,15 @@ export function HeaderTelemetry({
         <div className="spot-card" title={`SENSEX Spot | High: ${sensexData.high || sensexLtp} | Low: ${sensexData.low || sensexLtp}`}>
           <div className="spot-header">
             <span className="spot-name">SENSEX</span>
-            <span className="spot-atm-tag mono">ATM {sensexAtm}</span>
+            <div className="spot-header-tags">
+              <span className="spot-atm-tag mono">ATM {sensexAtm}</span>
+              <span
+                className={`spot-gamma-tag mono ${sensexGammaRegime === 'POSITIVE' ? 'gamma-pos' : sensexGammaRegime === 'NEGATIVE' ? 'gamma-neg' : 'gamma-neutral'}`}
+                title={sensexGammaTitle}
+              >
+                {sensexGammaBadge}
+              </span>
+            </div>
           </div>
           <div className="spot-body">
             <span className={`spot-ltp mono ${sensexChange >= 0 ? 'price-up' : 'price-down'}`}>

@@ -44,7 +44,7 @@ export default function App() {
     [soundEnabled, playRadarAlertSound]
   );
 
-  const { connected, activeSignals, radarAlerts, dismissRadarAlert, telemetry, spotData } = useWebSocketStream(
+  const { connected, activeSignals, radarAlerts, dismissRadarAlert, telemetry, spotData, gammaData } = useWebSocketStream(
     handleNewSignal,
     handleSignalResolved,
     handleRadarAlert
@@ -61,6 +61,7 @@ export default function App() {
       <HeaderTelemetry
         telemetry={telemetry}
         spotData={spotData}
+        gammaData={gammaData}
         connected={connected}
         soundEnabled={soundEnabled}
         onToggleSound={() => setSoundEnabled(!soundEnabled)}

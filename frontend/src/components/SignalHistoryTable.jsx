@@ -1,12 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { History, RefreshCw, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react';
+import { History, RefreshCw, CheckCircle2, XCircle, AlertTriangle, Timer } from 'lucide-react';
 
 export function SignalHistoryTable() {
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
 
   const fetchHistory = async () => {
-    setLoading(true);
     try {
       const res = await fetch('/api/signals/history?limit=30');
       if (res.ok) {
@@ -22,6 +21,8 @@ export function SignalHistoryTable() {
 
   useEffect(() => {
     fetchHistory();
+    const interval = setInterval(fetchHistory, 4000);
+    return () => clearInterval(interval);
   }, []);
 
   return (
@@ -98,7 +99,14 @@ export function SignalHistoryTable() {
                       {isWin && <span style={{ color: 'var(--ce-green)', display: 'flex', alignItems: 'center', gap: '4px' }}><CheckCircle2 size={12} /> Target Hit</span>}
                       {isLoss && <span style={{ color: 'var(--pe-red)', display: 'flex', alignItems: 'center', gap: '4px' }}><XCircle size={12} /> Stop Hit</span>}
                       {isChase && <span style={{ color: 'var(--accent-amber)', display: 'flex', alignItems: 'center', gap: '4px' }}><AlertTriangle size={12} /> Chase Prevented</span>}
-                      {!isWin && !isLoss && !isChase && <span style={{ color: 'var(--accent-cyan)' }}>{item.status}</span>}
+                      {item.status === 'ACTIVE' && (
+                        <span style={{ color: 'var(--accent-cyan)', display: 'flex', alignItems: 'center', gap: '4px', fontWeight: '600' }}>
+                          <Timer size={12} className="pulse-indicator" /> Active In Trade
+                        </span>
+                      )}
+                      {!isWin && !isLoss && !isChase && item.status !== 'ACTIVE' && (
+                        <span style={{ color: 'var(--text-muted)' }}>{item.status}</span>
+                      )}
                     </td>
                     <td style={{ fontWeight: '700', color: pnl > 0 ? 'var(--ce-green)' : pnl < 0 ? 'var(--pe-red)' : 'var(--text-muted)' }}>
                       {pnl > 0 ? '+' : ''}₹{pnl.toFixed(2)}

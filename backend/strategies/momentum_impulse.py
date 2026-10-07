@@ -196,6 +196,17 @@ class MomentumImpulseDetector(BaseStrategy):
             full_threshold = self._get_velocity_threshold(inst)
             radar_threshold = full_threshold * self.radar_ratio
 
+            # Sanity guard: reject impossible jumps caused by stale startup baselines or bad ticks
+            max_plausible_move = 150.0 if inst == "NIFTY" else 400.0
+            if abs_delta > max_plausible_move:
+                logger.warning(
+                    f"⚠️ [MOMENTUM IMPULSE SPIKE REJECTED] {inst} delta {delta:+.1f} pts in {elapsed:.1f}s "
+                    f"exceeds plausible limit ({max_plausible_move} pts). Resetting baseline to {ltp}."
+                )
+                self.spot_ticks[inst].clear()
+                self.spot_ticks[inst].append((ts, ltp))
+                return None
+
             direction = "CE" if delta > 0 else "PE"
 
             # 1a. Radar Pre-Alert: Early heads-up when 65% of impulse velocity is achieved

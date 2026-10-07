@@ -50,6 +50,10 @@ async def get_telemetry():
         except Exception:
             pass
 
+    gamma_data = {}
+    if hasattr(app_state, "gex_engine") and app_state.gex_engine:
+        gamma_data = getattr(app_state.gex_engine, "latest_gex", {})
+
     return {
         "status": "ONLINE",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -61,6 +65,7 @@ async def get_telemetry():
         "connected_clients": len(app_state.connected_websockets),
         "current_atm": atm_data,
         "spot_data": app_state.spot_data,
+        "gamma": gamma_data,
         "regimes": regimes
     }
 

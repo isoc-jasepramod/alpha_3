@@ -79,6 +79,8 @@ class EngineCoordinator:
         # Core and Precursor Predictive Engines
         iv_engine = IVEngine(strat_cfg.get("iv_engine"))
         gex_engine = GEXEngine(iv_engine=iv_engine, config=strat_cfg.get("gex_engine"))
+        self.gex_engine = gex_engine
+        app_state.gex_engine = gex_engine
         flow_engine = FlowEngine(strat_cfg.get("flow_engine"))
         flow_v2_engine = FlowEngineV2(strat_cfg.get("flow_v2"))
         squeeze_detector = SqueezeDetector(strat_cfg.get("squeeze_detector"))
@@ -129,7 +131,8 @@ class EngineCoordinator:
                 "high": self.nifty_spot,
                 "low": self.nifty_spot,
                 "close": self.nifty_spot,
-                "atm": 23350.0
+                "atm": 23350.0,
+                "gamma": {"net_gex": 0.0, "regime": "NEUTRAL", "call_wall": 0.0, "put_wall": 0.0}
             },
             "SENSEX": {
                 "symbol": "SENSEX",
@@ -142,7 +145,8 @@ class EngineCoordinator:
                 "high": self.sensex_spot,
                 "low": self.sensex_spot,
                 "close": self.sensex_spot,
-                "atm": 74300.0
+                "atm": 74300.0,
+                "gamma": {"net_gex": 0.0, "regime": "NEUTRAL", "call_wall": 0.0, "put_wall": 0.0}
             }
         }
 
@@ -354,6 +358,7 @@ class EngineCoordinator:
     async def initialize(self):
         try:
             await init_db()
+            await self.signal_tracker.restore_from_db()
         except Exception as e:
             logger.warning(f"⚠️ Database initialization failed (PostgreSQL offline): {e}. Proceeding in resilient mode — live signals will stream via Redis/WebSocket.")
         await self.redis_bus.connect()
@@ -417,6 +422,18 @@ class EngineCoordinator:
 
             for inst, candles in candles_map.items():
                 if candles:
+                    last_c = candles[-1]
+                    last_close = float(last_c.get("close", 0.0))
+                    if last_close > 0:
+                        if inst in app_state.spot_data:
+                            app_state.spot_data[inst]["ltp"] = last_close
+                            app_state.spot_data[inst]["close"] = last_close
+                            app_state.spot_data[inst]["atm"] = self.instrument_mgr.calculate_atm_strike(inst, last_close)
+                        if inst == "NIFTY":
+                            self.nifty_spot = last_close
+                        elif inst == "SENSEX":
+                            self.sensex_spot = last_close
+
                     try:
                         self.regime_filter.seed_from_candles(inst, candles)
                         for c in candles:
@@ -431,6 +448,7 @@ class EngineCoordinator:
                                 self.regime_vwap[inst].update(typical, v)
                             if inst in self.regime_adx:
                                 self.regime_adx[inst].update(h, l, cl)
+                            self.risk_governor.on_spot_candle(inst, h, l, cl)
                     except Exception as e:
                         logger.warning(f"Failed to seed regime filter for {inst}: {e}")
                     for strat in self.strategies:
@@ -648,7 +666,8 @@ class EngineCoordinator:
             return
 
         try:
-            ts = float(tick.get("exchange_timestamp", 0.0)) or datetime.now(timezone.utc).timestamp()
+            raw_ts = tick.get("exchange_timestamp", 0.0) or datetime.now(timezone.utc).timestamp()
+            ts = float(raw_ts) if float(raw_ts) < 1e11 else float(raw_ts) / 1000.0
             vol = float(tick.get("volume", 1.0)) or 1.0
 
             if inst in self.regime_vwap:
@@ -670,6 +689,7 @@ class EngineCoordinator:
                 adx_val = self.regime_adx[inst].update(h, l, c) if inst in self.regime_adx else 20.0
 
                 self.regime_filter.update_candle(inst, closed, vwap_val, adx_val)
+                self.risk_governor.on_spot_candle(inst, h, l, c)
         except Exception as e:
             logger.error(f"Error updating independent regime for {inst}: {e}")
 
@@ -696,6 +716,8 @@ class EngineCoordinator:
             # Feed option tick to chain poller for aggregate PCR and Max Pain tracking
             if meta and not meta.get("is_spot") and meta.get("strike") and meta.get("option_type"):
                 raw_oi = float(tick.get("open_interest", 0.0))
+                raw_exch_ts = float(tick.get("exchange_timestamp", 0.0) or 0.0)
+                ts_norm = (raw_exch_ts if raw_exch_ts < 1e11 else raw_exch_ts / 1000.0) if raw_exch_ts > 0 else datetime.now(timezone.utc).timestamp()
                 self.chain_poller.record_tick(
                     inst=meta.get("name", "NIFTY"),
                     token=token,
@@ -703,7 +725,7 @@ class EngineCoordinator:
                     opt_type=str(meta.get("option_type")),
                     oi=raw_oi,
                     ltp=ltp,
-                    ts=float(tick.get("exchange_timestamp", 0.0)) or datetime.now(timezone.utc).timestamp()
+                    ts=ts_norm
                 )
 
             # Spot price migration & live spot update detection
@@ -871,12 +893,19 @@ class EngineCoordinator:
             # Active signals snapshot with updated live LTP and deviation
             active_cards = list(self.signal_tracker.active_signals.values())
 
+            # Attach live gamma profiles to spot_data
+            if hasattr(self, "gex_engine") and self.gex_engine:
+                for inst in ("NIFTY", "SENSEX"):
+                    if inst in app_state.spot_data:
+                        app_state.spot_data[inst]["gamma"] = self.gex_engine.get_gamma_profile(inst)
+
             batch_payload = json.dumps({
                 "type": "TICK_BATCH",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "ticks": ticks_to_send,
                 "active_signals": active_cards,
                 "spot_data": app_state.spot_data,
+                "gamma": self.gex_engine.latest_gex if hasattr(self, "gex_engine") and self.gex_engine else {},
                 "regimes": {
                     "NIFTY": self.regime_filter.get_regime("NIFTY"),
                     "SENSEX": self.regime_filter.get_regime("SENSEX")
