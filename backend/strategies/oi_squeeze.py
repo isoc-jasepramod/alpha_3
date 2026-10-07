@@ -379,21 +379,7 @@ class OISqueezeSentinel(BaseStrategy):
         if delta_oi_pct <= -4.0 or delta_price_pct >= 2.5:
             logger.debug(f"[OI DEBUG] {token} ({symbol}): dOI={delta_oi_pct:.2f}%, dP={delta_price_pct:.2f}%, span={time_span:.0f}s, old_oi={old_oi}, cur_oi={oi}, old_ltp={old_ltp}, cur_ltp={ltp}")
 
-        # Macro Regime alignment filter
-        if self.regime_filter:
-            try:
-                reg_info = self.regime_filter.get_regime(inst)
-                regime = reg_info.get("regime", "NEUTRAL")
-                if regime == "TRENDING_BEAR" and opt_type == "CE":
-                    logger.info(f"🚫 [OI SQUEEZE REGIME-GATE] {symbol} CE blocked: Macro regime is TRENDING_BEAR ({reg_info.get('score', 0):.1f}).")
-                    return None
-                elif regime == "TRENDING_BULL" and opt_type == "PE":
-                    logger.info(f"🚫 [OI SQUEEZE REGIME-GATE] {symbol} PE blocked: Macro regime is TRENDING_BULL ({reg_info.get('score', 0):.1f}).")
-                    return None
-            except Exception as e:
-                logger.warning(f"Error querying regime filter in OI Squeeze: {e}")
-
-        # 3. Spot vs EMA20 — HARD directional confirmation
+        # 3. Spot vs EMA20 — Directional confirmation
         spot = self.spot_prices.get(inst, 0.0)
         ema20 = self.spot_ema20.get(inst).value if self.spot_ema20.get(inst) else None
 
