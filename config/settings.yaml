@@ -71,7 +71,7 @@ telegram:
     radar_precursors: false  # Disabled: No radar precursor spam to Telegram
     resolutions: true
   periodic_reports:
-    enabled: true
+    enabled: false  # Disabled: Antigravity AI Agent dispatches the unified AI report instead
     interval_minutes: 45
     start_time: "09:15"
     schedule_times:
