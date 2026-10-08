@@ -168,6 +168,10 @@ class IncrementalADX:
         self.adx: Optional[float] = None
         self.dx_history: deque = deque(maxlen=period)
         self.count = 0
+        # Latest directional indicators (exposed for direction-aware consumers e.g. RegimeFilter v2).
+        # Additive only — does not change ADX computation or any existing behavior.
+        self.plus_di: float = 0.0
+        self.minus_di: float = 0.0
 
     def seed(self, initial_adx: float = 25.0):
         self.adx = float(initial_adx)
@@ -205,6 +209,8 @@ class IncrementalADX:
         tr_denom = self.tr_smooth if self.tr_smooth > 1e-6 else 1e-6
         plus_di = 100.0 * (self.plus_dm_smooth / tr_denom)
         minus_di = 100.0 * (self.minus_dm_smooth / tr_denom)
+        self.plus_di = plus_di
+        self.minus_di = minus_di
         di_sum = plus_di + minus_di
         dx = 100.0 * (abs(plus_di - minus_di) / (di_sum if di_sum > 1e-6 else 1e-6))
 

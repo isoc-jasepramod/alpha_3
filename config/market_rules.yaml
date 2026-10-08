@@ -163,6 +163,27 @@ strategies:
     weight_persistence: 0.25        # VWAP Persistence weight (25%)
     weight_slope: 0.15              # VWAP Slope weight (15%)
 
+  # Regime Filter v2 — A/B CANDIDATE. Runs in PARALLEL with v1, NON-GATING: no strategy
+  # consumes it yet. Its per-candle state is recorded alongside v1 for next-day comparison.
+  # DO NOT let any strategy read this until validated against live outcomes.
+  regime_filter_v2:
+    enabled: true                   # compute + record (does NOT gate any strategy)
+    trending_threshold: 65.0
+    neutral_threshold: 45.0
+    weight_adx: 0.30
+    weight_er: 0.30
+    weight_persistence: 0.25
+    weight_slope: 0.15
+    er_lookback: 10
+    vwap_persistence_lookback: 10
+    vwap_slope_lookback: 5
+    slope_atr_target: 0.15          # VWAP slope as fraction of ATR/bar for a "full" slope score
+    use_participation: true         # live breadth dimension on (set false for backtests)
+    participation_weight: 0.20      # +/- score adjustment from breadth agreement
+    weakening_slope_frac: 0.05      # slope fade threshold for HEALTHY vs WEAKENING
+    record: true                    # write per-candle v1-vs-v2 comparison to data/regime_compare
+    breadth_poll_interval_sec: 45
+
   simplified_price_action:
     enabled: true
     start_time: "09:15:00"
