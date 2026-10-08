@@ -242,6 +242,14 @@ class TelegramNotifier:
         reward_pts = abs(tgt - entry)
         rr_str = f"1:{reward_pts / risk_pts:.1f}" if risk_pts > 0 else "1:2.0"
 
+        # +1R target: use the Risk Governor's computed value. The option is always BOUGHT
+        # (long CE or long PE), so premium rises when the trade works for BOTH directions —
+        # the +1R target is entry + 1R, never entry - 1R. (Old code subtracted a risk unit for
+        # PE, which put Target 1 exactly ON the stop loss.)
+        tgt_1r = float(sig.get("target_1r") or 0.0)
+        if tgt_1r <= 0.0:
+            tgt_1r = round(entry + risk_pts, 2)
+
         return (
             f"🚀 <b>ALPHA 3.0 — NEW SIGNAL</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -252,7 +260,7 @@ class TelegramNotifier:
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>Entry Price:</b> <code>₹{entry:.2f}</code>\n"
             f"🛑 <b>Stop Loss:</b> <code>₹{sl:.2f}</code> (-{risk_pts:.1f} pts)\n"
-            f"🏁 <b>Target (+1.0R):</b> <code>₹{entry + (risk_pts if opt_type=='CE' else -risk_pts):.2f}</code> (Book 50%, Trail BE)\n"
+            f"🏁 <b>Target (+1.0R):</b> <code>₹{tgt_1r:.2f}</code> (Book 50%, Trail BE)\n"
             f"🏆 <b>Target (+2.0R):</b> <code>₹{tgt:.2f}</code> (+{reward_pts:.1f} pts)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Position:</b> <code>{lots} Lot(s) ({qty} Qty)</code>\n"
