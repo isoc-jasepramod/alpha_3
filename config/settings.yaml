@@ -72,16 +72,19 @@ telegram:
     resolutions: true
   periodic_reports:
     enabled: false  # Disabled: Antigravity AI Agent dispatches the unified AI report instead
-    interval_minutes: 45
-    start_time: "09:15"
+    interval_minutes: 30
+    start_time: "09:30"
     schedule_times:
-      - "09:15"
+      - "09:30"
       - "10:00"
-      - "10:45"
+      - "10:30"
+      - "11:00"
       - "11:30"
-      - "12:15"
+      - "12:00"
+      - "12:30"
       - "13:00"
-      - "13:45"
+      - "13:30"
+      - "14:00"
       - "14:30"
-      - "15:15"
+      - "15:00"
 

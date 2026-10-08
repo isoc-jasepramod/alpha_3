@@ -7,27 +7,28 @@ import yaml
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-DEFAULT_SCHEDULE = ["09:15", "10:00", "10:45", "11:30", "12:15", "13:00", "13:45", "14:30", "15:15"]
+DEFAULT_SCHEDULE = ["09:30", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00"]
 
 
 class PeriodicAnalysisReporter:
     """
     Intraday Periodic Market & Signals Digest Reporter for Alpha 3.0.
-    Executes every 45 minutes starting from 09:15 AM IST during market hours.
+    Executes every 30 minutes starting from 09:30 AM IST during market hours.
     Compiles:
       - Live Spot & Range Telemetry (NIFTY & SENSEX)
       - Session VWAP & EMA Alignment
       - Trend Regime & Market Direction
-      - Option Chain Telemetry (PCR, MaxPain, GEX)
+      - Gamma Exposure (GEX) & Wall Structure (Call Wall, Put Wall, Strength, Breach Status)
+      - Option Chain Telemetry (PCR, MaxPain)
       - Cumulative Signal Tracker Performance & Net PnL
-      - Tactical Actionable Guidance for the upcoming 45-minute window
+      - Tactical Actionable Playbook for the upcoming 30-minute window
     Dispatches rich HTML reports directly to Telegram.
     """
 
     def __init__(self, server: Any, config_path: Optional[str] = None):
         self.server = server
         self.enabled = True
-        self.interval_minutes = 45
+        self.interval_minutes = 30
         self.schedule_times = list(DEFAULT_SCHEDULE)
         self.dispatched_slots: set = set() # Track "YYYY-MM-DD HH:MM" already sent
         self._task: Optional[asyncio.Task] = None
@@ -100,6 +101,7 @@ class PeriodicAnalysisReporter:
 
         return {
             "timestamp": now_dt,
+            "interval_minutes": self.interval_minutes,
             "nifty": {
                 "ltp": nifty_p,
                 "open": float(nifty_info.get("open", nifty_p)),
@@ -112,7 +114,20 @@ class PeriodicAnalysisReporter:
                 "adx": nifty_regime.adx if nifty_regime else 20.0,
                 "pcr": float(nifty_chain.get("pcr", 1.0)),
                 "max_pain": float(nifty_chain.get("max_pain", 0.0)),
-                "net_gex": float(nifty_gex.get("net_gamma_crores", 0.0))
+                "net_gex": float(nifty_gex.get("net_gex", 0.0)),
+                "call_wall": float(nifty_gex.get("call_wall", 0.0)),
+                "call_wall_oi": int(nifty_gex.get("call_wall_oi", 0)),
+                "call_wall_gex": float(nifty_gex.get("call_wall_gex", 0.0)),
+                "call_wall_dist": float(nifty_gex.get("call_wall_dist", 0.0)),
+                "call_wall_status": str(nifty_gex.get("call_wall_status", "ACTIVE_CEILING")),
+                "call_wall_strength": str(nifty_gex.get("call_wall_strength", "MODERATE")),
+                "put_wall": float(nifty_gex.get("put_wall", 0.0)),
+                "put_wall_oi": int(nifty_gex.get("put_wall_oi", 0)),
+                "put_wall_gex": float(nifty_gex.get("put_wall_gex", 0.0)),
+                "put_wall_dist": float(nifty_gex.get("put_wall_dist", 0.0)),
+                "put_wall_status": str(nifty_gex.get("put_wall_status", "ACTIVE_FLOOR")),
+                "put_wall_strength": str(nifty_gex.get("put_wall_strength", "MODERATE")),
+                "gamma_regime": str(nifty_gex.get("regime_detail", "NEUTRAL"))
             },
             "sensex": {
                 "ltp": sensex_p,
@@ -126,7 +141,20 @@ class PeriodicAnalysisReporter:
                 "adx": sensex_regime.adx if sensex_regime else 20.0,
                 "pcr": float(sensex_chain.get("pcr", 1.0)),
                 "max_pain": float(sensex_chain.get("max_pain", 0.0)),
-                "net_gex": float(sensex_gex.get("net_gamma_crores", 0.0))
+                "net_gex": float(sensex_gex.get("net_gex", 0.0)),
+                "call_wall": float(sensex_gex.get("call_wall", 0.0)),
+                "call_wall_oi": int(sensex_gex.get("call_wall_oi", 0)),
+                "call_wall_gex": float(sensex_gex.get("call_wall_gex", 0.0)),
+                "call_wall_dist": float(sensex_gex.get("call_wall_dist", 0.0)),
+                "call_wall_status": str(sensex_gex.get("call_wall_status", "ACTIVE_CEILING")),
+                "call_wall_strength": str(sensex_gex.get("call_wall_strength", "MODERATE")),
+                "put_wall": float(sensex_gex.get("put_wall", 0.0)),
+                "put_wall_oi": int(sensex_gex.get("put_wall_oi", 0)),
+                "put_wall_gex": float(sensex_gex.get("put_wall_gex", 0.0)),
+                "put_wall_dist": float(sensex_gex.get("put_wall_dist", 0.0)),
+                "put_wall_status": str(sensex_gex.get("put_wall_status", "ACTIVE_FLOOR")),
+                "put_wall_strength": str(sensex_gex.get("put_wall_strength", "MODERATE")),
+                "gamma_regime": str(sensex_gex.get("regime_detail", "NEUTRAL"))
             },
             "performance": {
                 "active_count": len(active_running),
@@ -144,6 +172,7 @@ class PeriodicAnalysisReporter:
         now_dt = payload["timestamp"]
         time_str = now_dt.strftime("%H:%M IST")
         date_str = now_dt.strftime("%d-%b-%Y")
+        interval = payload.get("interval_minutes", 30)
 
         nf = payload["nifty"]
         sx = payload["sensex"]
@@ -165,6 +194,62 @@ class PeriodicAnalysisReporter:
         nf_badge = get_regime_badge(nf["regime"], nf["regime_score"])
         sx_badge = get_regime_badge(sx["regime"], sx["regime_score"])
 
+        # Format GEX walls helper
+        def format_gex_lines(item: Dict[str, Any]) -> str:
+            cw = item.get("call_wall", 0.0)
+            pw = item.get("put_wall", 0.0)
+            net_gex = item.get("net_gex", 0.0)
+
+            gex_regime_badge = "⚡ <i>Amplifier</i>" if net_gex < -5.0 else ("🛡️ <i>Dampener</i>" if net_gex > 5.0 else "⚖️ <i>Neutral</i>")
+
+            if cw <= 0 and pw <= 0:
+                return f"• <b>Net GEX:</b> <code>{net_gex:+.1f} Cr</code> {gex_regime_badge}\n"
+
+            # Call Wall status
+            cw_stat = item.get("call_wall_status", "ACTIVE_CEILING")
+            if cw_stat == "BREACHED_UP":
+                cw_tag = "🚀 <b>SQUEEZE ACTIVE</b>"
+            elif cw_stat == "TESTING_CEILING":
+                cw_tag = "⚠️ <b>UNDER SIEGE</b>"
+            elif item.get("call_wall_strength") == "FORTIFIED":
+                cw_tag = "🛡️ <b>FORTIFIED CEILING</b>"
+            else:
+                cw_tag = "🧱 <b>RESISTANCE</b>"
+
+            cw_oi = item.get("call_wall_oi", 0)
+            cw_oi_str = f"{cw_oi / 1e6:.1f}M OI" if cw_oi >= 1e6 else (f"{cw_oi / 1e3:.0f}k OI" if cw_oi > 0 else "")
+            cw_gex = item.get("call_wall_gex", 0.0)
+            cw_extra = f" [{cw_oi_str} | +{cw_gex:.1f}Cr]" if cw_oi_str else ""
+            cw_dist = item.get("call_wall_dist", 0.0)
+            cw_dist_str = f"+{cw_dist:.0f} pts" if cw_dist >= 0 else f"{cw_dist:.0f} pts"
+
+            # Put Wall status
+            pw_stat = item.get("put_wall_status", "ACTIVE_FLOOR")
+            if pw_stat == "BREACHED_DOWN":
+                pw_tag = "🚨 <b>CASCADE ACTIVE (CRACKED)</b>"
+            elif pw_stat == "TESTING_FLOOR":
+                pw_tag = "⚠️ <b>UNDER SIEGE</b>"
+            elif item.get("put_wall_strength") == "FORTIFIED":
+                pw_tag = "🛡️ <b>FORTIFIED FLOOR</b>"
+            else:
+                pw_tag = "🧱 <b>SUPPORT</b>"
+
+            pw_oi = item.get("put_wall_oi", 0)
+            pw_oi_str = f"{pw_oi / 1e6:.1f}M OI" if pw_oi >= 1e6 else (f"{pw_oi / 1e3:.0f}k OI" if pw_oi > 0 else "")
+            pw_gex = item.get("put_wall_gex", 0.0)
+            pw_extra = f" [{pw_oi_str} | -{pw_gex:.1f}Cr]" if pw_oi_str else ""
+            pw_dist = item.get("put_wall_dist", 0.0)
+            pw_dist_str = f"-{pw_dist:.0f} pts" if pw_dist >= 0 else f"+{abs(pw_dist):.0f} pts"
+
+            return (
+                f"• <b>Net GEX:</b> <code>{net_gex:+.1f} Cr</code> {gex_regime_badge}\n"
+                f"• <b>Call Wall:</b> <code>{cw:.0f} CE</code> ({cw_dist_str}) | {cw_tag}{cw_extra}\n"
+                f"• <b>Put Wall:</b> <code>{pw:.0f} PE</code> ({pw_dist_str}) | {pw_tag}{pw_extra}\n"
+            )
+
+        nf_gex_block = format_gex_lines(nf)
+        sx_gex_block = format_gex_lines(sx)
+
         pnl = perf["theoretical_pnl"]
         pnl_str = f"+₹{pnl:,.2f}" if pnl >= 0 else f"-₹{abs(pnl):,.2f}"
         pnl_icon = "🟢" if pnl >= 0 else "🔴"
@@ -175,24 +260,26 @@ class PeriodicAnalysisReporter:
         ms_tag = f" | <i>Milestone {milestone_str}</i>" if milestone_str else ""
 
         return (
-            f"📊 <b>ALPHA 3.0 — 45-MIN MARKET DIGEST</b>\n"
+            f"📊 <b>ALPHA 3.0 — {interval}-MIN MARKET DIGEST</b>\n"
             f"🕒 <b>{time_str}</b> ({date_str}){ms_tag}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔹 <b>NIFTY 50</b>: <code>{nf['ltp']:.2f}</code> (<code>{nf['change_pct']:+.2f}%</code>)\n"
             f"• <b>Range:</b> {nf['low']:.1f} – {nf['high']:.1f} | <b>VWAP:</b> {nf['vwap']:.1f} (<code>{nf_vwap_diff:+.1f}</code>)\n"
             f"• <b>Regime:</b> {nf_badge} | <b>ADX:</b> <code>{nf['adx']:.1f}</code>\n"
-            f"• <b>Chain:</b> PCR: <code>{nf['pcr']:.2f}</code> | MaxPain: <code>{nf['max_pain']:.0f}</code>\n\n"
+            f"• <b>Chain:</b> PCR: <code>{nf['pcr']:.2f}</code> | MaxPain: <code>{nf['max_pain']:.0f}</code>\n"
+            f"{nf_gex_block}\n"
             f"🔸 <b>SENSEX</b>: <code>{sx['ltp']:.2f}</code> (<code>{sx['change_pct']:+.2f}%</code>)\n"
             f"• <b>Range:</b> {sx['low']:.1f} – {sx['high']:.1f} | <b>VWAP:</b> {sx['vwap']:.1f} (<code>{sx_vwap_diff:+.1f}</code>)\n"
             f"• <b>Regime:</b> {sx_badge} | <b>ADX:</b> <code>{sx['adx']:.1f}</code>\n"
             f"• <b>Chain:</b> PCR: <code>{sx['pcr']:.2f}</code> | MaxPain: <code>{sx['max_pain']:.0f}</code>\n"
+            f"{sx_gex_block}"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡ <b>EXECUTION & SIGNALS TRACKER</b>\n"
             f"• <b>Active Running:</b> <code>{perf['active_count']} trade(s)</code>\n"
             f"• <b>Outcomes:</b> 🏆 <code>{perf['target_hits']} Wins</code> | 🛑 <code>{perf['stop_hits']} Stops</code> | 🚫 <code>{perf['chase_blocked']} Blocked</code>\n"
             f"• <b>Session PnL:</b> {pnl_icon} <b>{pnl_str}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧭 <b>TACTICAL BIAS (NEXT 45 MINS):</b>\n"
+            f"🧭 <b>TACTICAL PLAYBOOK (NEXT {interval} MINS):</b>\n"
             f"<i>{guidance}</i>"
         )
 
@@ -204,6 +291,13 @@ class PeriodicAnalysisReporter:
         if is_late_expiry:
             return "⏳ Expiry Time Gate Active (>14:15 IST). New naked option buys paused to prevent theta bleed. Focus on managing open runners."
 
+        # Check for active gamma breaches
+        if sx.get("put_wall_status") == "BREACHED_DOWN" or nf.get("put_wall_status") == "BREACHED_DOWN":
+            return "🚨 Short Gamma Cascade Active: Spot broken below Put Wall! Put writers capitulating forces dealer short delta dumping. Downside moves amplify rapidly. Prioritize PE on EMA pullbacks; strictly avoid dip-buying CE."
+
+        if sx.get("call_wall_status") == "BREACHED_UP" or nf.get("call_wall_status") == "BREACHED_UP":
+            return "🚀 Short Squeeze Breakout Active: Spot pierced above Call Wall! Trapped call writers scrambling to cover. Upward momentum accelerating. Favor CE pullback entries; avoid PE short attempts."
+
         nf_bear = nf["ltp"] < nf["vwap"] and "BEAR" in nf["regime"]
         sx_bear = sx["ltp"] < sx["vwap"] and "BEAR" in sx["regime"]
 
@@ -211,13 +305,13 @@ class PeriodicAnalysisReporter:
         sx_bull = sx["ltp"] > sx["vwap"] and "BULL" in sx["regime"]
 
         if nf_bear and sx_bear:
-            return "Strong Downward Trend. Both indices below VWAP with high ADX. Favor PE pullback rejections into EMA9/21. Avoid CE counter-trend buys."
+            return "Strong Bear Trend. Both indices below VWAP with high ADX. Overhead Call Wall acts as fortified ceiling. Favor PE pullback rejections into EMA9/21. Avoid CE counter-trend buys."
         elif nf_bull and sx_bull:
-            return "Bullish Momentum. Both indices trading firmly above VWAP. Favor CE pullback entries. Suppress PE short attempts."
+            return "Bullish Momentum. Both indices trading firmly above VWAP supported by Put Wall floor. Favor CE pullback entries. Suppress PE counter-trend shorts."
         elif nf["ltp"] < nf["vwap"] or sx["ltp"] < sx["vwap"]:
-            return "Bearish Tilt / Distribution. Overhead VWAP resistance capping rallies. Wait for clear directional expansion before committing."
+            return "Bearish Tilt / Distribution. Overhead VWAP & Call Wall capping rallies. Wait for clear directional expansion before committing."
         else:
-            return "Consolidation / Rangebound. Low ADX participation. Rely on strict confirmation wicks and protect capital from whipsaws."
+            return "Consolidation / Corridor Rangebound. Spot trapped between Put Wall floor and Call Wall ceiling. Low ADX participation. Rely on strict confirmation wicks and protect capital from whipsaws."
 
     async def send_digest(self, milestone_str: str = "") -> bool:
         """Builds, formats, and dispatches the digest report via Telegram."""

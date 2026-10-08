@@ -58,6 +58,10 @@ class GEXEngine(BaseStrategy):
             "put_gex": 0.0
         })
 
+    def get_current_metrics(self, inst: str) -> Dict[str, Any]:
+        """Alias for get_gamma_profile for uniform reporter access."""
+        return self.get_gamma_profile(inst)
+
     def _zone_edge_enter(self, inst: str, zone: str, is_near: bool, has_exited: bool) -> bool:
         """
         Edge-trigger gate for proximity alerts.
@@ -172,6 +176,9 @@ class GEXEngine(BaseStrategy):
         put_wall_strike = 0.0
         max_call_gex = -1.0
         max_put_gex = -1.0
+        call_wall_oi = 0.0
+        put_wall_oi = 0.0
+        total_oi_all = 0.0
 
         for strike, data in strikes.items():
             ce = data.get("CE")
@@ -182,29 +189,69 @@ class GEXEngine(BaseStrategy):
                 # GEX in Crores INR = OI * Gamma * Spot^2 * LotSize / 1e7
                 gex_ce = (ce["oi"] * ce["gamma"] * (spot ** 2) * ce["lot_size"]) / 1e7
                 total_call_gex += gex_ce
+                total_oi_all += ce["oi"]
                 if gex_ce > max_call_gex:
                     max_call_gex = gex_ce
                     call_wall_strike = strike
+                    call_wall_oi = ce["oi"]
 
             # Put GEX: Dealer is short put -> Hedging creates downward acceleration
             if pe and pe["oi"] > 0 and pe["gamma"] > 0:
                 gex_pe = (pe["oi"] * pe["gamma"] * (spot ** 2) * pe["lot_size"]) / 1e7
                 total_put_gex += gex_pe
+                total_oi_all += pe["oi"]
                 if gex_pe > max_put_gex:
                     max_put_gex = gex_pe
                     put_wall_strike = strike
+                    put_wall_oi = pe["oi"]
 
         # Net GEX = Call GEX - Put GEX
         net_gex = total_call_gex - total_put_gex
         current_regime = "SHORT_GAMMA_AMPLIFIER" if net_gex < -5.0 else ("LONG_GAMMA_DAMPENER" if net_gex > 5.0 else "NEUTRAL")
         gamma_direction = "NEGATIVE" if net_gex < -5.0 else ("POSITIVE" if net_gex > 5.0 else "NEUTRAL")
 
+        # Determine Wall Proximity and Wall Strength
+        prox_threshold = 35.0 if inst == "NIFTY" else 100.0
+        avg_oi_per_side = (total_oi_all / (len(strikes) * 2.0)) if strikes else 1.0
+
+        # Call Wall Status & Strength
+        cw_dist = call_wall_strike - spot if call_wall_strike > 0 else 0.0
+        if spot >= call_wall_strike:
+            cw_status = "BREACHED_UP"  # Short Squeeze / Dealer buying acceleration
+        elif 0 < cw_dist <= prox_threshold:
+            cw_status = "TESTING_CEILING"
+        else:
+            cw_status = "ACTIVE_CEILING"
+
+        cw_strength = "FORTIFIED" if (call_wall_oi >= 2.0 * avg_oi_per_side or max_call_gex >= 5.0) else "MODERATE"
+
+        # Put Wall Status & Strength
+        pw_dist = spot - put_wall_strike if put_wall_strike > 0 else 0.0
+        if spot <= put_wall_strike:
+            pw_status = "BREACHED_DOWN"  # Capitulation / Short Gamma Cascade
+        elif 0 < pw_dist <= prox_threshold:
+            pw_status = "TESTING_FLOOR"
+        else:
+            pw_status = "ACTIVE_FLOOR"
+
+        pw_strength = "FORTIFIED" if (put_wall_oi >= 2.0 * avg_oi_per_side or max_put_gex >= 5.0) else "MODERATE"
+
         self.latest_gex[inst] = {
             "net_gex": round(net_gex, 1),
             "regime": gamma_direction,
             "regime_detail": current_regime,
             "call_wall": call_wall_strike,
+            "call_wall_oi": int(call_wall_oi),
+            "call_wall_gex": round(max(max_call_gex, 0.0), 1),
+            "call_wall_dist": round(cw_dist, 1),
+            "call_wall_status": cw_status,
+            "call_wall_strength": cw_strength,
             "put_wall": put_wall_strike,
+            "put_wall_oi": int(put_wall_oi),
+            "put_wall_gex": round(max(max_put_gex, 0.0), 1),
+            "put_wall_dist": round(pw_dist, 1),
+            "put_wall_status": pw_status,
+            "put_wall_strength": pw_strength,
             "call_gex": round(total_call_gex, 1),
             "put_gex": round(total_put_gex, 1),
             "updated_at": ts
