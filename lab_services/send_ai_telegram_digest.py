@@ -16,6 +16,9 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(project_root, ".env"))
 sys.path.insert(0, project_root)
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 from backend.core.telegram_notifier import TelegramNotifier
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -33,7 +36,7 @@ async def dispatch_telegram_ai_report(html_message: str) -> bool:
         await notifier.enqueue_message(html_message)
         # Give the background worker a moment to deliver
         await asyncio.sleep(2.5)
-        print("✅ [SUCCESS] AI Analysis Report dispatched to Telegram!")
+        print("[SUCCESS] AI Analysis Report dispatched to Telegram!")
         return True
     except Exception as e:
         print(f"[ERROR] Failed to send Telegram report: {e}")
