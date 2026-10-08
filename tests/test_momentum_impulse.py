@@ -24,6 +24,10 @@ async def test_momentum_impulse_lifecycle():
 
     strat = MomentumImpulseDetector(config)
     gov = RiskGovernor()
+    # Keep this unit test hermetic: the Expiry Time Gate uses the live wall clock and would
+    # reject signals on any Tue/Thu after 14:15 IST. This test exercises sizing math, not the
+    # gate, so disable it here (the gate has its own production path).
+    gov.expiry_gate_enabled = False
 
     base_time = 1727255000.0  # arbitrary epoch timestamp (14:33 IST)
     # Pre-seed spot

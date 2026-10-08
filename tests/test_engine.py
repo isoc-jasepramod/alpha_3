@@ -44,6 +44,9 @@ def test_indicators_math():
 def test_risk_governor_math():
     gov = RiskGovernor()
     gov.total_equity = 100000.0
+    # Hermetic: disable the wall-clock Expiry Time Gate so this sizing-math test is
+    # deterministic regardless of the day/time it runs.
+    gov.expiry_gate_enabled = False
     gov.update_spot_bar("NIFTY", 25100.0, 24900.0, 25000.0)
 
     raw_sig = {
