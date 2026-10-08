@@ -1,9 +1,10 @@
 import math
-from datetime import datetime, timezone, date
+import os
+import re
+from datetime import datetime, timezone, date, timedelta
 from typing import Dict, Any, Optional, Tuple
 from loguru import logger
 import yaml
-import os
 
 from backend.strategies.indicators import IncrementalATR
 
@@ -27,6 +28,10 @@ class RiskGovernor:
         self.sl_floor_ratio = 0.80
         self.rr_ratio = 2.0
         self.delta_atm = 0.50
+
+        # Expiry Time Gate: Disables new naked option buyer signals after cutoff on expiry days
+        self.expiry_gate_enabled: bool = True
+        self.expiry_cutoff_time: str = "14:15"  # HH:MM IST
 
         self.realized_daily_pnl = 0.0
         self.circuit_breaker_tripped = False
@@ -53,6 +58,8 @@ class RiskGovernor:
                     self.sl_floor_threshold = float(cfg.get("sl_floor_threshold", self.sl_floor_threshold))
                     self.sl_floor_ratio = float(cfg.get("sl_floor_ratio", self.sl_floor_ratio))
                     self.rr_ratio = float(cfg.get("rr_ratio", self.rr_ratio))
+                    self.expiry_gate_enabled = bool(cfg.get("expiry_gate_enabled", self.expiry_gate_enabled))
+                    self.expiry_cutoff_time = str(cfg.get("expiry_cutoff_time", self.expiry_cutoff_time))
             except Exception as e:
                 logger.warning(f"Error reading risk settings: {e}")
 
@@ -76,6 +83,52 @@ class RiskGovernor:
                 f"exceeds -{self.daily_max_drawdown_pct*100}% limit (₹{max_allowed_loss:.2f})! Halting signals."
             )
 
+    def _is_expiry_day(self, raw_signal: Dict[str, Any], dt: datetime) -> bool:
+        """
+        Determines if the candidate contract expires today, or if today is
+        the weekly expiry day for the underlying index.
+        """
+        symbol = str(raw_signal.get("option_symbol", "")).upper()
+        details = raw_signal.get("details") or {}
+        exp_str = str(raw_signal.get("expiry") or details.get("expiry") or "").strip().upper()
+
+        # 1. Direct explicit expiry string match (e.g. '08OCT2026', '2026-10-08')
+        if exp_str:
+            for fmt in ("%d%b%Y", "%d-%b-%Y", "%d%B%Y", "%Y-%m-%d"):
+                try:
+                    exp_date = datetime.strptime(exp_str, fmt).date()
+                    return exp_date == dt.date()
+                except ValueError:
+                    pass
+
+        # 2. BSE weekly symbol date pattern (e.g., SENSEX26O0871400PE -> day 08)
+        m_bse = re.match(r"SENSEX\d{2}[A-Z0-9](\d{2})", symbol, re.I)
+        if m_bse:
+            try:
+                if int(m_bse.group(1)) == dt.day:
+                    return True
+            except ValueError:
+                pass
+
+        # 3. NSE weekly symbol date pattern (e.g., NIFTY08OCT2622400PE)
+        m_nse = re.match(r"NIFTY(\d{2})([A-Z]{3})\d{2}", symbol, re.I)
+        if m_nse:
+            try:
+                day_str, mon_str = m_nse.groups()
+                if int(day_str) == dt.day and mon_str.upper() == dt.strftime("%b").upper():
+                    return True
+            except ValueError:
+                pass
+
+        # 4. Fallback: Underlying index weekly expiry day of week
+        # SENSEX: Thursday (3) or Friday (4); NIFTY: Thursday (3) or Tuesday (1)
+        inst = raw_signal.get("instrument", "NIFTY")
+        weekday = dt.weekday()
+        if (inst == "NIFTY" and weekday in (1, 3)) or (inst == "SENSEX" and weekday in (3, 4)):
+            return True
+
+        return False
+
     def evaluate_signal(self, raw_signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Validates raw candidate signal, computes precise SL, Target, and Lot Sizing.
@@ -95,6 +148,32 @@ class RiskGovernor:
         if p_entry <= 1.0 or spot_entry <= 0.0 or lot_size <= 0:
             logger.warning(f"Invalid pricing values for signal {raw_signal.get('signal_id')}")
             return None
+
+        # Expiry Time Gate: Block new naked buyer entries after cutoff on expiry days
+        if self.expiry_gate_enabled:
+            IST = timezone(timedelta(hours=5, minutes=30))
+            created_at_str = raw_signal.get("created_at")
+            if created_at_str:
+                try:
+                    now_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00")).astimezone(IST)
+                except Exception:
+                    now_dt = datetime.now(IST)
+            else:
+                now_dt = datetime.now(IST)
+
+            try:
+                cutoff_hour, cutoff_min = map(int, self.expiry_cutoff_time.split(":"))
+            except Exception:
+                cutoff_hour, cutoff_min = 14, 15
+
+            if (now_dt.hour > cutoff_hour) or (now_dt.hour == cutoff_hour and now_dt.minute >= cutoff_min):
+                if self._is_expiry_day(raw_signal, now_dt):
+                    logger.warning(
+                        f"⏳ [EXPIRY TIME GATE] Signal {raw_signal.get('signal_id')} ({raw_signal.get('option_symbol')}) "
+                        f"rejected: Naked option buyer signals disabled after {self.expiry_cutoff_time} IST on expiry days "
+                        f"(current time: {now_dt.strftime('%H:%M:%S IST')})."
+                    )
+                    return None
 
         # 1. Spot ATR14: live calculated value or index-calibrated baseline fallback
         min_atr_floor = 80.0 if inst == "SENSEX" else 20.0

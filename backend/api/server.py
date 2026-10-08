@@ -24,6 +24,9 @@ from backend.strategies.gamma_scalp import ExpiryDayGammaScalp
 from backend.strategies.momentum_impulse import MomentumImpulseDetector
 from backend.strategies.simplified_engine import SimplifiedPriceActionEngine
 from backend.strategies.regime_filter import RegimeFilter
+from backend.strategies.regime_filter_v2 import RegimeFilterV2
+from backend.core.market_breadth import BreadthPoller
+from backend.core.regime_recorder import RegimeComparisonRecorder
 from backend.strategies.indicators import CandleAggregator, IncrementalVWAP, IncrementalADX
 from backend.strategies.iv_engine import IVEngine
 from backend.strategies.gex_engine import GEXEngine
@@ -32,6 +35,7 @@ from backend.strategies.flow_engine_v2 import FlowEngineV2
 from backend.strategies.squeeze_detector import SqueezeDetector
 from backend.core.chain_poller import OptionChainPoller
 from backend.core.telegram_notifier import TelegramNotifier
+from backend.core.periodic_reporter import PeriodicAnalysisReporter
 from backend.api.routes import router, app_state
 
 class EngineCoordinator:
@@ -47,6 +51,7 @@ class EngineCoordinator:
         self.signal_tracker = SignalTracker(self.redis_bus, self.risk_governor)
         self.auth = AngelOneAuth()
         self.telegram = TelegramNotifier()
+        self.periodic_reporter = PeriodicAnalysisReporter(self)
         self.ws_client: Optional[SmartAPIWebSocketClient] = None
         
         # Load strategy configuration
@@ -59,8 +64,20 @@ class EngineCoordinator:
             except Exception as e:
                 logger.warning(f"Failed to load market_rules.yaml: {e}")
 
-        # Shared Market Regime Filter
+        # Shared Market Regime Filter (v1 — LIVE, gates strategies)
         self.regime_filter = RegimeFilter(strat_cfg.get("regime_filter"))
+
+        # Regime Filter v2 — A/B candidate, NON-GATING. Runs in parallel, recorded for comparison.
+        # No strategy consumes v2 until validated. Breadth poller feeds its participation dimension.
+        v2_cfg = strat_cfg.get("regime_filter_v2") or {}
+        self.regime_filter_v2 = RegimeFilterV2(v2_cfg)
+        self.regime_v2_enabled = bool(v2_cfg.get("enabled", False))
+        self.breadth_poller = BreadthPoller(
+            self.auth, poll_interval_sec=int(v2_cfg.get("breadth_poll_interval_sec", 45))
+        )
+        self.regime_recorder = (
+            RegimeComparisonRecorder() if v2_cfg.get("record", True) else None
+        )
 
         # Independent Regime Indicators & Candle Aggregators (driven directly by spot ticks)
         self.regime_aggregators: Dict[str, CandleAggregator] = {
@@ -513,6 +530,7 @@ class EngineCoordinator:
         app_state.risk_governor = self.risk_governor
         app_state.signal_tracker = self.signal_tracker
         app_state.regime_filter = self.regime_filter
+        app_state.periodic_reporter = self.periodic_reporter
 
     def _anchor_spot_for_subscription(self, inst: str, candles_map: Dict[str, Any], ltp_spot: float) -> float:
         """
@@ -572,14 +590,24 @@ class EngineCoordinator:
             logger.info("AngelOne SmartAPI WebSocket 2.0 client started.")
         if self.chain_poller:
             await self.chain_poller.start()
+        if hasattr(self, "periodic_reporter") and self.periodic_reporter:
+            await self.periodic_reporter.start()
         self.tasks.append(asyncio.create_task(self._tick_consumer_loop()))
         self.tasks.append(asyncio.create_task(self._throttle_broadcast_loop()))
         self.tasks.append(asyncio.create_task(self._signals_listener_loop()))
         self.tasks.append(asyncio.create_task(self._eod_sweep_scheduler()))
+        # Breadth poller feeds Regime Filter v2's participation dimension (A/B, non-gating).
+        if self.regime_v2_enabled and getattr(self.regime_filter_v2, "use_participation", False):
+            self.tasks.append(asyncio.create_task(self.breadth_poller.start()))
+            logger.info("Market breadth poller started (Regime v2 participation, non-gating).")
         logger.info("Alpha 2.0 Engine background workers started.")
 
     async def stop_workers(self):
         self.running = False
+        if getattr(self, "breadth_poller", None):
+            self.breadth_poller.stop()
+        if hasattr(self, "periodic_reporter") and self.periodic_reporter:
+            await self.periodic_reporter.stop()
         if self.chain_poller:
             await self.chain_poller.stop()
         if self.ws_client:
@@ -686,12 +714,43 @@ class EngineCoordinator:
                         self.regime_vwap[inst].seed(c, 5000.0)
                     vwap_val = c
 
-                adx_val = self.regime_adx[inst].update(h, l, c) if inst in self.regime_adx else 20.0
+                adx_obj = self.regime_adx.get(inst)
+                adx_val = adx_obj.update(h, l, c) if adx_obj else 20.0
 
-                self.regime_filter.update_candle(inst, closed, vwap_val, adx_val)
+                # v1 (LIVE — gates strategies)
+                v1_state = self.regime_filter.update_candle(inst, closed, vwap_val, adx_val)
+
+                # v2 (A/B candidate — NON-GATING, parallel, recorded only)
+                if self.regime_v2_enabled:
+                    self._drive_regime_v2(inst, closed, vwap_val, adx_val, adx_obj, v1_state)
+
                 self.risk_governor.on_spot_candle(inst, h, l, c)
         except Exception as e:
             logger.error(f"Error updating independent regime for {inst}: {e}")
+
+    def _drive_regime_v2(self, inst, closed, vwap_val, adx_val, adx_obj, v1_state):
+        """Feed the A/B v2 filter in parallel and record the v1-vs-v2 comparison.
+        Fully isolated: any failure here must NOT affect v1 or strategy gating."""
+        try:
+            plus_di = float(getattr(adx_obj, "plus_di", 0.0)) if adx_obj else 0.0
+            minus_di = float(getattr(adx_obj, "minus_di", 0.0)) if adx_obj else 0.0
+            # Wilder-smoothed True Range is our ATR proxy; fall back to ~0.3% of price.
+            atr = float(getattr(adx_obj, "tr_smooth", 0.0) or 0.0) if adx_obj else 0.0
+            if atr <= 0:
+                atr = max(1e-6, float(closed.get("close", 0.0)) * 0.003)
+
+            breadth_res = self.breadth_poller.get(inst)
+            breadth = breadth_res.to_dict() if breadth_res else None
+
+            v2_state = self.regime_filter_v2.update_candle(
+                inst, closed, vwap_val, adx_val,
+                plus_di=plus_di, minus_di=minus_di, atr=atr, breadth=breadth,
+            )
+
+            if self.regime_recorder:
+                self.regime_recorder.record(inst, closed, v1_state, v2_state, breadth)
+        except Exception as e:
+            logger.warning(f"[REGIME v2] parallel update failed for {inst}: {e}")
 
     async def _tick_consumer_loop(self):
         """
@@ -909,7 +968,12 @@ class EngineCoordinator:
                 "regimes": {
                     "NIFTY": self.regime_filter.get_regime("NIFTY"),
                     "SENSEX": self.regime_filter.get_regime("SENSEX")
-                }
+                },
+                # v2 A/B candidate — observability only, no strategy consumes this.
+                "regimes_v2": {
+                    "NIFTY": self.regime_filter_v2.get_regime("NIFTY"),
+                    "SENSEX": self.regime_filter_v2.get_regime("SENSEX")
+                } if getattr(self, "regime_v2_enabled", False) else {}
             })
 
             for ws in list(app_state.connected_websockets):

@@ -34,7 +34,7 @@ class TelegramNotifier:
         self.parse_mode = "HTML"
         self.rate_limit_per_sec = 1.0
         self.notify_signals = True
-        self.notify_radar = True
+        self.notify_radar = False
         self.notify_resolutions = True
 
         if os.path.exists(cfg_path):
@@ -47,7 +47,7 @@ class TelegramNotifier:
                     self.rate_limit_per_sec = float(t_cfg.get("rate_limit_per_sec", 1.0))
                     n_cfg = t_cfg.get("notifications", {})
                     self.notify_signals = bool(n_cfg.get("signals", True))
-                    self.notify_radar = bool(n_cfg.get("radar_precursors", True))
+                    self.notify_radar = bool(n_cfg.get("radar_precursors", False))
                     self.notify_resolutions = bool(n_cfg.get("resolutions", True))
             except Exception as e:
                 logger.warning(f"Error reading telegram settings: {e}")

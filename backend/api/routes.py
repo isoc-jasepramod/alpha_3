@@ -145,3 +145,22 @@ async def websocket_stream(websocket: WebSocket):
     finally:
         if websocket in app_state.connected_websockets:
             app_state.connected_websockets.remove(websocket)
+
+@router.post("/api/reports/send_periodic_digest")
+async def trigger_periodic_digest(milestone: Optional[str] = Query(None)):
+    """Triggers an immediate 45-min periodic analysis digest to Telegram."""
+    reporter = getattr(app_state, "periodic_reporter", None)
+    if reporter:
+        success = await reporter.send_digest(milestone_str=milestone or "Manual Trigger")
+        return {"status": "SUCCESS" if success else "FAILED", "sent": success}
+    return {"status": "ERROR", "message": "Periodic reporter not active on engine"}
+
+@router.get("/api/reports/digest_preview")
+async def get_digest_preview():
+    """Returns the current 45-min digest payload and formatted HTML preview without sending."""
+    reporter = getattr(app_state, "periodic_reporter", None)
+    if reporter:
+        payload = reporter.build_digest_payload()
+        html = reporter.format_digest_html(payload, milestone_str="Preview")
+        return {"status": "SUCCESS", "payload": payload, "html": html}
+    return {"status": "ERROR", "message": "Periodic reporter not active on engine"}

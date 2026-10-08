@@ -36,6 +36,8 @@ risk:
   sl_floor_ratio: 0.80            # If SL < 0.75 * P_entry, force SL = 0.80 * P_entry
   sl_floor_threshold: 0.75
   rr_ratio: 2.0                   # 1:2 Risk to Reward
+  expiry_gate_enabled: true
+  expiry_cutoff_time: "14:15"     # HH:MM IST — disable new naked option buyer signals after 14:15 on expiry days
   # Adaptive runaway guardrails — per-strategy profiles
   runaway_profiles:
     default:
@@ -66,6 +68,20 @@ telegram:
   rate_limit_per_sec: 1.0
   notifications:
     signals: true
-    radar_precursors: true
+    radar_precursors: false  # Disabled: No radar precursor spam to Telegram
     resolutions: true
+  periodic_reports:
+    enabled: true
+    interval_minutes: 45
+    start_time: "09:15"
+    schedule_times:
+      - "09:15"
+      - "10:00"
+      - "10:45"
+      - "11:30"
+      - "12:15"
+      - "13:00"
+      - "13:45"
+      - "14:30"
+      - "15:15"
 
