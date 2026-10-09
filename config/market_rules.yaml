@@ -168,12 +168,18 @@ strategies:
   # DO NOT let any strategy read this until validated against live outcomes.
   regime_filter_v2:
     enabled: true                   # compute + record (does NOT gate any strategy)
-    trending_threshold: 65.0
-    neutral_threshold: 45.0
-    weight_adx: 0.30
-    weight_er: 0.30
-    weight_persistence: 0.25
-    weight_slope: 0.15
+    # Recalibrated 2026-10-09 from the first live A/B (see docs/REGIME_FILTER_V2_AB.md).
+    # The original ER weight 0.30 + threshold 65 (inherited from v1) demoted healthy trends to
+    # NEUTRAL whenever ER dipped mid-move; it captured only 14% of strong moves and would have
+    # suppressed real winners. Config "F" from calibrate_regime_v2.py: lower ER weight, re-fit
+    # thresholds to v2's own distribution. Trend-capture 14%->27%, chop-rejection 51%->55%,
+    # recovers 90% of the Oct-9 healthy-trend demotions, Oct-7 chop still mostly rejected.
+    trending_threshold: 60.0
+    neutral_threshold: 43.0
+    weight_adx: 0.35
+    weight_er: 0.18
+    weight_persistence: 0.27
+    weight_slope: 0.20
     er_lookback: 10
     vwap_persistence_lookback: 10
     vwap_slope_lookback: 5
