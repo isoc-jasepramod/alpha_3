@@ -65,6 +65,12 @@ class SimplifiedPriceActionEngine(BaseStrategy):
         self.min_bottom_wick = float(cfg.get("min_bottom_wick_ratio", 0.35))
         self.min_top_wick = float(cfg.get("min_top_wick_ratio", 0.15))
 
+        # Macro Trend Veto: Block counter-trend setups in runaway directional sessions (default >= 1.20% from Open or Prior Close)
+        self.macro_veto_enabled = bool(cfg.get("macro_veto_enabled", True))
+        self.macro_veto_pct = float(cfg.get("macro_veto_pct", 1.20))
+        self.session_open_prices: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+        self.prior_close_prices: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+
         # Rubberband overextension guard (max allowed distance between spot close and EMA21)
         self.max_ema21_dist_nifty = float(cfg.get("max_ema21_dist_nifty", 35.0))
         self.max_ema21_dist_sensex = float(cfg.get("max_ema21_dist_sensex", 100.0))
@@ -147,6 +153,12 @@ class SimplifiedPriceActionEngine(BaseStrategy):
             if inst in self.spot_rsi:
                 self.spot_rsi[inst].update(cl)
 
+        # Record prior session close reference for Macro Trend Veto
+        if candles:
+            last_c = candles[-1]
+            if last_c.get("close"):
+                self.prior_close_prices[inst] = float(last_c["close"])
+
         # Session VWAP is strictly intraday (09:15 onwards)
         if inst in self.spot_vwap:
             self.spot_vwap[inst].reset()
@@ -165,6 +177,8 @@ class SimplifiedPriceActionEngine(BaseStrategy):
         ltp = float(spot_info.get("ltp", 0.0))
         if ltp > 0:
             self.spot_prices[inst] = ltp
+            if spot_info.get("close"):
+                self.prior_close_prices[inst] = float(spot_info["close"])
             if inst in self.spot_ema9 and self.spot_ema9[inst].value is None:
                 self.spot_ema9[inst].seed(ltp)
             if inst in self.spot_ema21 and self.spot_ema21[inst].value is None:
@@ -194,6 +208,10 @@ class SimplifiedPriceActionEngine(BaseStrategy):
             inst = meta.get("name", "NIFTY")
             self.spot_prices[inst] = ltp
 
+            # Record session open price on first spot tick of the session
+            if self.session_open_prices.get(inst, 0.0) <= 0.0:
+                self.session_open_prices[inst] = ltp
+
             # 3-Min Aggregator: VWAP & EMA Pullback Rejection
             closed_3m = self.spot_3m_aggregators[inst].on_tick(ts, ltp, volume=1.0)
             if closed_3m:
@@ -218,33 +236,58 @@ class SimplifiedPriceActionEngine(BaseStrategy):
                     aw_dir = awaiting["direction"]
                     sig_key = f"SIMPLIFIED_VWAP_{inst}_{aw_dir}"
 
-                    # Bullish Confirmation: Next candle closes above EMA9 and is green
-                    if aw_dir == "CE" and c > e9 and c >= o:
-                        if self.can_trigger(sig_key, ts):
-                            custom_sl = min(awaiting["low"], l, e9) - 5.0
-                            logger.info(f"🎯 [SIMPLIFIED VWAP_EMA] {inst} Bullish Pullback Confirmed at {c:.2f}! Arming CE entry...")
-                            self.pending_setup[inst] = {
-                                "direction": "CE",
-                                "spot": c,
-                                "custom_sl": custom_sl,
-                                "time": ts,
-                                "type": "VWAP_PULLBACK"
-                            }
-                    # Bearish Confirmation: Next candle closes below EMA9 and is red
-                    elif aw_dir == "PE" and c < e9 and c <= o:
-                        if self.can_trigger(sig_key, ts):
-                            custom_sl = max(awaiting["high"], h, e9) + 5.0
-                            logger.info(f"🎯 [SIMPLIFIED VWAP_EMA] {inst} Bearish Breakdown Confirmed at {c:.2f}! Arming PE entry...")
-                            self.pending_setup[inst] = {
-                                "direction": "PE",
-                                "spot": c,
-                                "custom_sl": custom_sl,
-                                "time": ts,
-                                "type": "VWAP_PULLBACK"
-                            }
+                    # Macro Trend Veto: Block counter-trend setups in extreme directional sessions
+                    vetoed = False
+                    if self.macro_veto_enabled:
+                        open_p = self.session_open_prices.get(inst, 0.0)
+                        prior_p = self.prior_close_prices.get(inst, 0.0)
+                        pct_open = ((c - open_p) / open_p * 100.0) if (open_p > 0) else 0.0
+                        pct_prior = ((c - prior_p) / prior_p * 100.0) if (prior_p > 0) else 0.0
+
+                        is_super_bull = (pct_open >= self.macro_veto_pct) or (pct_prior >= self.macro_veto_pct)
+                        is_super_bear = (pct_open <= -self.macro_veto_pct) or (pct_prior <= -self.macro_veto_pct)
+
+                        if aw_dir == "PE" and is_super_bull:
+                            lead_pct = max(pct_open, pct_prior)
+                            logger.warning(
+                                f"🚫 [SIMPLIFIED VWAP_EMA] Macro Trend Veto: {inst} PE blocked! Market is +{lead_pct:.2f}% (Super-Bull trend >= +{self.macro_veto_pct}%)."
+                            )
+                            vetoed = True
+                        elif aw_dir == "CE" and is_super_bear:
+                            lead_pct = min(pct_open, pct_prior)
+                            logger.warning(
+                                f"🚫 [SIMPLIFIED VWAP_EMA] Macro Trend Veto: {inst} CE blocked! Market is {lead_pct:.2f}% (Super-Bear trend <= -{self.macro_veto_pct}%)."
+                            )
+                            vetoed = True
+
+                    if not vetoed:
+                        # Bullish Confirmation: Next candle closes above EMA9 and is green
+                        if aw_dir == "CE" and c > e9 and c >= o:
+                            if self.can_trigger(sig_key, ts):
+                                custom_sl = min(awaiting["low"], l, e9) - 5.0
+                                logger.info(f"🎯 [SIMPLIFIED VWAP_EMA] {inst} Bullish Pullback Confirmed at {c:.2f}! Arming CE entry...")
+                                self.pending_setup[inst] = {
+                                    "direction": "CE",
+                                    "spot": c,
+                                    "custom_sl": custom_sl,
+                                    "time": ts,
+                                    "type": "VWAP_PULLBACK"
+                                }
+                        # Bearish Confirmation: Next candle closes below EMA9 and is red
+                        elif aw_dir == "PE" and c < e9 and c <= o:
+                            if self.can_trigger(sig_key, ts):
+                                custom_sl = max(awaiting["high"], h, e9) + 5.0
+                                logger.info(f"🎯 [SIMPLIFIED VWAP_EMA] {inst} Bearish Breakdown Confirmed at {c:.2f}! Arming PE entry...")
+                                self.pending_setup[inst] = {
+                                    "direction": "PE",
+                                    "spot": c,
+                                    "custom_sl": custom_sl,
+                                    "time": ts,
+                                    "type": "VWAP_PULLBACK"
+                                }
                     self.awaiting_confirmation[inst] = None
 
-                # Step 2: Check for fresh rejection setup (protected by Rubberband Guard & Directional Pause)
+                # Step 2: Check for fresh rejection setup (protected by Rubberband Guard, Directional Pause & Macro Veto)
                 t_str_3m = now_dt.strftime("%H:%M:%S")
                 max_dist = self.max_ema21_dist_nifty if inst == "NIFTY" else self.max_ema21_dist_sensex
                 dist21 = abs(c - e21) if (e21 is not None) else 0.0
@@ -253,8 +296,18 @@ class SimplifiedPriceActionEngine(BaseStrategy):
                     pause_ce = ts < self._pause_until.get(f"{inst}_CE", 0.0)
                     pause_pe = ts < self._pause_until.get(f"{inst}_PE", 0.0)
 
+                    veto_pe = False
+                    veto_ce = False
+                    if self.macro_veto_enabled:
+                        open_p = self.session_open_prices.get(inst, 0.0)
+                        prior_p = self.prior_close_prices.get(inst, 0.0)
+                        pct_open = ((c - open_p) / open_p * 100.0) if (open_p > 0) else 0.0
+                        pct_prior = ((c - prior_p) / prior_p * 100.0) if (prior_p > 0) else 0.0
+                        veto_pe = (pct_open >= self.macro_veto_pct) or (pct_prior >= self.macro_veto_pct)
+                        veto_ce = (pct_open <= -self.macro_veto_pct) or (pct_prior <= -self.macro_veto_pct)
+
                     # Bullish Rejection: Trend is UP (EMA9 > EMA21, c > VWAP), RSI healthy, bottom wick rejection
-                    if not pause_ce and e9 and e21 and e9 > e21 and c > v and bot_wick >= self.min_bottom_wick:
+                    if not pause_ce and not veto_ce and e9 and e21 and e9 > e21 and c > v and bot_wick >= self.min_bottom_wick:
                         if self.rsi_ce_min <= rsi <= self.rsi_ce_max:
                             logger.info(
                                 f"👀 [SIMPLIFIED VWAP_EMA] {inst} Bullish Pullback Wick Detected @ {c:.2f} "
@@ -267,7 +320,7 @@ class SimplifiedPriceActionEngine(BaseStrategy):
                                 "time": ts
                             }
                     # Bearish Rejection: Trend is DOWN (EMA9 < EMA21, c < VWAP), RSI healthy, top wick rejection
-                    elif not pause_pe and e9 and e21 and e9 < e21 and c < v and top_wick >= self.min_top_wick:
+                    elif not pause_pe and not veto_pe and e9 and e21 and e9 < e21 and c < v and top_wick >= self.min_top_wick:
                         if self.rsi_pe_min <= rsi <= self.rsi_pe_max:
                             logger.info(
                                 f"👀 [SIMPLIFIED VWAP_EMA] {inst} Bearish Rejection Wick Detected @ {c:.2f} "
@@ -343,14 +396,16 @@ class SimplifiedPriceActionEngine(BaseStrategy):
                 self.pending_setup[inst] = None
                 return None
 
-        # Check if option is ATM or near-ATM (offset 0 or within 1 strike, or closest lake surrogate)
+        # Check if option is strictly ATM or near-ATM (within 0.75 strike step, e.g. <=37.5 pts for NIFTY, <=75 pts for SENSEX)
         offset = meta.get("offset")
-        is_atm = (abs(offset) <= 1) if offset is not None else True
-        if not is_atm and not meta.get("is_closest_lake"):
-            spot = self.spot_prices.get(inst, 0.0)
-            step = 50.0 if inst == "NIFTY" else 100.0
-            if spot > 0 and abs(strike - spot) > (step * 1.5):
-                return None
+        spot = self.spot_prices.get(inst, 0.0)
+        step = 50.0 if inst == "NIFTY" else 100.0
+        max_dist = step * 0.75
+
+        if offset is not None and abs(offset) > 1:
+            return None
+        if not meta.get("is_closest_lake") and spot > 0 and abs(strike - spot) > max_dist:
+            return None
 
         # -------------------------------------------------------------
         # Option RVOL Gate Validation
