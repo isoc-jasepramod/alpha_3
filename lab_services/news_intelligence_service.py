@@ -303,6 +303,21 @@ class NewsIntelligenceAgent:
             "conflicts": conflicts
         }
 
+    def fetch_live_market_state(self) -> Dict[str, Any]:
+        """Fetches live telemetry, spot data, and GEX from local FastAPI backend."""
+        try:
+            req = urllib.request.Request("http://localhost:8001/api/telemetry")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return {
+                    "spot_data": data.get("spot_data", {}),
+                    "gamma": data.get("gamma", {}),
+                    "regimes": data.get("regimes", {})
+                }
+        except Exception as e:
+            logger.debug(f"Could not reach live telemetry API: {e}")
+            return {}
+
     def compile_full_intelligence(
         self,
         spot_data: Optional[Dict[str, Any]] = None,
@@ -329,11 +344,20 @@ class NewsIntelligenceAgent:
         scoring_res = self.classify_and_score_news(news_items, global_cues)
         news_score = scoring_res["news_sentiment_score"]
 
-        # Market confirmation
-        spots = spot_data or {
-            "NIFTY": {"ltp": 22520.45, "change_pct": 2.02, "vwap": 22449.0, "adv_pct": 90.0},
-            "SENSEX": {"ltp": 72472.33, "change_pct": 3.24, "vwap": 72200.0, "adv_pct": 90.0}
-        }
+        # Market confirmation - connect to live engine if available
+        if spot_data is None:
+            live_state = self.fetch_live_market_state()
+            if live_state.get("spot_data"):
+                spots = live_state["spot_data"]
+                gex_data = gex_data or live_state.get("gamma")
+            else:
+                spots = {
+                    "NIFTY": {"ltp": 22520.45, "change_pct": 2.02, "vwap": 22449.0, "adv_pct": 90.0},
+                    "SENSEX": {"ltp": 72472.33, "change_pct": 3.24, "vwap": 72200.0, "adv_pct": 90.0}
+                }
+        else:
+            spots = spot_data
+
         conf_res = self.correlate_with_market_confirmation(news_score, spots, gex_data)
 
         # Scenarios and Options context
