@@ -188,20 +188,99 @@ async def get_execution_status():
         "active_positions_count": len(bridge.active_positions),
         "total_orders_placed": len(bridge.placed_orders),
         "max_capital_per_trade": bridge.max_capital_per_trade,
-        "max_daily_loss": bridge.max_daily_loss
+        "max_daily_loss": bridge.max_daily_loss,
+        "allowed_strategies": getattr(bridge, "allowed_strategies", []),
+        "nifty_lots": getattr(bridge, "nifty_lots", 1),
+        "sensex_lots": getattr(bridge, "sensex_lots", 1)
+    }
+
+@router.get("/api/execution/positions")
+async def get_execution_positions():
+    """Returns the active open positions in the execution bridge."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return []
+    return list(bridge.active_positions.values())
+
+@router.post("/api/execution/exit-position")
+async def exit_single_position(signal_id: str = Query(...)):
+    """Manually exits/squares off a specific active position."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return {"status": "ERROR", "message": "Execution bridge not active on engine"}
+    pos = bridge.active_positions.get(signal_id)
+    if not pos:
+        return {"status": "NOT_FOUND", "message": f"No active position found for signal {signal_id}"}
+    exit_price = pos.get("current_ltp", pos.get("fill_price", 0.0))
+    res = await bridge.handle_full_exit({"signal_id": signal_id}, exit_price=exit_price, reason="MANUAL_UI_EXIT")
+    return {"status": "SUCCESS", "result": res}
+
+@router.post("/api/execution/toggle-arm")
+async def toggle_execution_arm(armed: bool = Query(...)):
+    """Arms or disarms live trade routing to broker."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return {"status": "ERROR", "message": "Execution bridge not active on engine"}
+    bridge.enabled = armed
+    return {"status": "SUCCESS", "armed": bridge.enabled}
+
+@router.get("/api/execution/config")
+async def get_execution_config():
+    """Returns execution configuration options."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return {}
+    return {
+        "enabled": bridge.enabled,
+        "allowed_strategies": getattr(bridge, "allowed_strategies", []),
+        "max_capital_per_trade": bridge.max_capital_per_trade,
+        "max_daily_loss": bridge.max_daily_loss,
+        "nifty_lots": getattr(bridge, "nifty_lots", 1),
+        "sensex_lots": getattr(bridge, "sensex_lots", 1)
+    }
+
+@router.post("/api/execution/config")
+async def update_execution_config(payload: Dict[str, Any]):
+    """Updates runtime execution configuration."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return {"status": "ERROR", "message": "Execution bridge not active"}
+    if "allowed_strategies" in payload:
+        bridge.allowed_strategies = list(payload["allowed_strategies"])
+    if "max_capital_per_trade" in payload:
+        bridge.max_capital_per_trade = float(payload["max_capital_per_trade"])
+    if "max_daily_loss" in payload:
+        bridge.max_daily_loss = float(payload["max_daily_loss"])
+    if "nifty_lots" in payload:
+        bridge.nifty_lots = int(payload["nifty_lots"])
+    if "sensex_lots" in payload:
+        bridge.sensex_lots = int(payload["sensex_lots"])
+    return {
+        "status": "SUCCESS",
+        "config": {
+            "allowed_strategies": bridge.allowed_strategies,
+            "max_capital_per_trade": bridge.max_capital_per_trade,
+            "max_daily_loss": bridge.max_daily_loss,
+            "nifty_lots": bridge.nifty_lots,
+            "sensex_lots": bridge.sensex_lots
+        }
     }
 
 @router.post("/api/execution/kill-switch")
 async def toggle_kill_switch(active: bool = Query(True)):
-    """Toggles the emergency execution kill switch."""
+    """Toggles the emergency execution kill switch and squares off all open positions."""
     bridge = getattr(app_state, "execution_bridge", None)
     if not bridge:
         return {"status": "ERROR", "message": "Execution bridge not active on engine"}
+    closed_positions = []
     if active:
-        bridge.activate_kill_switch(reason="Manual API Trigger")
+        bridge.activate_kill_switch(reason="Manual Emergency UI Trigger")
+        if hasattr(bridge, "square_off_all_positions"):
+            closed_positions = await bridge.square_off_all_positions(reason="EMERGENCY_KILL_SWITCH")
     else:
         bridge.deactivate_kill_switch()
     return {
         "status": "SUCCESS",
-        "kill_switch_active": bridge.kill_switch_active
+        "kill_switch_active": bridge.kill_switch_active,
+        "closed_positions": closed_positions
     }

@@ -94,6 +94,11 @@ class AngelExecutionBridge:
         self.max_active_orders = int(cfg.get("max_active_orders", 2))
         self.kill_switch_active = bool(cfg.get("kill_switch_active", False))
         self.audit_log_dir = str(cfg.get("audit_log_dir", "data/execution_logs"))
+        self.allowed_strategies = cfg.get("allowed_strategies", [
+            "OI_SQUEEZE_SENTINEL", "BREAKOUT_ORB", "VWAP_EMA_ALIGNMENT", "GAMMA_SCALP"
+        ])
+        self.nifty_lots = int(cfg.get("nifty_lots", 1))
+        self.sensex_lots = int(cfg.get("sensex_lots", 1))
 
     def activate_kill_switch(self, reason: str = "Manual / Automated Trigger"):
         """Instantly activates the emergency kill switch, blocking all new orders."""
@@ -104,6 +109,18 @@ class AngelExecutionBridge:
         """Resets the kill switch."""
         self.kill_switch_active = False
         logger.warning("🟢 [KILL SWITCH DEACTIVATED] Automated execution re-enabled.")
+
+    async def square_off_all_positions(self, reason: str = "KILL_SWITCH") -> List[Dict[str, Any]]:
+        """Squares off all active open positions immediately."""
+        closed = []
+        sig_ids = list(self.active_positions.keys())
+        for sig_id in sig_ids:
+            pos = self.active_positions.get(sig_id)
+            if pos:
+                exit_price = pos.get("current_ltp", pos.get("fill_price", 0.0))
+                evt = await self.handle_full_exit({"signal_id": sig_id}, exit_price=exit_price, reason=reason)
+                closed.append(evt)
+        return closed
 
     def validate_signal(self, signal: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """
@@ -118,7 +135,12 @@ class AngelExecutionBridge:
         if not self.enabled:
             return False, "REJECTED_EXECUTION_DISABLED", None
 
-        # 3. Required Fields
+        # 3. Strategy Filter Check
+        strategy_name = signal.get("strategy")
+        if strategy_name and self.allowed_strategies and strategy_name not in self.allowed_strategies:
+            return False, f"REJECTED_STRATEGY_NOT_ALLOWED ({strategy_name})", None
+
+        # 4. Required Fields
         req_keys = [
             "signal_id", "instrument", "strike", "direction", 
             "option_type", "option_token", "option_symbol", 
@@ -130,12 +152,12 @@ class AngelExecutionBridge:
 
         sig_id = str(signal["signal_id"])
 
-        # 4. Idempotency Check (Zero duplicate submissions)
+        # 5. Idempotency Check (Zero duplicate submissions)
         if sig_id in self.signal_to_order:
             existing_ord = self.signal_to_order[sig_id]
             return False, f"REJECTED_DUPLICATE_SIGNAL (Already ordered as {existing_ord})", None
 
-        # 5. Active Position Concurrency Cap
+        # 6. Active Position Concurrency Cap
         if len(self.active_positions) >= self.max_active_orders:
             return False, f"REJECTED_MAX_CONCURRENT_POSITIONS_REACHED ({len(self.active_positions)}/{self.max_active_orders})", None
 

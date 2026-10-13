@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { Layers, History, Shield, Zap, Filter, BellRing } from 'lucide-react';
+import { Layers, History, Shield, Zap, Filter, BellRing, Activity } from 'lucide-react';
 import { useWebSocketStream } from './hooks/useWebSocketStream';
 import { useSoundEffects } from './hooks/useSoundEffects';
 import { HeaderTelemetry } from './components/HeaderTelemetry';
@@ -7,6 +7,7 @@ import { SignalCard } from './components/SignalCard';
 import { SignalHistoryTable } from './components/SignalHistoryTable';
 import { ReplayControlModal } from './components/ReplayControlModal';
 import { RadarAlertBanner } from './components/RadarAlertBanner';
+import { LiveTradeTerminal } from './components/LiveTradeTerminal';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('live'); // 'live' | 'journal'
@@ -115,6 +116,14 @@ export default function App() {
               <History size={14} />
               <span>Signal Journal</span>
             </button>
+
+            <button
+              className={`btn-secondary ${activeTab === 'broker_trades' ? 'btn-primary' : ''}`}
+              onClick={() => setActiveTab('broker_trades')}
+            >
+              <Activity size={14} />
+              <span>Live Broker Trades</span>
+            </button>
           </div>
         </div>
 
@@ -187,8 +196,10 @@ export default function App() {
             </div>
           )}
         </div>
-      ) : (
+      ) : activeTab === 'journal' ? (
         <SignalHistoryTable />
+      ) : (
+        <LiveTradeTerminal />
       )}
 
       {/* Market Replay Modal */}
