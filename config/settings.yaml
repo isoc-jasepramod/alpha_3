@@ -100,3 +100,16 @@ telegram:
       - "15:00"
       - "15:15"
 
+execution:
+  enabled: true
+  mode: "PAPER"                    # "PAPER" (Dry-Run) or "LIVE"
+  dry_run: true                    # Phase 1 Hard Safety Lock: Real broker orders strictly prohibited
+  default_product_type: "INTRADAY" # MIS (Intraday)
+  default_order_type: "LIMIT"      # Buffered LIMIT to prevent market spread slippage
+  slippage_buffer_pct: 0.5         # +0.5% buffer on limit price to ensure fill
+  max_capital_per_trade: 25000.0   # Max capital allowed per position
+  max_daily_loss: 4000.0           # Daily loss ceiling before lock
+  max_active_orders: 2             # Max simultaneous active positions
+  kill_switch_active: false        # Emergency panic shutoff
+  audit_log_dir: "data/execution_logs"
+

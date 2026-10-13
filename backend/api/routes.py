@@ -26,6 +26,7 @@ class AppState:
     circuit_breaker_status: bool = False
     spot_data: Dict[str, Dict[str, Any]] = {}
     regime_filter: Any = None
+    execution_bridge: Any = None
 
 app_state = AppState()
 
@@ -164,3 +165,43 @@ async def get_digest_preview():
         html = reporter.format_digest_html(payload, milestone_str="Preview")
         return {"status": "SUCCESS", "payload": payload, "html": html}
     return {"status": "ERROR", "message": "Periodic reporter not active on engine"}
+
+@router.get("/api/execution/orders")
+async def get_execution_orders():
+    """Returns the list of orders executed (simulated in Phase 1 Paper mode)."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return []
+    return bridge.get_audit_history()
+
+@router.get("/api/execution/status")
+async def get_execution_status():
+    """Returns the status, safety gates, and limits of the Execution Bridge."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return {"enabled": False, "mode": "DISABLED"}
+    return {
+        "enabled": bridge.enabled,
+        "mode": bridge.mode,
+        "dry_run": bridge.dry_run,
+        "kill_switch_active": bridge.kill_switch_active,
+        "active_positions_count": len(bridge.active_positions),
+        "total_orders_placed": len(bridge.placed_orders),
+        "max_capital_per_trade": bridge.max_capital_per_trade,
+        "max_daily_loss": bridge.max_daily_loss
+    }
+
+@router.post("/api/execution/kill-switch")
+async def toggle_kill_switch(active: bool = Query(True)):
+    """Toggles the emergency execution kill switch."""
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return {"status": "ERROR", "message": "Execution bridge not active on engine"}
+    if active:
+        bridge.activate_kill_switch(reason="Manual API Trigger")
+    else:
+        bridge.deactivate_kill_switch()
+    return {
+        "status": "SUCCESS",
+        "kill_switch_active": bridge.kill_switch_active
+    }

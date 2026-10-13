@@ -36,6 +36,7 @@ from backend.strategies.squeeze_detector import SqueezeDetector
 from backend.core.chain_poller import OptionChainPoller
 from backend.core.telegram_notifier import TelegramNotifier
 from backend.core.periodic_reporter import PeriodicAnalysisReporter
+from backend.execution.angel_execution_bridge import AngelExecutionBridge
 from backend.api.routes import router, app_state
 
 class EngineCoordinator:
@@ -52,6 +53,7 @@ class EngineCoordinator:
         self.auth = AngelOneAuth()
         self.telegram = TelegramNotifier()
         self.periodic_reporter = PeriodicAnalysisReporter(self)
+        self.execution_bridge = AngelExecutionBridge(auth=self.auth, redis_bus=self.redis_bus, force_dry_run=True)
         self.ws_client: Optional[SmartAPIWebSocketClient] = None
         
         # Load strategy configuration
@@ -531,6 +533,7 @@ class EngineCoordinator:
         app_state.signal_tracker = self.signal_tracker
         app_state.regime_filter = self.regime_filter
         app_state.periodic_reporter = self.periodic_reporter
+        app_state.execution_bridge = self.execution_bridge
 
     def _anchor_spot_for_subscription(self, inst: str, candles_map: Dict[str, Any], ltp_spot: float) -> float:
         """
@@ -911,6 +914,13 @@ class EngineCoordinator:
             "signal": evaluated_sig
         })
 
+        # Phase 1 Paper Execution: Validate risk gates and simulate order placement
+        if hasattr(self, "execution_bridge") and self.execution_bridge:
+            try:
+                await self.execution_bridge.execute_signal(evaluated_sig)
+            except Exception as e:
+                logger.error(f"Execution bridge error for signal {evaluated_sig.get('signal_id')}: {e}")
+
     async def _signals_listener_loop(self):
         """Listens to channel:signals and pushes immediately to WebSocket clients and Telegram"""
         async for msg in self.redis_bus.subscribe(self.redis_bus.signals_channel):
@@ -923,7 +933,7 @@ class EngineCoordinator:
                 except Exception:
                     pass
 
-            # Telegram dispatch for signals, precursor radar alerts, and trade resolutions
+            # Telegram dispatch and execution bridge lifecycle tracking
             if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
                 try:
                     evt = msg.get("event")
@@ -931,10 +941,20 @@ class EngineCoordinator:
                         await self.telegram.notify_new_signal(msg["signal"])
                     elif evt == "RADAR_PRE_ALERT" and "alert" in msg:
                         await self.telegram.notify_radar_alert(msg["alert"])
+                    elif evt == "SIGNAL_PARTIAL_PROFIT" and "signal" in msg:
+                        if hasattr(self, "execution_bridge") and self.execution_bridge:
+                            sig = msg["signal"]
+                            tgt_1r = float(sig.get("target_1r") or sig.get("target", 0.0))
+                            await self.execution_bridge.handle_partial_exit(sig, exit_price=tgt_1r)
                     elif evt == "SIGNAL_RESOLVED" and "signal" in msg:
                         await self.telegram.notify_signal_resolved(msg["signal"])
+                        if hasattr(self, "execution_bridge") and self.execution_bridge:
+                            sig = msg["signal"]
+                            exit_p = float(sig.get("exit_price") or sig.get("entry_price", 0.0))
+                            reason = str(sig.get("status", "RESOLVED"))
+                            await self.execution_bridge.handle_full_exit(sig, exit_price=exit_p, reason=reason)
                 except Exception as e:
-                    logger.warning(f"Telegram dispatch error in signals listener: {e}")
+                    logger.warning(f"Signals listener error: {e}")
 
     async def _throttle_broadcast_loop(self):
         """
