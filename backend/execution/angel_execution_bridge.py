@@ -95,7 +95,7 @@ class AngelExecutionBridge:
         self.kill_switch_active = bool(cfg.get("kill_switch_active", False))
         self.audit_log_dir = str(cfg.get("audit_log_dir", "data/execution_logs"))
         self.allowed_strategies = cfg.get("allowed_strategies", [
-            "OI_SQUEEZE_SENTINEL", "BREAKOUT_ORB", "VWAP_EMA_ALIGNMENT", "GAMMA_SCALP", "MOMENTUM_IMPULSE"
+            "OI_SQUEEZE", "ORB_BREAKOUT", "VWAP_EMA", "SIMPLIFIED_VWAP_EMA", "GAMMA_SCALP", "MOMENTUM_IMPULSE"
         ])
         self.nifty_lots = int(cfg.get("nifty_lots", 1))
         self.sensex_lots = int(cfg.get("sensex_lots", 1))
@@ -137,8 +137,20 @@ class AngelExecutionBridge:
 
         # 3. Strategy Filter Check
         strategy_name = signal.get("strategy")
-        if strategy_name and self.allowed_strategies and strategy_name not in self.allowed_strategies:
-            return False, f"REJECTED_STRATEGY_NOT_ALLOWED ({strategy_name})", None
+        if strategy_name and self.allowed_strategies:
+            alias_map = {
+                "OI_SQUEEZE_SENTINEL": "OI_SQUEEZE",
+                "BREAKOUT_ORB": "ORB_BREAKOUT",
+                "VWAP_EMA_ALIGNMENT": "VWAP_EMA",
+            }
+            allowed_set = set(self.allowed_strategies)
+            for k, v in alias_map.items():
+                if k in allowed_set:
+                    allowed_set.add(v)
+                if v in allowed_set:
+                    allowed_set.add(k)
+            if strategy_name not in allowed_set:
+                return False, f"REJECTED_STRATEGY_NOT_ALLOWED ({strategy_name})", None
 
         # 4. Required Fields
         req_keys = [
