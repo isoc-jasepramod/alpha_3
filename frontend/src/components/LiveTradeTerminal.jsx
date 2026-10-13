@@ -34,7 +34,7 @@ export function LiveTradeTerminal() {
 
   // Runtime Configuration state
   const [config, setConfig] = useState({
-    allowed_strategies: ['OI_SQUEEZE_SENTINEL', 'BREAKOUT_ORB', 'VWAP_EMA_ALIGNMENT', 'GAMMA_SCALP'],
+    allowed_strategies: ['OI_SQUEEZE_SENTINEL', 'BREAKOUT_ORB', 'VWAP_EMA_ALIGNMENT', 'GAMMA_SCALP', 'MOMENTUM_IMPULSE'],
     max_capital_per_trade: 25000,
     max_daily_loss: 4000,
     nifty_lots: 1,
@@ -187,7 +187,8 @@ export function LiveTradeTerminal() {
     { id: 'OI_SQUEEZE_SENTINEL', name: 'OI Squeeze Sentinel', desc: 'Aggressive call/put open interest unwinding & ITM trapped shorts.' },
     { id: 'VWAP_EMA_ALIGNMENT', name: 'VWAP / EMA Alignment', desc: 'Trend day impulse continuation with EMA9/21 pullbacks.' },
     { id: 'BREAKOUT_ORB', name: 'Opening Range Breakout (ORB)', desc: 'Morning session 15-min range breakout with volume surge.' },
-    { id: 'GAMMA_SCALP', name: '0-DTE Gamma Scalp', desc: 'High delta acceleration scalp off major Call/Put Walls.' }
+    { id: 'GAMMA_SCALP', name: '0-DTE Gamma Scalp', desc: 'High delta acceleration scalp off major Call/Put Walls.' },
+    { id: 'MOMENTUM_IMPULSE', name: 'Momentum Impulse Detector', desc: 'High-frequency 5–15s directional spot velocity surge with anti-chase guards.' }
   ];
 
   return (

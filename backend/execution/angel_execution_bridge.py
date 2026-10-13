@@ -95,7 +95,7 @@ class AngelExecutionBridge:
         self.kill_switch_active = bool(cfg.get("kill_switch_active", False))
         self.audit_log_dir = str(cfg.get("audit_log_dir", "data/execution_logs"))
         self.allowed_strategies = cfg.get("allowed_strategies", [
-            "OI_SQUEEZE_SENTINEL", "BREAKOUT_ORB", "VWAP_EMA_ALIGNMENT", "GAMMA_SCALP"
+            "OI_SQUEEZE_SENTINEL", "BREAKOUT_ORB", "VWAP_EMA_ALIGNMENT", "GAMMA_SCALP", "MOMENTUM_IMPULSE"
         ])
         self.nifty_lots = int(cfg.get("nifty_lots", 1))
         self.sensex_lots = int(cfg.get("sensex_lots", 1))
