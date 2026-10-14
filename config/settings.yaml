@@ -104,6 +104,8 @@ execution:
   enabled: true
   mode: "PAPER"                    # "PAPER" (Dry-Run) or "LIVE"
   dry_run: true                    # Phase 1 Hard Safety Lock: Real broker orders strictly prohibited
+  total_capital: 25000.0           # Total dedicated execution capital pool (₹25,000)
+  force_single_lot: true           # Phase 2 rule: Strict 1-lot limit per order (micro-lot risk)
   default_product_type: "INTRADAY" # MIS (Intraday)
   default_order_type: "LIMIT"      # Buffered LIMIT to prevent market spread slippage
   slippage_buffer_pct: 0.5         # +0.5% buffer on limit price to ensure fill

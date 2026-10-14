@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple, List
 from loguru import logger
 import yaml
+from backend.execution.execution_risk_governor import ExecutionRiskGovernor
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
@@ -59,6 +60,9 @@ class AngelExecutionBridge:
         self.active_positions: Dict[str, Dict[str, Any]] = {}    # signal_id -> active_position
         self.kill_switch_active: bool = False
 
+        # Dedicated Execution Risk Governor (Decoupled from Live Advisory)
+        self.risk_governor = ExecutionRiskGovernor(self.config_path)
+
         self._load_config()
 
         # Audit directory
@@ -67,7 +71,7 @@ class AngelExecutionBridge:
 
         logger.info(
             f"🛡️ [EXECUTION BRIDGE] Initialized. Mode: {self.mode} | "
-            f"DryRun: {self.dry_run} | MaxCap/Trade: ₹{self.max_capital_per_trade:,.0f} | "
+            f"DryRun: {self.dry_run} | Capital Pool: ₹{self.risk_governor.total_capital:,.0f} | "
             f"KillSwitch: {'ACTIVE' if self.kill_switch_active else 'OFF'}"
         )
 
@@ -99,6 +103,8 @@ class AngelExecutionBridge:
         ])
         self.nifty_lots = int(cfg.get("nifty_lots", 1))
         self.sensex_lots = int(cfg.get("sensex_lots", 1))
+        if hasattr(self, "risk_governor") and self.risk_governor:
+            self.risk_governor.load_config()
 
     def activate_kill_switch(self, reason: str = "Manual / Automated Trigger"):
         """Instantly activates the emergency kill switch, blocking all new orders."""
@@ -169,10 +175,6 @@ class AngelExecutionBridge:
             existing_ord = self.signal_to_order[sig_id]
             return False, f"REJECTED_DUPLICATE_SIGNAL (Already ordered as {existing_ord})", None
 
-        # 6. Active Position Concurrency Cap
-        if len(self.active_positions) >= self.max_active_orders:
-            return False, f"REJECTED_MAX_CONCURRENT_POSITIONS_REACHED ({len(self.active_positions)}/{self.max_active_orders})", None
-
         # 6. Instrument & Exchange Mapping
         instrument = str(signal["instrument"]).upper()
         if instrument == "NIFTY":
@@ -182,24 +184,20 @@ class AngelExecutionBridge:
         else:
             return False, f"REJECTED_UNSUPPORTED_INSTRUMENT_{instrument}", None
 
-        # 7. Quantity & Lot Size Validation
-        qty = int(signal["quantity"])
+        # 7. Execution Risk Governor: Concurrency, Available Margin Pool, & Lot Sizing
+        risk_ok, risk_reason, risk_data = self.risk_governor.evaluate_execution_order(
+            signal, self.active_positions
+        )
+        if not risk_ok:
+            return False, risk_reason, None
+
+        qty = int(risk_data["quantity"])
+        lots_count = int(risk_data["lots_count"])
+        required_capital = float(risk_data["required_capital"])
         lot_size = int(signal["lot_size"])
-        if qty <= 0 or lot_size <= 0:
-            return False, "REJECTED_INVALID_QUANTITY_OR_LOT_SIZE", None
-        if qty % lot_size != 0:
-            return False, f"REJECTED_QTY_NOT_MULTIPLE_OF_LOT_SIZE ({qty} vs lot {lot_size})", None
-
-        # 8. Price & Capital Limits
         entry_price = float(signal["entry_price"])
-        if entry_price <= 0.0:
-            return False, "REJECTED_INVALID_ENTRY_PRICE", None
 
-        required_capital = round(entry_price * qty, 2)
-        if required_capital > self.max_capital_per_trade:
-            return False, f"REJECTED_CAPITAL_EXCEEDS_LIMIT (Req: ₹{required_capital:.2f} > Max: ₹{self.max_capital_per_trade:.2f})", None
-
-        # 9. Slippage-Buffered Limit Price
+        # 8. Slippage-Buffered Limit Price
         buffer_multiplier = 1.0 + (self.slippage_buffer_pct / 100.0)
         buffered_limit_price = round(entry_price * buffer_multiplier, 1)
 
@@ -221,14 +219,17 @@ class AngelExecutionBridge:
             "instrument": instrument,
             "strike": float(signal["strike"]),
             "direction": str(signal["direction"]),
+            "strategy": str(signal.get("strategy", "")),
             "option_symbol": str(signal["option_symbol"]),
             "option_token": str(signal["option_token"]),
             "lot_size": lot_size,
             "quantity": qty,
-            "lots_count": qty // lot_size,
+            "lots_count": lots_count,
             "expected_entry": entry_price,
             "buffered_limit_price": buffered_limit_price,
             "required_capital": required_capital,
+            "available_capital_after": risk_data.get("available_capital_after"),
+            "adjustment_note": risk_data.get("adjustment_note"),
             "stop_loss": float(signal.get("stop_loss", 0.0)),
             "target": float(signal.get("target", 0.0)),
             "target_1r": float(signal.get("target_1r") or signal.get("target", 0.0)),
@@ -393,6 +394,10 @@ class AngelExecutionBridge:
         pos["total_realized_pnl"] = total_pnl
         pos["closed_at"] = now_iso
 
+        # Record trade result in ExecutionRiskGovernor
+        if hasattr(self, "risk_governor") and self.risk_governor:
+            self.risk_governor.record_trade_result(total_pnl)
+
         logger.info(
             f"🏁 [PAPER POSITION CLOSED] {sig_id} via {reason} @ ₹{exit_price:.2f} | "
             f"Leg 2 PnL: ₹{leg2_pnl:+.2f} | Total Net Trade PnL: ₹{total_pnl:+.2f}"
@@ -430,3 +435,15 @@ class AngelExecutionBridge:
     def get_audit_history(self) -> List[Dict[str, Any]]:
         """Returns all placed orders in current session."""
         return list(self.placed_orders.values())
+
+    def get_capital_metrics(self) -> Dict[str, Any]:
+        """Returns real-time execution capital pool metrics."""
+        if hasattr(self, "risk_governor") and self.risk_governor:
+            return self.risk_governor.get_capital_metrics(self.active_positions)
+        return {
+            "total_capital": self.max_capital_per_trade,
+            "deployed_capital": 0.0,
+            "available_capital": self.max_capital_per_trade,
+            "utilization_pct": 0.0,
+            "active_positions_count": len(self.active_positions)
+        }

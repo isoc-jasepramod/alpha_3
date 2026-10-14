@@ -194,6 +194,7 @@ async def get_execution_status():
     bridge = getattr(app_state, "execution_bridge", None)
     if not bridge:
         return {"enabled": False, "mode": "DISABLED"}
+    cap_metrics = bridge.get_capital_metrics() if hasattr(bridge, "get_capital_metrics") else {}
     return {
         "enabled": bridge.enabled,
         "mode": bridge.mode,
@@ -205,7 +206,9 @@ async def get_execution_status():
         "max_daily_loss": bridge.max_daily_loss,
         "allowed_strategies": getattr(bridge, "allowed_strategies", []),
         "nifty_lots": getattr(bridge, "nifty_lots", 1),
-        "sensex_lots": getattr(bridge, "sensex_lots", 1)
+        "sensex_lots": getattr(bridge, "sensex_lots", 1),
+        "force_single_lot": getattr(bridge.risk_governor, "force_single_lot", True) if hasattr(bridge, "risk_governor") else True,
+        "capital_metrics": cap_metrics
     }
 
 @router.get("/api/execution/positions")
@@ -253,13 +256,17 @@ async def get_execution_config():
     bridge = getattr(app_state, "execution_bridge", None)
     if not bridge:
         return {}
+    cap_metrics = bridge.get_capital_metrics() if hasattr(bridge, "get_capital_metrics") else {}
     return {
         "enabled": bridge.enabled,
         "allowed_strategies": getattr(bridge, "allowed_strategies", []),
         "max_capital_per_trade": bridge.max_capital_per_trade,
         "max_daily_loss": bridge.max_daily_loss,
         "nifty_lots": getattr(bridge, "nifty_lots", 1),
-        "sensex_lots": getattr(bridge, "sensex_lots", 1)
+        "sensex_lots": getattr(bridge, "sensex_lots", 1),
+        "total_capital": cap_metrics.get("total_capital", 25000.0),
+        "force_single_lot": getattr(bridge.risk_governor, "force_single_lot", True) if hasattr(bridge, "risk_governor") else True,
+        "capital_metrics": cap_metrics
     }
 
 @router.post("/api/execution/config")
@@ -272,20 +279,30 @@ async def update_execution_config(payload: Dict[str, Any]):
         bridge.allowed_strategies = list(payload["allowed_strategies"])
     if "max_capital_per_trade" in payload:
         bridge.max_capital_per_trade = float(payload["max_capital_per_trade"])
+    if "total_capital" in payload and hasattr(bridge, "risk_governor"):
+        bridge.risk_governor.total_capital = float(payload["total_capital"])
+    if "force_single_lot" in payload and hasattr(bridge, "risk_governor"):
+        bridge.risk_governor.force_single_lot = bool(payload["force_single_lot"])
     if "max_daily_loss" in payload:
         bridge.max_daily_loss = float(payload["max_daily_loss"])
+        if hasattr(bridge, "risk_governor"):
+            bridge.risk_governor.max_daily_loss = float(payload["max_daily_loss"])
     if "nifty_lots" in payload:
         bridge.nifty_lots = int(payload["nifty_lots"])
     if "sensex_lots" in payload:
         bridge.sensex_lots = int(payload["sensex_lots"])
+    cap_metrics = bridge.get_capital_metrics() if hasattr(bridge, "get_capital_metrics") else {}
     return {
         "status": "SUCCESS",
         "config": {
             "allowed_strategies": bridge.allowed_strategies,
             "max_capital_per_trade": bridge.max_capital_per_trade,
+            "total_capital": cap_metrics.get("total_capital", 25000.0),
+            "force_single_lot": getattr(bridge.risk_governor, "force_single_lot", True) if hasattr(bridge, "risk_governor") else True,
             "max_daily_loss": bridge.max_daily_loss,
             "nifty_lots": bridge.nifty_lots,
-            "sensex_lots": bridge.sensex_lots
+            "sensex_lots": bridge.sensex_lots,
+            "capital_metrics": cap_metrics
         }
     }
 

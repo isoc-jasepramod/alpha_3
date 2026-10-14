@@ -370,44 +370,57 @@ export function LiveTradeTerminal() {
         {/* Telemetry Strip */}
         <div style={{
           display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
           gap: '1rem',
           marginTop: '1.25rem',
           paddingTop: '1rem',
           borderTop: '1px solid var(--border-subtle)'
         }}>
           <div>
+            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>CAPITAL POOL</div>
+            <div className="mono" style={{ fontSize: '1.15rem', fontWeight: '700', color: 'var(--text-primary)' }}>
+              ₹{(status?.capital_metrics?.total_capital || 25000).toLocaleString('en-IN')}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>DEPLOYED MARGIN</div>
+            <div className="mono" style={{ fontSize: '1.15rem', fontWeight: '700', color: (status?.capital_metrics?.deployed_capital || 0) > 0 ? 'var(--accent-amber)' : 'var(--text-muted)' }}>
+              ₹{(status?.capital_metrics?.deployed_capital || 0).toLocaleString('en-IN')}
+              <span style={{ fontSize: '0.75rem', fontWeight: '500', marginLeft: '4px', color: 'var(--text-secondary)' }}>
+                ({status?.capital_metrics?.utilization_pct || 0}%)
+              </span>
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>AVAILABLE CASH</div>
+            <div className="mono" style={{ fontSize: '1.15rem', fontWeight: '700', color: (status?.capital_metrics?.available_capital ?? 25000) > 5000 ? 'var(--ce-green)' : 'var(--pe-red)' }}>
+              ₹{(status?.capital_metrics?.available_capital ?? 25000).toLocaleString('en-IN')}
+            </div>
+          </div>
+
+          <div>
             <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>ACTIVE POSITIONS</div>
-            <div className="mono" style={{ fontSize: '1.2rem', fontWeight: '700', color: positions.length > 0 ? 'var(--accent-cyan)' : 'var(--text-primary)' }}>
-              {positions.length}
+            <div className="mono" style={{ fontSize: '1.15rem', fontWeight: '700', color: positions.length > 0 ? 'var(--accent-cyan)' : 'var(--text-primary)' }}>
+              {positions.length} / {status?.capital_metrics?.max_active_positions || 2}
             </div>
           </div>
 
           <div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>SESSION ORDERS PLACED</div>
-            <div className="mono" style={{ fontSize: '1.2rem', fontWeight: '700' }}>
-              {status?.total_orders_placed || orders.length}
-            </div>
-          </div>
-
-          <div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>MAX CAP / TRADE</div>
-            <div className="mono" style={{ fontSize: '1.2rem', fontWeight: '700', color: 'var(--text-secondary)' }}>
-              ₹{(status?.max_capital_per_trade || 25000).toLocaleString('en-IN')}
-            </div>
-          </div>
-
-          <div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>MAX DAILY LOSS LIMIT</div>
-            <div className="mono" style={{ fontSize: '1.2rem', fontWeight: '700', color: 'var(--pe-red)' }}>
+            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>MAX DAILY LOSS</div>
+            <div className="mono" style={{ fontSize: '1.15rem', fontWeight: '700', color: 'var(--pe-red)' }}>
               -₹{(status?.max_daily_loss || 4000).toLocaleString('en-IN')}
             </div>
           </div>
 
           <div>
-            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>LOT SIZING</div>
-            <div className="mono" style={{ fontSize: '0.9rem', fontWeight: '600', color: 'var(--text-secondary)', marginTop: '4px' }}>
-              NIFTY: {config.nifty_lots} lot ({config.nifty_lots * 65}q) | SENSEX: {config.sensex_lots} lot ({config.sensex_lots * 20}q)
+            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>PHASE 2 SIZING RULE</div>
+            <div className="mono" style={{ fontSize: '0.82rem', fontWeight: '700', color: 'var(--accent-cyan)', marginTop: '4px' }}>
+              {status?.force_single_lot ? '🛡️ STRICT 1-LOT LOCK' : 'DYNAMIC MULTI-LOT'}
+            </div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>
+              NIFTY: 1L (65q) | SENSEX: 1L (20q)
             </div>
           </div>
         </div>
