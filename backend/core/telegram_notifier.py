@@ -211,6 +211,32 @@ class TelegramNotifier:
         except asyncio.QueueFull:
             logger.warning("Telegram alert queue is full, dropping message.")
 
+    async def send_message_direct(self, text: str) -> bool:
+        """Sends a message immediately to all resolved chat IDs without queue delay."""
+        if not self.enabled or not self.client or not self.bot_token:
+            return False
+        if not self.resolved_chat_ids:
+            await self._resolve_chat_ids()
+        if not self.resolved_chat_ids:
+            return False
+        success = True
+        for chat_id in list(self.resolved_chat_ids):
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": self.parse_mode
+            }
+            try:
+                res = await self.client.post(f"{self.api_url}/sendMessage", json=payload)
+                data = res.json()
+                if not data.get("ok"):
+                    logger.warning(f"Direct Telegram error to {chat_id}: {data.get('description')}")
+                    success = False
+            except Exception as e:
+                logger.error(f"Error direct sending to {chat_id}: {e}")
+                success = False
+        return success
+
     def format_signal_html(self, sig: Dict[str, Any]) -> str:
         """Formats a NEW_SIGNAL event into a high-visibility Telegram HTML message."""
         inst = sig.get("instrument", "NIFTY")

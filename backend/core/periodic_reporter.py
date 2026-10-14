@@ -1,9 +1,15 @@
 import os
+import sys
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
 from loguru import logger
 import yaml
+from dotenv import load_dotenv
+
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv(os.path.join(project_root, ".env"))
+load_dotenv()
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -547,9 +553,9 @@ class PeriodicAnalysisReporter:
         else:
             return "Consolidation / Corridor Rangebound. Spot trapped between Put Wall floor and Call Wall ceiling. Low ADX participation. Rely on strict confirmation wicks and protect capital from whipsaws."
 
-    async def send_digest(self, milestone_str: str = "") -> bool:
+    async def send_digest(self, milestone_str: str = "", force: bool = False) -> bool:
         """Builds, formats, and dispatches the digest report via Telegram."""
-        if not self.enabled:
+        if not self.enabled and not milestone_str and not force:
             return False
 
         notifier = getattr(self.server, "telegram", None)
@@ -567,12 +573,21 @@ class PeriodicAnalysisReporter:
         try:
             payload = self.build_digest_payload()
             html_msg = self.format_digest_html(payload, milestone_str=milestone_str)
-            await notifier.enqueue_message(html_msg)
-            if local_notifier:
+            if hasattr(notifier, "send_message_direct"):
+                sent = await notifier.send_message_direct(html_msg)
+            else:
+                await notifier.enqueue_message(html_msg)
                 await asyncio.sleep(2.5)
+                sent = True
+
+            if local_notifier:
                 await notifier.close()
-            logger.success(f"📢 [PERIODIC DIGEST] Dispatched 15-min Telegram analysis report ({milestone_str})!")
-            return True
+
+            if sent:
+                logger.success(f"📢 [PERIODIC DIGEST] Dispatched 15-min Telegram analysis report ({milestone_str})!")
+            else:
+                logger.warning(f"📢 [PERIODIC DIGEST] Direct dispatch returned false ({milestone_str})")
+            return sent
         except Exception as e:
             logger.error(f"Error generating/sending periodic digest: {e}")
             if local_notifier:
