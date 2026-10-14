@@ -104,6 +104,28 @@ class PeriodicAnalysisReporter:
         nifty_gex = gex.get_current_metrics("NIFTY") if gex and hasattr(gex, "get_current_metrics") else {}
         sensex_gex = gex.get_current_metrics("SENSEX") if gex and hasattr(gex, "get_current_metrics") else {}
 
+        # 7. Robust fallback to local Telemetry API if standalone or metrics unpopulated
+        if not nifty_gex.get("call_wall") or not sensex_gex.get("call_wall") or not nifty_p:
+            try:
+                import json
+                import urllib.request
+                req = urllib.request.urlopen("http://localhost:8001/api/telemetry", timeout=1.5)
+                t_data = json.loads(req.read().decode("utf-8"))
+                gamma_data = t_data.get("gamma", {})
+                if not nifty_gex.get("call_wall") and gamma_data.get("NIFTY"):
+                    nifty_gex = gamma_data["NIFTY"]
+                if not sensex_gex.get("call_wall") and gamma_data.get("SENSEX"):
+                    sensex_gex = gamma_data["SENSEX"]
+                sp_data = t_data.get("spot_data", {})
+                if not nifty_p and sp_data.get("NIFTY"):
+                    nifty_info = sp_data["NIFTY"]
+                    nifty_p = float(nifty_info.get("ltp", 0.0))
+                if not sensex_p and sp_data.get("SENSEX"):
+                    sensex_info = sp_data["SENSEX"]
+                    sensex_p = float(sensex_info.get("ltp", 0.0))
+            except Exception as e:
+                logger.debug(f"Telemetry API fallback skipped: {e}")
+
         return {
             "timestamp": now_dt,
             "interval_minutes": self.interval_minutes,
@@ -203,7 +225,8 @@ class PeriodicAnalysisReporter:
         def format_gex_lines(item: Dict[str, Any]) -> str:
             cw = item.get("call_wall", 0.0)
             pw = item.get("put_wall", 0.0)
-            net_gex = item.get("net_gex", 0.0)
+            raw_net_gex = item.get("net_gex", 0.0)
+            net_gex = (raw_net_gex / 1e7) if abs(raw_net_gex) > 1e4 else raw_net_gex
 
             gex_regime_badge = "⚡ <i>Amplifier</i>" if net_gex < -5.0 else ("🛡️ <i>Dampener</i>" if net_gex > 5.0 else "⚖️ <i>Neutral</i>")
 
@@ -223,8 +246,9 @@ class PeriodicAnalysisReporter:
 
             cw_oi = item.get("call_wall_oi", 0)
             cw_oi_str = f"{cw_oi / 1e6:.1f}M OI" if cw_oi >= 1e6 else (f"{cw_oi / 1e3:.0f}k OI" if cw_oi > 0 else "")
-            cw_gex = item.get("call_wall_gex", 0.0)
-            cw_extra = f" [{cw_oi_str} | +{cw_gex:.1f}Cr]" if cw_oi_str else ""
+            raw_cw_gex = item.get("call_wall_gex", 0.0)
+            cw_gex = (raw_cw_gex / 1e7) if abs(raw_cw_gex) > 1e4 else raw_cw_gex
+            cw_extra = f" [{cw_oi_str} | +{cw_gex:.1f} Cr]" if cw_oi_str else ""
             cw_dist = item.get("call_wall_dist", 0.0)
             cw_dist_str = f"+{cw_dist:.0f} pts" if cw_dist >= 0 else f"{cw_dist:.0f} pts"
 
@@ -241,8 +265,9 @@ class PeriodicAnalysisReporter:
 
             pw_oi = item.get("put_wall_oi", 0)
             pw_oi_str = f"{pw_oi / 1e6:.1f}M OI" if pw_oi >= 1e6 else (f"{pw_oi / 1e3:.0f}k OI" if pw_oi > 0 else "")
-            pw_gex = item.get("put_wall_gex", 0.0)
-            pw_extra = f" [{pw_oi_str} | -{pw_gex:.1f}Cr]" if pw_oi_str else ""
+            raw_pw_gex = item.get("put_wall_gex", 0.0)
+            pw_gex = (raw_pw_gex / 1e7) if abs(raw_pw_gex) > 1e4 else raw_pw_gex
+            pw_extra = f" [{pw_oi_str} | -{pw_gex:.1f} Cr]" if pw_oi_str else ""
             pw_dist = item.get("put_wall_dist", 0.0)
             pw_dist_str = f"-{pw_dist:.0f} pts" if pw_dist >= 0 else f"+{abs(pw_dist):.0f} pts"
 
