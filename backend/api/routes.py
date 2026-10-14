@@ -221,7 +221,7 @@ async def get_execution_positions():
     for pos in bridge.active_positions.values():
         p = dict(pos)
         meta = p.get("metadata") or {}
-        for key in ["instrument", "strike", "direction", "strategy", "option_symbol", "stop_loss", "target", "target_1r", "target_2r"]:
+        for key in ["instrument", "strike", "direction", "strategy", "option_symbol", "stop_loss", "target", "target_1r", "target_2r", "lots_count", "exit_mode", "exit_guidance"]:
             if key not in p or p[key] is None:
                 if key in meta:
                     p[key] = meta[key]

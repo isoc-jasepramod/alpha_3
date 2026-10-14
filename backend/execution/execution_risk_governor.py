@@ -302,11 +302,21 @@ class ExecutionRiskGovernor:
             logger.warning(f"🚫 {reason}")
             return False, reason, {}
 
+        # 10. Exit Target Policy: 1-Lot = Target 1 (+1R Full Exit) | 2-Lots = Scale & Trail (+2R)
+        if final_lots == 1:
+            effective_target = target_1r
+            exit_mode = "TARGET_1_FULL_EXIT"
+            exit_guidance = f"1-Lot Policy: 100% position exits at Target 1 (+1R = ₹{target_1r:.2f})"
+        else:
+            effective_target = target_2r
+            exit_mode = "1_TO_2_SCALE_AND_TRAIL"
+            exit_guidance = f"2-Lot Policy: Book 1 lot at Target 1 (+1R = ₹{target_1r:.2f}), trail remaining lot with BE Stop to Target 2 (+2R = ₹{target_2r:.2f})"
+
         remaining_after = max(0.0, round(available_capital - final_capital, 2))
 
         logger.info(
             f"✅ [EXECUTION RISK APPROVED] {sig_id} ➔ Qty: {final_quantity} ({final_lots}L) @ ₹{entry_price:.2f} | "
-            f"SL: ₹{stop_loss:.2f} | T1: ₹{target_1r:.2f} | T2: ₹{target_2r:.2f} | "
+            f"SL: ₹{stop_loss:.2f} | Tgt: ₹{effective_target:.2f} ({exit_mode}) | "
             f"Committed: ₹{final_capital:,.2f} | Remaining Pool: ₹{remaining_after:,.2f} ({adjustment_note})"
         )
 
@@ -315,8 +325,11 @@ class ExecutionRiskGovernor:
             "lots_count": final_lots,
             "required_capital": final_capital,
             "stop_loss": stop_loss,
+            "target": effective_target,
             "target_1r": target_1r,
             "target_2r": target_2r,
+            "exit_mode": exit_mode,
+            "exit_guidance": exit_guidance,
             "available_capital_before": available_capital,
             "available_capital_after": remaining_after,
             "deployed_capital_before": deployed_capital,

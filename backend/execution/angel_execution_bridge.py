@@ -230,8 +230,10 @@ class AngelExecutionBridge:
             "required_capital": required_capital,
             "available_capital_after": risk_data.get("available_capital_after"),
             "adjustment_note": risk_data.get("adjustment_note"),
+            "exit_mode": risk_data.get("exit_mode", "TARGET_1_FULL_EXIT" if lots_count == 1 else "1_TO_2_SCALE_AND_TRAIL"),
+            "exit_guidance": risk_data.get("exit_guidance", ""),
             "stop_loss": float(signal.get("stop_loss", 0.0)),
-            "target": float(signal.get("target", 0.0)),
+            "target": float(risk_data.get("target") or signal.get("target_1r" if lots_count == 1 else "target_2r", 0.0)),
             "target_1r": float(signal.get("target_1r") or signal.get("target", 0.0)),
             "target_2r": float(signal.get("target_2r") or signal.get("target", 0.0))
         }
@@ -322,13 +324,32 @@ class AngelExecutionBridge:
 
     async def handle_partial_exit(self, signal: Dict[str, Any], exit_price: float) -> Dict[str, Any]:
         """
-        Simulates booking 50% (1 Lot) at Target 1 and moving remaining SL to Breakeven.
+        Handles Target 1 (+1R) execution:
+        - 1-Lot Policy: Closes 100% of the position at Target 1 (Full Exit, does not chase Target 2).
+        - 2-Lot Policy: Sells 1 lot (50%) at Target 1, moves remaining SL to Breakeven, trails to Target 2.
         """
         sig_id = str(signal.get("signal_id"))
         pos = self.active_positions.get(sig_id)
         if not pos:
             return {"status": "NO_ACTIVE_POSITION", "signal_id": sig_id}
 
+        lot_size = pos["lot_size"]
+        rem_qty = pos.get("remaining_quantity", pos.get("quantity", lot_size))
+        lots_count = pos.get("lots_count", rem_qty // lot_size)
+
+        # 1-LOT POLICY: 100% Full Exit at Target 1
+        if lots_count <= 1 or rem_qty <= lot_size:
+            logger.success(
+                f"🎯 [1-LOT TARGET 1 FULL EXIT] {sig_id}: 100% position ({rem_qty} qty) exited at Target 1 ₹{exit_price:.2f}! "
+                f"Single-lot target achieved."
+            )
+            return await self.handle_full_exit(
+                signal={"signal_id": sig_id},
+                exit_price=exit_price,
+                reason="TARGET_1_HIT"
+            )
+
+        # 2-LOT POLICY: Scale and Trail (50% booked at T1, 50% trailed to T2)
         if pos.get("target_1_hit"):
             return {"status": "ALREADY_PARTIALLY_EXITED", "signal_id": sig_id}
 

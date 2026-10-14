@@ -498,8 +498,11 @@ export function LiveTradeTerminal() {
                 const dir = pos.direction || meta.direction || (pos.broker_payload?.tradingsymbol?.endsWith('PE') ? 'PE' : 'CE');
                 const optSymbol = pos.option_symbol || meta.option_symbol || pos.tradingsymbol || pos.broker_payload?.tradingsymbol || `${inst} ${strike} ${dir}`;
                 const strat = pos.strategy || meta.strategy || meta.strategy_name || 'MOMENTUM_IMPULSE';
+                const lotsCount = pos.lots_count ?? meta.lots_count ?? (pos.quantity ? Math.max(1, Math.round(pos.quantity / (pos.lot_size || 1))) : 1);
                 const target1 = pos.target_1r ?? meta.target_1r ?? meta.target ?? null;
+                const target2 = pos.target_2r ?? meta.target_2r ?? null;
                 const stopLoss = pos.breakeven_sl ?? pos.stop_loss ?? meta.breakeven_sl ?? meta.stop_loss ?? null;
+                const isSingleLot = lotsCount <= 1;
 
                 return (
                   <div 
@@ -539,10 +542,22 @@ export function LiveTradeTerminal() {
                           }}>
                             {strat}
                           </span>
+
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: 'var(--radius-sm)',
+                            background: isSingleLot ? 'rgba(0, 240, 255, 0.1)' : 'rgba(255, 170, 0, 0.1)',
+                            border: `1px solid ${isSingleLot ? 'var(--accent-cyan)' : 'var(--accent-amber)'}`,
+                            fontSize: '0.68rem',
+                            fontWeight: '600',
+                            color: isSingleLot ? 'var(--accent-cyan)' : 'var(--accent-amber)'
+                          }}>
+                            {isSingleLot ? '1-LOT (EXIT @ T1)' : '2-LOTS (1:2 TRAIL)'}
+                          </span>
                         </div>
 
                         {/* Price Details */}
-                        <div style={{ display: 'flex', gap: '1.5rem', marginTop: '0.75rem', fontSize: '0.8rem' }}>
+                        <div style={{ display: 'flex', gap: '1.5rem', marginTop: '0.75rem', fontSize: '0.8rem', flexWrap: 'wrap' }}>
                           <div>
                             <span style={{ color: 'var(--text-muted)' }}>Fill Price: </span>
                             <span className="mono" style={{ fontWeight: '600' }}>₹{fillPrice.toFixed(2)}</span>
@@ -553,14 +568,22 @@ export function LiveTradeTerminal() {
                           </div>
                           <div>
                             <span style={{ color: 'var(--text-muted)' }}>Qty: </span>
-                            <span className="mono" style={{ fontWeight: '600' }}>{remQty}</span>
+                            <span className="mono" style={{ fontWeight: '600' }}>{remQty} ({lotsCount}L)</span>
                           </div>
                           <div>
-                            <span style={{ color: 'var(--text-muted)' }}>Target 1: </span>
+                            <span style={{ color: 'var(--text-muted)' }}>{isSingleLot ? 'Target (+1R Full): ' : 'Target 1 (50%): '}</span>
                             <span className="mono" style={{ color: 'var(--ce-green)', fontWeight: '600' }}>
                               {target1 ? `₹${Number(target1).toFixed(2)}` : '₹-'} {pos.target_1_hit ? '(HIT 🎯)' : ''}
                             </span>
                           </div>
+                          {!isSingleLot && target2 && (
+                            <div>
+                              <span style={{ color: 'var(--text-muted)' }}>Target 2 (Runner): </span>
+                              <span className="mono" style={{ color: 'var(--accent-cyan)', fontWeight: '600' }}>
+                                ₹{Number(target2).toFixed(2)}
+                              </span>
+                            </div>
+                          )}
                           <div>
                             <span style={{ color: 'var(--text-muted)' }}>Stop Loss: </span>
                             <span className="mono" style={{ color: 'var(--pe-red)', fontWeight: '600' }}>

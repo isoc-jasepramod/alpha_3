@@ -233,3 +233,98 @@ def test_angel_execution_bridge_integration():
     assert prep["metadata"]["stop_loss"] == 200.0
     assert prep["metadata"]["target_1r"] == 300.0
     assert prep["metadata"]["target_2r"] == 350.0
+    assert prep["metadata"]["exit_mode"] == "TARGET_1_FULL_EXIT"
+    assert prep["metadata"]["target"] == 300.0
+
+
+@pytest.mark.asyncio
+async def test_1_lot_exits_at_target_1_policy():
+    bridge = AngelExecutionBridge(force_dry_run=True)
+    bridge.enabled = True
+    bridge.risk_governor.total_capital = 25000.0
+    bridge.risk_governor.force_single_lot = True
+    bridge.risk_governor.expiry_gate_enabled = False
+    
+    sig = {
+        "signal_id": "SIG-1LOT-EXIT",
+        "instrument": "SENSEX",
+        "strike": 73000.0,
+        "direction": "CE",
+        "option_type": "CE",
+        "option_symbol": "SENSEX26O1573000CE",
+        "option_token": "1111226",
+        "entry_price": 250.0,
+        "quantity": 20,
+        "lot_size": 20,
+        "stop_loss": 200.0,
+        "target": 350.0,
+        "target_1r": 300.0,
+        "target_2r": 350.0,
+        "strategy": "MOMENTUM_IMPULSE"
+    }
+    
+    # 1. Enter trade
+    res = await bridge.execute_signal(sig)
+    assert res["status"] == "SIMULATED_FILLED"
+    assert "SIG-1LOT-EXIT" in bridge.active_positions
+    pos = bridge.active_positions["SIG-1LOT-EXIT"]
+    assert pos["metadata"]["exit_mode"] == "TARGET_1_FULL_EXIT"
+    assert pos["metadata"]["target"] == 300.0  # Points to Target 1, not Target 2!
+    
+    # 2. Target 1 Reached: Should trigger FULL EXIT, closing the 1-lot position completely
+    exit_res = await bridge.handle_partial_exit(sig, exit_price=300.0)
+    assert exit_res["action"] == "FULL_EXIT"
+    assert exit_res["reason"] == "TARGET_1_HIT"
+    assert exit_res["total_realized_pnl"] == (300.0 - 250.0) * 20  # +₹1,000
+    assert "SIG-1LOT-EXIT" not in bridge.active_positions
+    assert bridge.risk_governor.get_available_capital(bridge.active_positions) == 25000.0
+
+
+@pytest.mark.asyncio
+async def test_2_lot_scale_and_trail_policy():
+    bridge = AngelExecutionBridge(force_dry_run=True)
+    bridge.enabled = True
+    bridge.risk_governor.total_capital = 25000.0
+    bridge.risk_governor.force_single_lot = False  # Multi-lot allowed
+    bridge.risk_governor.expiry_gate_enabled = False
+    
+    sig = {
+        "signal_id": "SIG-2LOT-SCALE",
+        "instrument": "SENSEX",
+        "strike": 73000.0,
+        "direction": "CE",
+        "option_type": "CE",
+        "option_symbol": "SENSEX26O1573000CE",
+        "option_token": "1111226",
+        "entry_price": 250.0,
+        "quantity": 40,  # 2 lots
+        "lot_size": 20,
+        "stop_loss": 200.0,
+        "target": 350.0,
+        "target_1r": 300.0,
+        "target_2r": 350.0,
+        "strategy": "OI_SQUEEZE"
+    }
+    
+    # 1. Enter trade
+    res = await bridge.execute_signal(sig)
+    assert res["status"] == "SIMULATED_FILLED"
+    pos = bridge.active_positions["SIG-2LOT-SCALE"]
+    assert pos["metadata"]["exit_mode"] == "1_TO_2_SCALE_AND_TRAIL"
+    assert pos["metadata"]["target"] == 350.0  # Points to Target 2
+    
+    # 2. Target 1 Reached: Should book 1 lot (50%) and keep 1 lot running at Breakeven
+    part_res = await bridge.handle_partial_exit(sig, exit_price=300.0)
+    assert part_res["action"] == "PARTIAL_EXIT_T1"
+    assert part_res["quantity_sold"] == 20
+    assert part_res["remaining_quantity"] == 20
+    assert part_res["realized_pnl"] == (300.0 - 250.0) * 20  # +₹1,000
+    assert pos["breakeven_sl"] == 250.0  # SL moved to Breakeven
+    assert "SIG-2LOT-SCALE" in bridge.active_positions  # Still open!
+    
+    # 3. Target 2 Reached: Should close final runner
+    full_res = await bridge.handle_full_exit(sig, exit_price=350.0, reason="TARGET_HIT")
+    assert full_res["action"] == "FULL_EXIT"
+    assert full_res["total_realized_pnl"] == 1000.0 + (350.0 - 250.0) * 20  # +₹3,000 total
+    assert "SIG-2LOT-SCALE" not in bridge.active_positions
+
