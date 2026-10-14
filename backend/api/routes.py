@@ -33,7 +33,21 @@ app_state = AppState()
 @router.get("/api/telemetry")
 async def get_telemetry():
     active_sigs = len(app_state.signal_tracker.active_signals) if app_state.signal_tracker else 0
-    realized_pnl = app_state.risk_governor.realized_daily_pnl if app_state.risk_governor else 0.0
+    realized_pnl = float(app_state.risk_governor.realized_daily_pnl) if app_state.risk_governor else 0.0
+    
+    # Reconcile with all-day persistent execution log (accounting for any mid-day restarts)
+    try:
+        import os, json
+        today_file = f"data/execution_logs/orders_{datetime.now().strftime('%Y-%m-%d')}.json"
+        if os.path.exists(today_file):
+            with open(today_file, "r", encoding="utf-8") as f:
+                o_log = json.load(f)
+            file_tot = sum(float(o.get("total_realized_pnl", 0.0)) for o in o_log if o.get("action") == "FULL_EXIT")
+            if file_tot != 0.0:
+                realized_pnl = file_tot
+    except Exception:
+        pass
+
     equity = app_state.risk_governor.total_equity if app_state.risk_governor else 100000.0
     cb_tripped = app_state.risk_governor.circuit_breaker_tripped if app_state.risk_governor else False
 
@@ -196,11 +210,20 @@ async def get_execution_status():
 
 @router.get("/api/execution/positions")
 async def get_execution_positions():
-    """Returns the active open positions in the execution bridge."""
+    """Returns the active open positions in the execution bridge with flattened metadata."""
     bridge = getattr(app_state, "execution_bridge", None)
     if not bridge:
         return []
-    return list(bridge.active_positions.values())
+    flattened = []
+    for pos in bridge.active_positions.values():
+        p = dict(pos)
+        meta = p.get("metadata") or {}
+        for key in ["instrument", "strike", "direction", "strategy", "option_symbol", "stop_loss", "target", "target_1r", "target_2r"]:
+            if key not in p or p[key] is None:
+                if key in meta:
+                    p[key] = meta[key]
+        flattened.append(p)
+    return flattened
 
 @router.post("/api/execution/exit-position")
 async def exit_single_position(signal_id: str = Query(...)):

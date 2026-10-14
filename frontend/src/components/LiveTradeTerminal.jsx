@@ -473,11 +473,20 @@ export function LiveTradeTerminal() {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               {positions.map((pos) => {
-                const fillPrice = pos.fill_price || pos.entry_price || 0;
+                const meta = pos.metadata || {};
+                const fillPrice = pos.fill_price || pos.entry_price || meta.expected_entry || 0;
                 const currentPrice = pos.current_ltp || fillPrice;
-                const remQty = pos.remaining_quantity || pos.quantity || 0;
+                const remQty = pos.remaining_quantity || pos.quantity || meta.quantity || 0;
                 const unrlPnl = ((currentPrice - fillPrice) * remQty);
                 const isProfitable = unrlPnl >= 0;
+
+                const inst = pos.instrument || meta.instrument || 'INDEX';
+                const strike = pos.strike || meta.strike || '';
+                const dir = pos.direction || meta.direction || (pos.broker_payload?.tradingsymbol?.endsWith('PE') ? 'PE' : 'CE');
+                const optSymbol = pos.option_symbol || meta.option_symbol || pos.tradingsymbol || pos.broker_payload?.tradingsymbol || `${inst} ${strike} ${dir}`;
+                const strat = pos.strategy || meta.strategy || meta.strategy_name || 'MOMENTUM_IMPULSE';
+                const target1 = pos.target_1r ?? meta.target_1r ?? meta.target ?? null;
+                const stopLoss = pos.breakeven_sl ?? pos.stop_loss ?? meta.breakeven_sl ?? meta.stop_loss ?? null;
 
                 return (
                   <div 
@@ -485,7 +494,7 @@ export function LiveTradeTerminal() {
                     className="glass-panel"
                     style={{
                       padding: '1.25rem',
-                      borderLeft: `4px solid ${pos.direction === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)'}`
+                      borderLeft: `4px solid ${dir === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)'}`
                     }}
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '1rem' }}>
@@ -497,15 +506,15 @@ export function LiveTradeTerminal() {
                             borderRadius: 'var(--radius-sm)',
                             fontWeight: '700',
                             fontSize: '0.75rem',
-                            background: pos.direction === 'CE' ? 'var(--ce-green-bg)' : 'var(--pe-red-bg)',
-                            color: pos.direction === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)',
-                            border: `1px solid ${pos.direction === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)'}`
+                            background: dir === 'CE' ? 'var(--ce-green-bg)' : 'var(--pe-red-bg)',
+                            color: dir === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)',
+                            border: `1px solid ${dir === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)'}`
                           }}>
-                            {pos.instrument} {pos.strike} {pos.direction}
+                            {inst} {strike} {dir}
                           </span>
 
                           <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                            {pos.option_symbol || pos.tradingsymbol}
+                            {optSymbol}
                           </span>
 
                           <span style={{
@@ -515,7 +524,7 @@ export function LiveTradeTerminal() {
                             fontSize: '0.7rem',
                             color: 'var(--text-secondary)'
                           }}>
-                            {pos.strategy || 'QUANT_STRATEGY'}
+                            {strat}
                           </span>
                         </div>
 
@@ -536,13 +545,13 @@ export function LiveTradeTerminal() {
                           <div>
                             <span style={{ color: 'var(--text-muted)' }}>Target 1: </span>
                             <span className="mono" style={{ color: 'var(--ce-green)', fontWeight: '600' }}>
-                              ₹{pos.target_1r || '-'} {pos.target_1_hit ? '(HIT 🎯)' : ''}
+                              {target1 ? `₹${Number(target1).toFixed(2)}` : '₹-'} {pos.target_1_hit ? '(HIT 🎯)' : ''}
                             </span>
                           </div>
                           <div>
                             <span style={{ color: 'var(--text-muted)' }}>Stop Loss: </span>
                             <span className="mono" style={{ color: 'var(--pe-red)', fontWeight: '600' }}>
-                              ₹{pos.breakeven_sl || pos.stop_loss || '-'}
+                              {stopLoss ? `₹${Number(stopLoss).toFixed(2)}` : '₹-'}
                             </span>
                           </div>
                         </div>
