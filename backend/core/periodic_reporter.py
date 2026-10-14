@@ -440,18 +440,33 @@ class PeriodicAnalysisReporter:
             return False
 
         notifier = getattr(self.server, "telegram", None)
-        if not notifier or not notifier.enabled:
-            logger.info("Periodic reporter: Telegram notifier not active or disabled.")
+        local_notifier = False
+        if not notifier or not getattr(notifier, "enabled", False):
+            from backend.core.telegram_notifier import TelegramNotifier
+            notifier = TelegramNotifier()
+            await notifier.initialize()
+            local_notifier = True
+
+        if not notifier.enabled or not getattr(notifier, "client", None):
+            logger.warning("Periodic reporter: Telegram notifier not active or disabled.")
             return False
 
         try:
             payload = self.build_digest_payload()
             html_msg = self.format_digest_html(payload, milestone_str=milestone_str)
             await notifier.enqueue_message(html_msg)
-            logger.success(f"📢 [PERIODIC DIGEST] Dispatched 45-min Telegram analysis report ({milestone_str})!")
+            if local_notifier:
+                await asyncio.sleep(2.5)
+                await notifier.close()
+            logger.success(f"📢 [PERIODIC DIGEST] Dispatched 15-min Telegram analysis report ({milestone_str})!")
             return True
         except Exception as e:
             logger.error(f"Error generating/sending periodic digest: {e}")
+            if local_notifier:
+                try:
+                    await notifier.close()
+                except Exception:
+                    pass
             return False
 
     async def start(self):
