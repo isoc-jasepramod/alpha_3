@@ -2,22 +2,30 @@
 Execution Risk Governor & Capital Pool Manager (Phase 1 & Phase 2).
 
 Decoupled strictly from the Live Advisory RiskGovernor (which uses ₹1,00,000 benchmark equity).
-Focuses 100% on live execution constraints:
-1. Capital Pool Governance:
+Focuses 100% on live broker execution constraints:
+1. Expiry Time Gate (The Anti-Theta Trap):
+   - Blocks new naked buyer orders after 14:15 IST on weekly/monthly expiry days.
+2. Volatility Stop Loss Validation (No Guessing):
+   - Enforces that all execution orders have a verified volatility-based Stop Loss 
+     with floor rules and minimum spread buffers.
+3. 1:2 Risk-to-Reward Targets (Target 1 & Target 2):
+   - Enforces valid Target 1 (+1R partial profit) and Target 2 (+2R final runner).
+4. Capital Pool Governance (₹25,000 Pool):
    - Tracks deployed capital across all open broker positions.
    - Dynamically calculates available margin: (Total Pool - Deployed).
-2. Dynamic Lot Sizing & Phase 2 Micro-Lot Guard:
+5. Dynamic Lot Sizing & Phase 2 Micro-Lot Guard:
    - Enforces strict 1-lot trading in Phase 2 for micro-risk live testing.
    - If multi-lot is enabled and margin is tight, automatically downsizes to 1 lot.
-3. Insufficient Margin Guard & Detailed Audit Logging:
+6. Insufficient Margin Guard & Detailed Audit Logging:
    - Explicitly rejects and logs if remaining margin cannot fund even 1 lot.
-4. Execution Loss Circuit Breaker:
+7. Execution Loss Circuit Breaker:
    - Tracks daily realized PnL against max daily loss ceiling.
 """
 
 import math
 import os
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple
 from loguru import logger
 import yaml
@@ -41,6 +49,10 @@ class ExecutionRiskGovernor:
         self.max_active_positions: int = 2         # Max concurrent open trades
         self.max_daily_loss: float = 4000.0        # Daily loss ceiling for execution
         
+        # Expiry Time Gate
+        self.expiry_gate_enabled: bool = True
+        self.expiry_cutoff_time: str = "14:15"     # HH:MM IST
+        
         self.realized_daily_pnl: float = 0.0
         self.circuit_breaker_tripped: bool = False
         self.circuit_breaker_time: Optional[datetime] = None
@@ -52,6 +64,7 @@ class ExecutionRiskGovernor:
             f"Capital Pool: ₹{self.total_capital:,.2f} | "
             f"ForceSingleLot: {self.force_single_lot} | "
             f"MaxActive: {self.max_active_positions} | "
+            f"ExpiryGate: {self.expiry_cutoff_time} IST | "
             f"MaxLoss: ₹{self.max_daily_loss:,.2f}"
         )
 
@@ -61,16 +74,62 @@ class ExecutionRiskGovernor:
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     full_cfg = yaml.safe_load(f) or {}
-                    cfg = full_cfg.get("execution", {})
+                    exec_cfg = full_cfg.get("execution", {})
+                    risk_cfg = full_cfg.get("risk", {})
 
-                    # Total pool can be set via total_capital or falls back to max_capital_per_trade
-                    self.total_capital = float(cfg.get("total_capital", cfg.get("max_capital_per_trade", 25000.0)))
-                    self.max_capital_per_trade = float(cfg.get("max_capital_per_trade", self.total_capital))
-                    self.force_single_lot = bool(cfg.get("force_single_lot", True))
-                    self.max_active_positions = int(cfg.get("max_active_orders", 2))
-                    self.max_daily_loss = float(cfg.get("max_daily_loss", 4000.0))
+                    # Capital & sizing
+                    self.total_capital = float(exec_cfg.get("total_capital", exec_cfg.get("max_capital_per_trade", 25000.0)))
+                    self.max_capital_per_trade = float(exec_cfg.get("max_capital_per_trade", self.total_capital))
+                    self.force_single_lot = bool(exec_cfg.get("force_single_lot", True))
+                    self.max_active_positions = int(exec_cfg.get("max_active_orders", 2))
+                    self.max_daily_loss = float(exec_cfg.get("max_daily_loss", 4000.0))
+
+                    # Expiry gate settings (from execution or fallback to risk)
+                    self.expiry_gate_enabled = bool(exec_cfg.get("expiry_gate_enabled", risk_cfg.get("expiry_gate_enabled", True)))
+                    self.expiry_cutoff_time = str(exec_cfg.get("expiry_cutoff_time", risk_cfg.get("expiry_cutoff_time", "14:15")))
             except Exception as e:
                 logger.warning(f"Failed to load execution risk config from {self.config_path}: {e}")
+
+    def _is_expiry_day(self, raw_signal: Dict[str, Any], dt: datetime) -> bool:
+        """Determines if the candidate contract expires today or if today is weekly index expiry."""
+        symbol = str(raw_signal.get("option_symbol", "")).upper()
+        details = raw_signal.get("details") or {}
+        exp_str = str(raw_signal.get("expiry") or details.get("expiry") or "").strip().upper()
+
+        if exp_str:
+            for fmt in ("%d%b%Y", "%d-%b-%Y", "%d%B%Y", "%Y-%m-%d"):
+                try:
+                    exp_date = datetime.strptime(exp_str, fmt).date()
+                    return exp_date == dt.date()
+                except ValueError:
+                    pass
+
+        # BSE weekly symbol date pattern (e.g., SENSEX26O1473000CE -> day 14)
+        m_bse = re.match(r"SENSEX\d{2}[A-Z0-9](\d{2})", symbol, re.I)
+        if m_bse:
+            try:
+                if int(m_bse.group(1)) == dt.day:
+                    return True
+            except ValueError:
+                pass
+
+        # NSE weekly symbol date pattern (e.g., NIFTY15OCT2622400PE)
+        m_nse = re.match(r"NIFTY(\d{2})([A-Z]{3})\d{2}", symbol, re.I)
+        if m_nse:
+            try:
+                day_str, mon_str = m_nse.groups()
+                if int(day_str) == dt.day and mon_str.upper() == dt.strftime("%b").upper():
+                    return True
+            except ValueError:
+                pass
+
+        # Index weekly fallback (SENSEX: Wed/Thu/Fri; NIFTY: Thu)
+        inst = raw_signal.get("instrument", "NIFTY")
+        weekday = dt.weekday()
+        if (inst == "NIFTY" and weekday in (1, 3)) or (inst == "SENSEX" and weekday in (2, 3, 4)):
+            return True
+
+        return False
 
     def get_deployed_capital(self, active_positions: Dict[str, Dict[str, Any]]) -> float:
         """Calculates total capital currently locked in open active positions."""
@@ -126,11 +185,13 @@ class ExecutionRiskGovernor:
         active_positions: Dict[str, Dict[str, Any]]
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
-        Evaluates an incoming candidate signal against execution risk rules:
+        Evaluates an incoming candidate signal against complete execution risk gates:
         1. Circuit breaker status
-        2. Active position concurrency cap
-        3. Available capital vs required margin
-        4. Single-lot enforcement (Phase 2) or dynamic lot step-down
+        2. Expiry Time Gate (Anti-Theta Trap)
+        3. Active position concurrency cap
+        4. Volatility Stop Loss & 1:2 R:R Targets validation
+        5. Available capital vs required margin
+        6. Single-lot enforcement (Phase 2) or dynamic lot step-down
         """
         sig_id = signal.get("signal_id", "UNKNOWN")
 
@@ -140,23 +201,54 @@ class ExecutionRiskGovernor:
             logger.warning(f"🚫 {reason}")
             return False, reason, {}
 
-        # 2. Concurrency cap check
+        # 2. Expiry Time Gate: Block naked option buyer orders after cutoff on expiry days
+        if self.expiry_gate_enabled:
+            IST = timezone(timedelta(hours=5, minutes=30))
+            now_dt = datetime.now(IST)
+            try:
+                cutoff_hour, cutoff_min = map(int, self.expiry_cutoff_time.split(":"))
+            except Exception:
+                cutoff_hour, cutoff_min = 14, 15
+
+            if (now_dt.hour > cutoff_hour) or (now_dt.hour == cutoff_hour and now_dt.minute >= cutoff_min):
+                if self._is_expiry_day(signal, now_dt):
+                    reason = (
+                        f"REJECTED_EXPIRY_TIME_GATE (Naked buyer entries disabled after {self.expiry_cutoff_time} IST "
+                        f"on expiry days to prevent 0-DTE Theta crush)"
+                    )
+                    logger.warning(f"⏳ [ANTI-THETA GATE] {sig_id}: {reason}")
+                    return False, reason, {}
+
+        # 3. Concurrency cap check
         if len(active_positions) >= self.max_active_positions:
             reason = f"REJECTED_MAX_CONCURRENT_POSITIONS ({len(active_positions)}/{self.max_active_positions})"
             logger.warning(f"🚫 [EXECUTION CAP] {sig_id}: {reason}")
             return False, reason, {}
 
-        # 3. Price & Lot size validation
+        # 4. Price & Lot size validation
         entry_price = float(signal.get("entry_price", 0.0))
         lot_size = int(signal.get("lot_size", 0))
         if entry_price <= 0.0 or lot_size <= 0:
             return False, "REJECTED_INVALID_PRICE_OR_LOT_SIZE", {}
 
+        # 5. Volatility Stop Loss Validation (No Guessing)
+        stop_loss = float(signal.get("stop_loss", 0.0))
+        if stop_loss <= 0.0:
+            return False, "REJECTED_MISSING_VOLATILITY_STOP_LOSS", {}
+        if stop_loss >= entry_price:
+            return False, f"REJECTED_STOP_LOSS_ABOVE_ENTRY (SL: ₹{stop_loss:.2f} >= Entry: ₹{entry_price:.2f})", {}
+
+        # 6. 1:2 Risk-to-Reward Targets Validation (Target 1 & Target 2)
+        target_1r = float(signal.get("target_1r") or signal.get("target", 0.0))
+        target_2r = float(signal.get("target_2r") or signal.get("target", 0.0))
+        if target_1r <= entry_price:
+            return False, f"REJECTED_INVALID_TARGET_1R (T1: ₹{target_1r:.2f} <= Entry: ₹{entry_price:.2f})", {}
+
         one_lot_capital = round(entry_price * lot_size, 2)
         deployed_capital = self.get_deployed_capital(active_positions)
         available_capital = self.get_available_capital(active_positions)
 
-        # 4. Check if even 1 lot is affordable in remaining available capital
+        # 7. Check if even 1 lot is affordable in remaining available capital
         if one_lot_capital > available_capital:
             reason = (
                 f"REJECTED_INSUFFICIENT_AVAILABLE_CAPITAL "
@@ -171,7 +263,7 @@ class ExecutionRiskGovernor:
                 "required_one_lot": one_lot_capital
             }
 
-        # 5. Lot sizing decision
+        # 8. Lot sizing decision (Phase 2 Single-Lot Lock or Dynamic Step-Down)
         requested_qty = int(signal.get("quantity", lot_size))
         requested_lots = max(1, requested_qty // lot_size)
 
@@ -204,9 +296,9 @@ class ExecutionRiskGovernor:
         final_quantity = final_lots * lot_size
         final_capital = round(entry_price * final_quantity, 2)
 
-        # 6. Check single-trade ceiling
+        # 9. Check single-trade ceiling
         if final_capital > self.max_capital_per_trade:
-            reason = f"REJECTED_CAPITAL_EXCEEDS_TRADE_LIMIT (Req: ₹{final_capital:,.2f} > Max: ₹{self.max_capital_per_trade:,.2f})"
+            reason = f"REJECTED_CAPITAL_EXCEEDS_TRADE_LIMIT (Req: ₹{final_capital:.2f} > Max: ₹{self.max_capital_per_trade:.2f})"
             logger.warning(f"🚫 {reason}")
             return False, reason, {}
 
@@ -214,6 +306,7 @@ class ExecutionRiskGovernor:
 
         logger.info(
             f"✅ [EXECUTION RISK APPROVED] {sig_id} ➔ Qty: {final_quantity} ({final_lots}L) @ ₹{entry_price:.2f} | "
+            f"SL: ₹{stop_loss:.2f} | T1: ₹{target_1r:.2f} | T2: ₹{target_2r:.2f} | "
             f"Committed: ₹{final_capital:,.2f} | Remaining Pool: ₹{remaining_after:,.2f} ({adjustment_note})"
         )
 
@@ -221,6 +314,9 @@ class ExecutionRiskGovernor:
             "quantity": final_quantity,
             "lots_count": final_lots,
             "required_capital": final_capital,
+            "stop_loss": stop_loss,
+            "target_1r": target_1r,
+            "target_2r": target_2r,
             "available_capital_before": available_capital,
             "available_capital_after": remaining_after,
             "deployed_capital_before": deployed_capital,

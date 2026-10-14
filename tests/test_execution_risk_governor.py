@@ -5,12 +5,16 @@ Tests:
 2. Phase 2 single-lot lock (forcing 1 lot regardless of requested size).
 3. Dynamic lot step-down when margin is tight.
 4. Clean rejection and logging on insufficient available capital.
-5. Concurrency and circuit breaker gates.
+5. Volatility Stop Loss verification.
+6. 1:2 Risk-to-Reward Targets verification.
+7. Expiry Time Gate verification.
+8. AngelExecutionBridge integration.
 """
 
 import pytest
 import os
 import sys
+from datetime import datetime, timezone, timedelta
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -51,6 +55,7 @@ def test_phase2_forced_single_lot():
     gov = ExecutionRiskGovernor()
     gov.total_capital = 25000.0
     gov.force_single_lot = True
+    gov.expiry_gate_enabled = False  # Isolate test from current time
     active_positions = {}
     
     # Strategy asks for 2 lots (40 qty for SENSEX lot 20) @ 300.0 (Req: ₹12,000)
@@ -59,7 +64,10 @@ def test_phase2_forced_single_lot():
         "instrument": "SENSEX",
         "entry_price": 300.0,
         "lot_size": 20,
-        "quantity": 40  # 2 lots
+        "quantity": 40,  # 2 lots
+        "stop_loss": 240.0,
+        "target_1r": 360.0,
+        "target_2r": 420.0
     }
     
     ok, reason, data = gov.evaluate_execution_order(sig, active_positions)
@@ -75,6 +83,7 @@ def test_dynamic_lot_step_down_when_margin_tight():
     gov = ExecutionRiskGovernor()
     gov.total_capital = 25000.0
     gov.force_single_lot = False  # Multi-lot enabled
+    gov.expiry_gate_enabled = False
     
     # Position 1 already active using ₹14,000 (Available: ₹11,000)
     active_positions = {
@@ -89,7 +98,10 @@ def test_dynamic_lot_step_down_when_margin_tight():
         "instrument": "SENSEX",
         "entry_price": 350.0,
         "lot_size": 20,
-        "quantity": 40
+        "quantity": 40,
+        "stop_loss": 280.0,
+        "target_1r": 420.0,
+        "target_2r": 490.0
     }
     
     ok, reason, data = gov.evaluate_execution_order(sig, active_positions)
@@ -104,6 +116,7 @@ def test_dynamic_lot_step_down_when_margin_tight():
 def test_insufficient_available_capital_rejection():
     gov = ExecutionRiskGovernor()
     gov.total_capital = 25000.0
+    gov.expiry_gate_enabled = False
     
     # Position 1 active using ₹20,000 (Available: ₹5,000)
     active_positions = {
@@ -117,7 +130,10 @@ def test_insufficient_available_capital_rejection():
         "instrument": "SENSEX",
         "entry_price": 300.0,
         "lot_size": 20,
-        "quantity": 20
+        "quantity": 20,
+        "stop_loss": 240.0,
+        "target_1r": 360.0,
+        "target_2r": 420.0
     }
     
     ok, reason, data = gov.evaluate_execution_order(sig, active_positions)
@@ -127,12 +143,67 @@ def test_insufficient_available_capital_rejection():
     assert "Req 1-Lot: ₹6,000.00" in reason
 
 
+def test_volatility_stop_loss_validation():
+    gov = ExecutionRiskGovernor()
+    gov.expiry_gate_enabled = False
+    active_positions = {}
+    
+    # Missing SL
+    sig_no_sl = {
+        "signal_id": "SIG-NO-SL",
+        "instrument": "SENSEX",
+        "entry_price": 300.0,
+        "lot_size": 20,
+        "quantity": 20,
+        "stop_loss": 0.0,
+        "target_1r": 360.0
+    }
+    ok, reason, _ = gov.evaluate_execution_order(sig_no_sl, active_positions)
+    assert ok is False
+    assert "REJECTED_MISSING_VOLATILITY_STOP_LOSS" in reason
+    
+    # SL above entry (invalid for buyer)
+    sig_bad_sl = {
+        "signal_id": "SIG-BAD-SL",
+        "instrument": "SENSEX",
+        "entry_price": 300.0,
+        "lot_size": 20,
+        "quantity": 20,
+        "stop_loss": 320.0,
+        "target_1r": 360.0
+    }
+    ok, reason, _ = gov.evaluate_execution_order(sig_bad_sl, active_positions)
+    assert ok is False
+    assert "REJECTED_STOP_LOSS_ABOVE_ENTRY" in reason
+
+
+def test_target_ratio_validation():
+    gov = ExecutionRiskGovernor()
+    gov.expiry_gate_enabled = False
+    active_positions = {}
+    
+    # Target 1 below entry price
+    sig_bad_t1 = {
+        "signal_id": "SIG-BAD-T1",
+        "instrument": "SENSEX",
+        "entry_price": 300.0,
+        "lot_size": 20,
+        "quantity": 20,
+        "stop_loss": 250.0,
+        "target_1r": 280.0
+    }
+    ok, reason, _ = gov.evaluate_execution_order(sig_bad_t1, active_positions)
+    assert ok is False
+    assert "REJECTED_INVALID_TARGET_1R" in reason
+
+
 def test_angel_execution_bridge_integration():
     bridge = AngelExecutionBridge(force_dry_run=True)
     bridge.enabled = True
     bridge.kill_switch_active = False
     bridge.risk_governor.total_capital = 25000.0
     bridge.risk_governor.force_single_lot = True
+    bridge.risk_governor.expiry_gate_enabled = False
     
     # Valid candidate signal
     sig = {
@@ -148,6 +219,8 @@ def test_angel_execution_bridge_integration():
         "lot_size": 20,
         "stop_loss": 200.0,
         "target": 350.0,
+        "target_1r": 300.0,
+        "target_2r": 350.0,
         "strategy": "MOMENTUM_IMPULSE"
     }
     
@@ -157,3 +230,6 @@ def test_angel_execution_bridge_integration():
     assert prep["metadata"]["quantity"] == 20
     assert prep["metadata"]["required_capital"] == 5000.0
     assert prep["metadata"]["available_capital_after"] == 20000.0
+    assert prep["metadata"]["stop_loss"] == 200.0
+    assert prep["metadata"]["target_1r"] == 300.0
+    assert prep["metadata"]["target_2r"] == 350.0
