@@ -5,6 +5,11 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
 from loguru import logger
 import yaml
+from dotenv import load_dotenv
+
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv(os.path.join(project_root, ".env"))
+load_dotenv()
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
