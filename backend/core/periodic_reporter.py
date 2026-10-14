@@ -72,8 +72,8 @@ class PeriodicAnalysisReporter:
 
         # 2. VWAP
         regime_vwaps = getattr(self.server, "regime_vwap", {})
-        nifty_vwap = regime_vwaps.get("NIFTY").value if regime_vwaps.get("NIFTY") else nifty_p
-        sensex_vwap = regime_vwaps.get("SENSEX").value if regime_vwaps.get("SENSEX") else sensex_p
+        nifty_vwap = regime_vwaps.get("NIFTY").value if regime_vwaps.get("NIFTY") else None
+        sensex_vwap = regime_vwaps.get("SENSEX").value if regime_vwaps.get("SENSEX") else None
 
         # 3. Regime Filter
         rf = getattr(self.server, "regime_filter", None)
@@ -93,7 +93,6 @@ class PeriodicAnalysisReporter:
         rg = getattr(self.server, "risk_governor", None)
         realized_pnl = float(getattr(rg, "realized_daily_pnl", 0.0)) if rg else 0.0
 
-        # Calculate today's resolved signals stats
         target_hits = sum(1 for s in active_sigs if s.get("status") == "TARGET_HIT")
         stop_hits = sum(1 for s in active_sigs if s.get("status") == "STOP_HIT")
         chase_blocked = sum(1 for s in active_sigs if s.get("status") == "INVALID_CHASE_PREVENTED")
@@ -104,27 +103,106 @@ class PeriodicAnalysisReporter:
         nifty_gex = gex.get_current_metrics("NIFTY") if gex and hasattr(gex, "get_current_metrics") else {}
         sensex_gex = gex.get_current_metrics("SENSEX") if gex and hasattr(gex, "get_current_metrics") else {}
 
-        # 7. Robust fallback to local Telemetry API if standalone or metrics unpopulated
-        if not nifty_gex.get("call_wall") or not sensex_gex.get("call_wall") or not nifty_p:
-            try:
-                import json
-                import urllib.request
-                req = urllib.request.urlopen("http://localhost:8001/api/telemetry", timeout=1.5)
-                t_data = json.loads(req.read().decode("utf-8"))
-                gamma_data = t_data.get("gamma", {})
-                if not nifty_gex.get("call_wall") and gamma_data.get("NIFTY"):
-                    nifty_gex = gamma_data["NIFTY"]
-                if not sensex_gex.get("call_wall") and gamma_data.get("SENSEX"):
-                    sensex_gex = gamma_data["SENSEX"]
-                sp_data = t_data.get("spot_data", {})
-                if not nifty_p and sp_data.get("NIFTY"):
-                    nifty_info = sp_data["NIFTY"]
-                    nifty_p = float(nifty_info.get("ltp", 0.0))
-                if not sensex_p and sp_data.get("SENSEX"):
-                    sensex_info = sp_data["SENSEX"]
-                    sensex_p = float(sensex_info.get("ltp", 0.0))
-            except Exception as e:
-                logger.debug(f"Telemetry API fallback skipped: {e}")
+        # 7. Comprehensive Fallback to Local REST API & Execution Engine
+        t_data: Dict[str, Any] = {}
+        try:
+            import json
+            import urllib.request
+            req = urllib.request.urlopen("http://localhost:8001/api/telemetry", timeout=1.5)
+            t_data = json.loads(req.read().decode("utf-8"))
+            
+            # Gamma / GEX fallback
+            gamma_data = t_data.get("gamma", {})
+            if not nifty_gex.get("call_wall") and gamma_data.get("NIFTY"):
+                nifty_gex = gamma_data["NIFTY"]
+            if not sensex_gex.get("call_wall") and gamma_data.get("SENSEX"):
+                sensex_gex = gamma_data["SENSEX"]
+            
+            # Spot data fallback
+            sp_data = t_data.get("spot_data", {})
+            if (not nifty_p or nifty_p <= 0) and sp_data.get("NIFTY"):
+                nifty_info = sp_data["NIFTY"]
+                nifty_p = float(nifty_info.get("ltp", 0.0))
+            elif sp_data.get("NIFTY") and not nifty_info.get("open"):
+                nifty_info = sp_data["NIFTY"]
+
+            if (not sensex_p or sensex_p <= 0) and sp_data.get("SENSEX"):
+                sensex_info = sp_data["SENSEX"]
+                sensex_p = float(sensex_info.get("ltp", 0.0))
+            elif sp_data.get("SENSEX") and not sensex_info.get("open"):
+                sensex_info = sp_data["SENSEX"]
+        except Exception as e:
+            logger.debug(f"Telemetry API fallback skipped: {e}")
+
+        # Regime fallback from telemetry
+        t_regimes = t_data.get("regimes", {})
+        n_reg = t_regimes.get("NIFTY", {})
+        nifty_regime_name = nifty_regime.state.name if nifty_regime else n_reg.get("regime", "BALANCED_RANGE")
+        nifty_regime_score = nifty_regime.trend_score if nifty_regime else float(n_reg.get("score", 50.0))
+        nifty_adx = nifty_regime.adx if nifty_regime else float(n_reg.get("adx_value", 20.0))
+
+        s_reg = t_regimes.get("SENSEX", {})
+        sensex_regime_name = sensex_regime.state.name if sensex_regime else s_reg.get("regime", "BALANCED_RANGE")
+        sensex_regime_score = sensex_regime.trend_score if sensex_regime else float(s_reg.get("score", 50.0))
+        sensex_adx = sensex_regime.adx if sensex_regime else float(s_reg.get("adx_value", 20.0))
+
+        # Robust VWAP fallback: compute typical price approximation if server object missing
+        if not nifty_vwap or nifty_vwap <= 0:
+            n_o = float(nifty_info.get("open", nifty_p))
+            n_h = float(nifty_info.get("high", nifty_p))
+            n_l = float(nifty_info.get("low", nifty_p))
+            nifty_vwap = round((n_o + n_h + n_l + 2 * nifty_p) / 5, 2) if nifty_p > 0 else 0.0
+
+        if not sensex_vwap or sensex_vwap <= 0:
+            s_o = float(sensex_info.get("open", sensex_p))
+            s_h = float(sensex_info.get("high", sensex_p))
+            s_l = float(sensex_info.get("low", sensex_p))
+            sensex_vwap = round((s_o + s_h + s_l + 2 * sensex_p) / 5, 2) if sensex_p > 0 else 0.0
+
+        # Chain metrics (PCR & MaxPain) fallback from GEX if chain_poller missing
+        nifty_pcr = float(nifty_chain.get("pcr", 0.0))
+        if nifty_pcr <= 0 and nifty_gex.get("call_wall_oi"):
+            nifty_pcr = round(float(nifty_gex.get("put_wall_oi", 1)) / float(nifty_gex["call_wall_oi"]), 2)
+        nifty_max_pain = float(nifty_chain.get("max_pain", 0.0)) or float(nifty_gex.get("put_wall", 0.0))
+
+        sensex_pcr = float(sensex_chain.get("pcr", 0.0))
+        if sensex_pcr <= 0 and sensex_gex.get("call_wall_oi"):
+            sensex_pcr = round(float(sensex_gex.get("put_wall_oi", 1)) / float(sensex_gex["call_wall_oi"]), 2)
+        sensex_max_pain = float(sensex_chain.get("max_pain", 0.0)) or float(sensex_gex.get("put_wall", 0.0))
+
+        # Execution tracking fallback: fetch from execution API or today's orders file
+        active_exec_count = len(active_running)
+        try:
+            import os, json, urllib.request
+            req_exec = urllib.request.urlopen("http://localhost:8001/api/execution/status", timeout=1.0)
+            e_status = json.loads(req_exec.read().decode("utf-8"))
+            active_exec_count = e_status.get("active_positions_count", active_exec_count)
+
+            today_orders_file = f"data/execution_logs/orders_{today_str}.json"
+            if os.path.exists(today_orders_file):
+                with open(today_orders_file, "r", encoding="utf-8") as f:
+                    orders_log = json.load(f)
+                file_pnl = 0.0
+                file_wins = 0
+                file_stops = 0
+                for o in orders_log:
+                    if o.get("action") == "FULL_EXIT":
+                        pnl_val = float(o.get("total_realized_pnl", 0.0))
+                        file_pnl += pnl_val
+                        if pnl_val > 0:
+                            file_wins += 1
+                        elif pnl_val < 0:
+                            file_stops += 1
+                    elif o.get("target_1_hit") and float(o.get("realized_pnl", 0.0)) > 0:
+                        file_pnl += float(o.get("realized_pnl", 0.0))
+                        file_wins += 1
+                if file_wins > 0 or file_stops > 0:
+                    realized_pnl = file_pnl
+                    target_hits = file_wins
+                    stop_hits = file_stops
+                    theoretical_pnl = file_pnl
+        except Exception:
+            pass
 
         return {
             "timestamp": now_dt,
@@ -136,11 +214,11 @@ class PeriodicAnalysisReporter:
                 "low": float(nifty_info.get("low", nifty_p)),
                 "vwap": nifty_vwap,
                 "change_pct": float(nifty_info.get("change_pct", 0.0)),
-                "regime": nifty_regime.state.name if nifty_regime else "BALANCED_RANGE",
-                "regime_score": nifty_regime.trend_score if nifty_regime else 50.0,
-                "adx": nifty_regime.adx if nifty_regime else 20.0,
-                "pcr": float(nifty_chain.get("pcr", 1.0)),
-                "max_pain": float(nifty_chain.get("max_pain", 0.0)),
+                "regime": nifty_regime_name,
+                "regime_score": nifty_regime_score,
+                "adx": nifty_adx,
+                "pcr": nifty_pcr,
+                "max_pain": nifty_max_pain,
                 "net_gex": float(nifty_gex.get("net_gex", 0.0)),
                 "call_wall": float(nifty_gex.get("call_wall", 0.0)),
                 "call_wall_oi": int(nifty_gex.get("call_wall_oi", 0)),
@@ -163,11 +241,11 @@ class PeriodicAnalysisReporter:
                 "low": float(sensex_info.get("low", sensex_p)),
                 "vwap": sensex_vwap,
                 "change_pct": float(sensex_info.get("change_pct", 0.0)),
-                "regime": sensex_regime.state.name if sensex_regime else "BALANCED_RANGE",
-                "regime_score": sensex_regime.trend_score if sensex_regime else 50.0,
-                "adx": sensex_regime.adx if sensex_regime else 20.0,
-                "pcr": float(sensex_chain.get("pcr", 1.0)),
-                "max_pain": float(sensex_chain.get("max_pain", 0.0)),
+                "regime": sensex_regime_name,
+                "regime_score": sensex_regime_score,
+                "adx": sensex_adx,
+                "pcr": sensex_pcr,
+                "max_pain": sensex_max_pain,
                 "net_gex": float(sensex_gex.get("net_gex", 0.0)),
                 "call_wall": float(sensex_gex.get("call_wall", 0.0)),
                 "call_wall_oi": int(sensex_gex.get("call_wall_oi", 0)),
@@ -184,7 +262,7 @@ class PeriodicAnalysisReporter:
                 "gamma_regime": str(sensex_gex.get("regime_detail", "NEUTRAL"))
             },
             "performance": {
-                "active_count": len(active_running),
+                "active_count": active_exec_count,
                 "target_hits": target_hits,
                 "stop_hits": stop_hits,
                 "chase_blocked": chase_blocked,
@@ -250,14 +328,18 @@ class PeriodicAnalysisReporter:
             cw_gex = (raw_cw_gex / 1e7) if abs(raw_cw_gex) > 1e4 else raw_cw_gex
             cw_extra = f" [{cw_oi_str} | +{cw_gex:.1f} Cr]" if cw_oi_str else ""
             cw_dist = item.get("call_wall_dist", 0.0)
-            cw_dist_str = f"+{cw_dist:.0f} pts" if cw_dist >= 0 else f"{cw_dist:.0f} pts"
+            if cw_dist < 0:
+                cw_dist_str = f"+{abs(cw_dist):.0f} pts pierced"
+            else:
+                cw_dist_str = f"{cw_dist:.0f} pts away"
 
-            # Put Wall status
+            # Put Wall status & Tag
             pw_stat = item.get("put_wall_status", "ACTIVE_FLOOR")
-            if pw_stat == "BREACHED_DOWN":
+            pw_dist = item.get("put_wall_dist", 0.0)
+            if pw_stat == "BREACHED_DOWN" or pw_dist < 0:
                 pw_tag = "🚨 <b>CASCADE ACTIVE (CRACKED)</b>"
             elif pw_stat == "TESTING_FLOOR":
-                pw_tag = "⚠️ <b>UNDER SIEGE</b>"
+                pw_tag = "🛡️ <b>TESTING SUPPORT FLOOR</b>"
             elif item.get("put_wall_strength") == "FORTIFIED":
                 pw_tag = "🛡️ <b>FORTIFIED FLOOR</b>"
             else:
@@ -268,8 +350,13 @@ class PeriodicAnalysisReporter:
             raw_pw_gex = item.get("put_wall_gex", 0.0)
             pw_gex = (raw_pw_gex / 1e7) if abs(raw_pw_gex) > 1e4 else raw_pw_gex
             pw_extra = f" [{pw_oi_str} | -{pw_gex:.1f} Cr]" if pw_oi_str else ""
-            pw_dist = item.get("put_wall_dist", 0.0)
-            pw_dist_str = f"-{pw_dist:.0f} pts" if pw_dist >= 0 else f"+{abs(pw_dist):.0f} pts"
+            
+            if pw_dist > 0:
+                pw_dist_str = f"+{pw_dist:.0f} pts cushion"
+            elif pw_dist < 0:
+                pw_dist_str = f"-{abs(pw_dist):.0f} pts cracked"
+            else:
+                pw_dist_str = "at floor"
 
             return (
                 f"• <b>Net GEX:</b> <code>{net_gex:+.1f} Cr</code> {gex_regime_badge}\n"
@@ -394,10 +481,11 @@ class PeriodicAnalysisReporter:
 
         # 4. Anti-FOMO Re-Entry Blueprint
         poc = nf_vwap
+        target_strike = (call_wall + 50.0) if (call_wall > 0 and nf_p >= call_wall) else call_wall
         if p_bull >= 50.0:
             re_entry_protocol = (
                 f"If shaken out on wicks: Confirmed re-entry trigger is a 5-min candle close reclaiming "
-                f"VWAP ({poc:.0f}) or clearing {round(nf_p - 15, 0)}. Target: {call_wall:.0f}. "
+                f"VWAP ({poc:.0f}) or clearing {round(nf_p + 15, 0)}. Target: {target_strike:.0f}. "
                 f"Invalidation: 5-min body close below Put Wall ({put_wall:.0f})."
             )
         elif p_bear >= 50.0:
