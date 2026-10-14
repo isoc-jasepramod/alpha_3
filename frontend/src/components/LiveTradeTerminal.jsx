@@ -41,6 +41,8 @@ export function LiveTradeTerminal() {
     sensex_lots: 1
   });
   const [configSaving, setConfigSaving] = useState(false);
+  const [isConfigDirty, setIsConfigDirty] = useState(false);
+  const [initialConfigLoaded, setInitialConfigLoaded] = useState(false);
 
   // Fetch status, positions, orders
   const fetchData = useCallback(async () => {
@@ -53,14 +55,26 @@ export function LiveTradeTerminal() {
 
       if (statusRes) {
         setStatus(statusRes);
-        setConfig(prev => ({
-          ...prev,
-          allowed_strategies: statusRes.allowed_strategies || prev.allowed_strategies,
-          max_capital_per_trade: statusRes.max_capital_per_trade || prev.max_capital_per_trade,
-          max_daily_loss: statusRes.max_daily_loss || prev.max_daily_loss,
-          nifty_lots: statusRes.nifty_lots || prev.nifty_lots,
-          sensex_lots: statusRes.sensex_lots || prev.sensex_lots
-        }));
+        // Only initialize config on first load, or sync if user has not modified form and is not actively editing
+        if (!initialConfigLoaded) {
+          setConfig({
+            allowed_strategies: statusRes.allowed_strategies || ['OI_SQUEEZE', 'BREAKOUT_ORB', 'VWAP_EMA', 'SIMPLIFIED_VWAP_EMA', 'GAMMA_SCALP', 'MOMENTUM_IMPULSE'],
+            max_capital_per_trade: statusRes.max_capital_per_trade || 25000,
+            max_daily_loss: statusRes.max_daily_loss || 4000,
+            nifty_lots: statusRes.nifty_lots || 1,
+            sensex_lots: statusRes.sensex_lots || 1
+          });
+          setInitialConfigLoaded(true);
+        } else if (!isConfigDirty && activeSubTab !== 'config') {
+          setConfig(prev => ({
+            ...prev,
+            allowed_strategies: statusRes.allowed_strategies || prev.allowed_strategies,
+            max_capital_per_trade: statusRes.max_capital_per_trade || prev.max_capital_per_trade,
+            max_daily_loss: statusRes.max_daily_loss || prev.max_daily_loss,
+            nifty_lots: statusRes.nifty_lots || prev.nifty_lots,
+            sensex_lots: statusRes.sensex_lots || prev.sensex_lots
+          }));
+        }
       }
       if (Array.isArray(posRes)) setPositions(posRes);
       if (Array.isArray(ordRes)) setOrders(ordRes);
@@ -163,7 +177,18 @@ export function LiveTradeTerminal() {
         body: JSON.stringify(config)
       }).then(r => r.json());
       if (res.status === 'SUCCESS') {
+        setIsConfigDirty(false);
         setActionSuccess('Configuration saved and applied to runtime bridge.');
+        if (res.config) {
+          setStatus(prev => ({
+            ...prev,
+            allowed_strategies: res.config.allowed_strategies,
+            max_capital_per_trade: res.config.max_capital_per_trade,
+            max_daily_loss: res.config.max_daily_loss,
+            nifty_lots: res.config.nifty_lots,
+            sensex_lots: res.config.sensex_lots
+          }));
+        }
         setTimeout(() => setActionSuccess(null), 4000);
       }
     } catch (err) {
@@ -174,6 +199,7 @@ export function LiveTradeTerminal() {
   };
 
   const toggleStrategy = (stratName) => {
+    setIsConfigDirty(true);
     setConfig(prev => {
       const exists = prev.allowed_strategies.includes(stratName);
       const updated = exists 
@@ -739,7 +765,11 @@ export function LiveTradeTerminal() {
                 return (
                   <div
                     key={strat.id}
-                    onClick={() => toggleStrategy(strat.id)}
+                    onClick={(e) => {
+                      if (e.target.tagName !== 'INPUT') {
+                        toggleStrategy(strat.id);
+                      }
+                    }}
                     style={{
                       padding: '1rem',
                       borderRadius: 'var(--radius-sm)',
@@ -756,8 +786,8 @@ export function LiveTradeTerminal() {
                       <input 
                         type="checkbox" 
                         checked={isSelected} 
-                        onChange={() => {}} // handled by parent div onClick
-                        style={{ accentColor: 'var(--accent-cyan)' }}
+                        onChange={() => toggleStrategy(strat.id)}
+                        style={{ accentColor: 'var(--accent-cyan)', cursor: 'pointer', width: '16px', height: '16px' }}
                       />
                     </div>
                     <p style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.4rem' }}>
@@ -782,7 +812,10 @@ export function LiveTradeTerminal() {
                   min="1"
                   max="10"
                   value={config.nifty_lots}
-                  onChange={(e) => setConfig({ ...config, nifty_lots: parseInt(e.target.value) || 1 })}
+                  onChange={(e) => {
+                    setIsConfigDirty(true);
+                    setConfig({ ...config, nifty_lots: parseInt(e.target.value) || 1 });
+                  }}
                   style={{
                     width: '100%',
                     padding: '8px 12px',
@@ -804,7 +837,10 @@ export function LiveTradeTerminal() {
                   min="1"
                   max="10"
                   value={config.sensex_lots}
-                  onChange={(e) => setConfig({ ...config, sensex_lots: parseInt(e.target.value) || 1 })}
+                  onChange={(e) => {
+                    setIsConfigDirty(true);
+                    setConfig({ ...config, sensex_lots: parseInt(e.target.value) || 1 });
+                  }}
                   style={{
                     width: '100%',
                     padding: '8px 12px',
@@ -825,7 +861,10 @@ export function LiveTradeTerminal() {
                   type="number"
                   step="5000"
                   value={config.max_capital_per_trade}
-                  onChange={(e) => setConfig({ ...config, max_capital_per_trade: parseFloat(e.target.value) || 25000 })}
+                  onChange={(e) => {
+                    setIsConfigDirty(true);
+                    setConfig({ ...config, max_capital_per_trade: parseFloat(e.target.value) || 25000 });
+                  }}
                   style={{
                     width: '100%',
                     padding: '8px 12px',
@@ -846,7 +885,10 @@ export function LiveTradeTerminal() {
                   type="number"
                   step="1000"
                   value={config.max_daily_loss}
-                  onChange={(e) => setConfig({ ...config, max_daily_loss: parseFloat(e.target.value) || 4000 })}
+                  onChange={(e) => {
+                    setIsConfigDirty(true);
+                    setConfig({ ...config, max_daily_loss: parseFloat(e.target.value) || 4000 });
+                  }}
                   style={{
                     width: '100%',
                     padding: '8px 12px',
@@ -860,14 +902,26 @@ export function LiveTradeTerminal() {
               </div>
             </div>
 
-            <button
-              className="btn-primary"
-              onClick={handleSaveConfig}
-              disabled={configSaving}
-              style={{ marginTop: '1.25rem', padding: '8px 20px', fontSize: '0.85rem' }}
-            >
-              {configSaving ? 'Saving...' : 'Save Configuration'}
-            </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginTop: '1.25rem' }}>
+              <button
+                className="btn-primary"
+                onClick={handleSaveConfig}
+                disabled={configSaving}
+                style={{
+                  padding: '8px 20px',
+                  fontSize: '0.85rem',
+                  boxShadow: isConfigDirty ? '0 0 16px rgba(0, 240, 255, 0.4)' : undefined,
+                  border: isConfigDirty ? '1px solid var(--accent-cyan)' : undefined
+                }}
+              >
+                {configSaving ? 'Saving...' : 'Save Configuration'}
+              </button>
+              {isConfigDirty && (
+                <span style={{ fontSize: '0.8rem', color: 'var(--accent-amber)', fontWeight: '600' }}>
+                  ⚠️ Unsaved changes — click Save Configuration to apply
+                </span>
+              )}
+            </div>
           </div>
         </div>
       )}
