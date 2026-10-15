@@ -65,11 +65,17 @@ class SimplifiedPriceActionEngine(BaseStrategy):
         self.min_bottom_wick = float(cfg.get("min_bottom_wick_ratio", 0.35))
         self.min_top_wick = float(cfg.get("min_top_wick_ratio", 0.15))
 
-        # Macro Trend Veto: Block counter-trend setups in runaway directional sessions (default >= 1.20% from Open or Prior Close)
+        # Macro Trend Veto: Block counter-trend setups in runaway directional sessions (default >= 1.60% intraday from Open)
         self.macro_veto_enabled = bool(cfg.get("macro_veto_enabled", True))
-        self.macro_veto_pct = float(cfg.get("macro_veto_pct", 1.20))
+        self.macro_veto_pct = float(cfg.get("macro_veto_pct", 1.60))
         self.session_open_prices: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
         self.prior_close_prices: Dict[str, float] = {"NIFTY": 0.0, "SENSEX": 0.0}
+
+        # Pending setup timeout & strike tolerance parameters
+        self.pending_expiry_sec = float(cfg.get("pending_expiry_sec", 90.0))
+        self.atm_strike_step_multiplier = float(cfg.get("atm_strike_step_multiplier", 1.25))
+        self.spot_invalidation_nifty = float(cfg.get("spot_invalidation_nifty", 25.0))
+        self.spot_invalidation_sensex = float(cfg.get("spot_invalidation_sensex", 75.0))
 
         # Rubberband overextension guard (max allowed distance between spot close and EMA21)
         self.max_ema21_dist_nifty = float(cfg.get("max_ema21_dist_nifty", 35.0))
@@ -82,7 +88,7 @@ class SimplifiedPriceActionEngine(BaseStrategy):
         self._pause_until: Dict[str, float] = {}
 
         # Option RVOL Gate parameters
-        self.min_opt_rvol = float(cfg.get("min_opt_rvol", 1.20))
+        self.min_opt_rvol = float(cfg.get("min_opt_rvol", 0.80))
         self.require_opt_rvol = bool(cfg.get("require_opt_rvol", True))
 
         # Option volume trackers for RVOL computation
@@ -236,27 +242,27 @@ class SimplifiedPriceActionEngine(BaseStrategy):
                     aw_dir = awaiting["direction"]
                     sig_key = f"SIMPLIFIED_VWAP_{inst}_{aw_dir}"
 
-                    # Macro Trend Veto: Block counter-trend setups in extreme directional sessions
+                    # Macro Trend Veto: Block counter-trend setups in extreme runaway directional sessions
                     vetoed = False
                     if self.macro_veto_enabled:
                         open_p = self.session_open_prices.get(inst, 0.0)
-                        prior_p = self.prior_close_prices.get(inst, 0.0)
                         pct_open = ((c - open_p) / open_p * 100.0) if (open_p > 0) else 0.0
+                        prior_p = self.prior_close_prices.get(inst, 0.0)
                         pct_prior = ((c - prior_p) / prior_p * 100.0) if (prior_p > 0) else 0.0
 
-                        is_super_bull = (pct_open >= self.macro_veto_pct) or (pct_prior >= self.macro_veto_pct)
-                        is_super_bear = (pct_open <= -self.macro_veto_pct) or (pct_prior <= -self.macro_veto_pct)
+                        is_super_bull = (pct_open >= self.macro_veto_pct) or (pct_open >= 1.0 and pct_prior >= self.macro_veto_pct)
+                        is_super_bear = (pct_open <= -self.macro_veto_pct) or (pct_open <= -1.0 and pct_prior <= -self.macro_veto_pct)
 
                         if aw_dir == "PE" and is_super_bull:
-                            lead_pct = max(pct_open, pct_prior)
+                            lead_pct = pct_open if pct_open != 0 else pct_prior
                             logger.warning(
-                                f"🚫 [SIMPLIFIED VWAP_EMA] Macro Trend Veto: {inst} PE blocked! Market is +{lead_pct:.2f}% (Super-Bull trend >= +{self.macro_veto_pct}%)."
+                                f"🚫 [SIMPLIFIED VWAP_EMA] Macro Trend Veto: {inst} PE blocked! Intraday is +{lead_pct:.2f}% (Super-Bull trend >= +{self.macro_veto_pct}%)."
                             )
                             vetoed = True
                         elif aw_dir == "CE" and is_super_bear:
-                            lead_pct = min(pct_open, pct_prior)
+                            lead_pct = pct_open if pct_open != 0 else pct_prior
                             logger.warning(
-                                f"🚫 [SIMPLIFIED VWAP_EMA] Macro Trend Veto: {inst} CE blocked! Market is {lead_pct:.2f}% (Super-Bear trend <= -{self.macro_veto_pct}%)."
+                                f"🚫 [SIMPLIFIED VWAP_EMA] Macro Trend Veto: {inst} CE blocked! Intraday is {lead_pct:.2f}% (Super-Bear trend <= -{self.macro_veto_pct}%)."
                             )
                             vetoed = True
 
@@ -300,11 +306,11 @@ class SimplifiedPriceActionEngine(BaseStrategy):
                     veto_ce = False
                     if self.macro_veto_enabled:
                         open_p = self.session_open_prices.get(inst, 0.0)
-                        prior_p = self.prior_close_prices.get(inst, 0.0)
                         pct_open = ((c - open_p) / open_p * 100.0) if (open_p > 0) else 0.0
+                        prior_p = self.prior_close_prices.get(inst, 0.0)
                         pct_prior = ((c - prior_p) / prior_p * 100.0) if (prior_p > 0) else 0.0
-                        veto_pe = (pct_open >= self.macro_veto_pct) or (pct_prior >= self.macro_veto_pct)
-                        veto_ce = (pct_open <= -self.macro_veto_pct) or (pct_prior <= -self.macro_veto_pct)
+                        veto_pe = (pct_open >= self.macro_veto_pct) or (pct_open >= 1.0 and pct_prior >= self.macro_veto_pct)
+                        veto_ce = (pct_open <= -self.macro_veto_pct) or (pct_open <= -1.0 and pct_prior <= -self.macro_veto_pct)
 
                     # Bullish Rejection: Trend is UP (EMA9 > EMA21, c > VWAP), RSI healthy, bottom wick rejection
                     if not pause_ce and not veto_ce and e9 and e21 and e9 > e21 and c > v and bot_wick >= self.min_bottom_wick:
@@ -362,11 +368,11 @@ class SimplifiedPriceActionEngine(BaseStrategy):
         if not pending:
             return None
 
-        # Expire pending setup if older than 45 seconds, or ignore out-of-order past ticks
+        # Expire pending setup if older than pending_expiry_sec (90s default), or ignore out-of-order past ticks
         age = ts - pending["time"]
         if age < 0:
             return None
-        if age > 45.0:
+        if age > self.pending_expiry_sec:
             logger.info(f"⌛ [SIMPLIFIED VWAP_EMA] {inst} pending setup expired after {age:.1f}s without option RVOL.")
             self.pending_setup[inst] = None
             return None
@@ -380,7 +386,7 @@ class SimplifiedPriceActionEngine(BaseStrategy):
         custom_sl = pending["custom_sl"]
         p_dir = pending["direction"]
         if current_spot > 0:
-            spot_buffer = 15.0 if inst == "NIFTY" else 50.0
+            spot_buffer = self.spot_invalidation_nifty if inst == "NIFTY" else self.spot_invalidation_sensex
             if p_dir == "PE" and (current_spot >= custom_sl or current_spot > pending["spot"] + spot_buffer):
                 logger.warning(
                     f"❌ [SIMPLIFIED VWAP_EMA INVALIDATED] {inst} PE setup aborted! Spot moved to {current_spot:.1f} "
@@ -396,11 +402,11 @@ class SimplifiedPriceActionEngine(BaseStrategy):
                 self.pending_setup[inst] = None
                 return None
 
-        # Check if option is strictly ATM or near-ATM (within 0.75 strike step, e.g. <=37.5 pts for NIFTY, <=75 pts for SENSEX)
+        # Check if option is strictly ATM or near-ATM (within atm_strike_step_multiplier, e.g. <=62.5 pts for NIFTY, <=125 pts for SENSEX)
         offset = meta.get("offset")
         spot = self.spot_prices.get(inst, 0.0)
         step = 50.0 if inst == "NIFTY" else 100.0
-        max_dist = step * 0.75
+        max_dist = step * self.atm_strike_step_multiplier
 
         if offset is not None and abs(offset) > 1:
             return None

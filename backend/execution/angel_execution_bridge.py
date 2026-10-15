@@ -68,12 +68,49 @@ class AngelExecutionBridge:
         # Audit directory
         self.audit_dir = os.path.join(project_root, self.audit_log_dir)
         os.makedirs(self.audit_dir, exist_ok=True)
+        self._load_today_orders()
 
         logger.info(
             f"🛡️ [EXECUTION BRIDGE] Initialized. Mode: {self.mode} | "
             f"DryRun: {self.dry_run} | Capital Pool: ₹{self.risk_governor.total_capital:,.0f} | "
             f"KillSwitch: {'ACTIVE' if self.kill_switch_active else 'OFF'}"
         )
+
+    def _load_today_orders(self):
+        """Restores today's placed orders from JSON audit file if available."""
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        filepath = os.path.join(self.audit_dir, f"orders_{today_str}.json")
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+                for r in records:
+                    oid = r.get("order_id")
+                    if oid and not oid.startswith("DRY-EXIT-") and not oid.startswith("DRY-T1-"):
+                        self.placed_orders[oid] = r
+                    elif oid and (oid.startswith("DRY-EXIT-") or oid.startswith("DRY-T1-")):
+                        p_oid = r.get("parent_order_id")
+                        if p_oid and p_oid in self.placed_orders:
+                            self.placed_orders[p_oid]["status"] = "CLOSED"
+                            self.placed_orders[p_oid]["exit_price"] = r.get("exit_price")
+                            self.placed_orders[p_oid]["exit_reason"] = r.get("reason", "TARGET_HIT")
+                            self.placed_orders[p_oid]["total_realized_pnl"] = r.get("total_realized_pnl", 0.0)
+                            self.placed_orders[p_oid]["closed_at"] = r.get("timestamp")
+
+                # Restore still-open positions into active_positions & signal_to_order
+                for oid, ord_rec in self.placed_orders.items():
+                    sig_id = ord_rec.get("signal_id")
+                    if sig_id:
+                        self.signal_to_order[sig_id] = oid
+                    if ord_rec.get("status") == "FILLED":
+                        self.active_positions[sig_id] = ord_rec
+
+                total_pnl = sum(float(o.get("total_realized_pnl", 0.0)) for o in self.placed_orders.values())
+                if hasattr(self, "risk_governor") and self.risk_governor:
+                    self.risk_governor.realized_daily_pnl = round(total_pnl, 2)
+                logger.info(f"📁 [EXECUTION BRIDGE] Restored {len(self.placed_orders)} historical session orders ({len(self.active_positions)} active open, PnL: ₹{total_pnl:+.2f}) from {filepath}")
+            except Exception as e:
+                logger.warning(f"Could not restore session orders from {filepath}: {e}")
 
     def _load_config(self):
         """Loads execution configuration from settings.yaml."""
@@ -105,6 +142,32 @@ class AngelExecutionBridge:
         self.sensex_lots = int(cfg.get("sensex_lots", 1))
         if hasattr(self, "risk_governor") and self.risk_governor:
             self.risk_governor.load_config()
+
+    def save_config(self):
+        """Persists current runtime execution config to settings.yaml under 'execution' key."""
+        try:
+            full_cfg = {}
+            if os.path.exists(self.config_path):
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    full_cfg = yaml.safe_load(f) or {}
+            
+            exec_cfg = full_cfg.get("execution", {})
+            exec_cfg["enabled"] = self.enabled
+            exec_cfg["allowed_strategies"] = list(self.allowed_strategies)
+            exec_cfg["max_capital_per_trade"] = float(self.max_capital_per_trade)
+            exec_cfg["max_daily_loss"] = float(self.max_daily_loss)
+            exec_cfg["nifty_lots"] = int(self.nifty_lots)
+            exec_cfg["sensex_lots"] = int(self.sensex_lots)
+            if hasattr(self, "risk_governor") and self.risk_governor:
+                exec_cfg["total_capital"] = float(self.risk_governor.total_capital)
+                exec_cfg["force_single_lot"] = bool(self.risk_governor.force_single_lot)
+            
+            full_cfg["execution"] = exec_cfg
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                yaml.dump(full_cfg, f, default_flow_style=False, sort_keys=False)
+            logger.info(f"💾 [EXECUTION BRIDGE] Configuration successfully saved to {self.config_path}")
+        except Exception as e:
+            logger.error(f"Failed to persist execution config: {e}")
 
     def activate_kill_switch(self, reason: str = "Manual / Automated Trigger"):
         """Instantly activates the emergency kill switch, blocking all new orders."""

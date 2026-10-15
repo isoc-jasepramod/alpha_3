@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
 from loguru import logger
 from sqlalchemy import select, update
@@ -47,6 +47,13 @@ class SignalTracker:
         self.active_signals: Dict[str, Dict[str, Any]] = {} # signal_id -> signal_dict
         self.runaway_profiles = _load_runaway_profiles()
 
+        # Cumulative today's Advisory metrics
+        self.today_theoretical_pnl: float = 0.0
+        self.today_signals_count: int = 0
+        self.today_target_hits: int = 0
+        self.today_stop_hits: int = 0
+        self.today_chase_prevented: int = 0
+
         # Resolution callback registry — strategies can register to receive outcome notifications
         self._resolution_callbacks = []
 
@@ -55,28 +62,53 @@ class SignalTracker:
         self._resolution_callbacks.append(callback)
 
     async def restore_from_db(self):
-        """Restores recent signals created today so active cards and recent outcomes survive server restarts."""
+        """
+        Restores today's signals created in IST and calculates the exact cumulative
+        theoretical PnL from PostgreSQL so that metrics survive any backend restart.
+        """
         try:
             async with AsyncSessionLocal() as session:
-                today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-                stmt = select(Signal).where(Signal.created_at >= today_start).order_by(Signal.created_at.desc()).limit(20)
+                ist = timezone(timedelta(hours=5, minutes=30))
+                now_ist = datetime.now(ist)
+                today_ist = now_ist.date()
+                start_ist = datetime(today_ist.year, today_ist.month, today_ist.day, 0, 0, 0, tzinfo=ist)
+                start_utc = start_ist.astimezone(timezone.utc)
+                end_utc = (start_ist + timedelta(days=1)).astimezone(timezone.utc)
+
+                # Query ALL signals created today in IST
+                stmt = select(Signal).where(Signal.created_at >= start_utc, Signal.created_at < end_utc).order_by(Signal.created_at.asc())
                 res = await session.execute(stmt)
                 records = res.scalars().all()
+
+                self.today_signals_count = len(records)
+                self.today_target_hits = sum(1 for r in records if r.status == "TARGET_HIT")
+                self.today_stop_hits = sum(1 for r in records if r.status == "STOP_HIT")
+                self.today_chase_prevented = sum(1 for r in records if r.status == "INVALID_CHASE_PREVENTED")
+                self.today_theoretical_pnl = round(sum(float(r.theoretical_pnl or 0.0) for r in records), 2)
+
+                # Reconcile risk governor realized PnL with true today's database total
+                if self.risk_governor:
+                    self.risk_governor.realized_daily_pnl = self.today_theoretical_pnl
+
                 restored_count = 0
                 now_ts = datetime.now(timezone.utc).timestamp()
-                for rec in reversed(records):
+                for rec in records:
                     d = rec.to_dict()
                     sig_id = d["signal_id"]
                     status = d.get("status", "ACTIVE")
                     res_ts = rec.resolved_at.timestamp() if rec.resolved_at else d.get("resolved_ts")
-                    if status == "ACTIVE" or (res_ts and (now_ts - res_ts) <= 1800):
+                    # Keep active signals or signals resolved in the past 45 minutes
+                    if status == "ACTIVE" or (res_ts and (now_ts - res_ts) <= 2700):
                         d["resolved_ts"] = res_ts
                         d["registered_ts"] = d.get("registered_ts") or (rec.created_at.timestamp() if rec.created_at else now_ts)
                         d["live_ltp"] = d.get("exit_price") or d.get("entry_price")
                         self.active_signals[sig_id] = d
                         restored_count += 1
-                if restored_count > 0:
-                    logger.info(f"🔄 Restored {restored_count} today's signal(s) from database into live tracker.")
+
+                logger.info(
+                    f"🔄 [SIGNAL TRACKER] Restored {restored_count} active/recent cards from {len(records)} today's ({today_ist}) signals. "
+                    f"Today Theoretical PnL: ₹{self.today_theoretical_pnl:+.2f} (Wins: {self.today_target_hits}, Losses: {self.today_stop_hits}, Chase Prevented: {self.today_chase_prevented})."
+                )
         except Exception as e:
             logger.warning(f"Could not restore signals from database: {e}")
 
@@ -94,6 +126,7 @@ class SignalTracker:
         sig["live_ltp"] = signal["entry_price"]
         sig["deviation_pct"] = 0.0
         self.active_signals[sig_id] = sig
+        self.today_signals_count += 1
 
         surge_pct, window_sec = self._get_runaway_params(sig)
         logger.info(
@@ -246,6 +279,14 @@ class SignalTracker:
         # Process resolutions - keep in active_signals so card stays displayed on screen!
         for sig_id, sig, pnl in resolved_signals:
             self.active_signals[sig_id] = sig
+            self.today_theoretical_pnl = round(self.today_theoretical_pnl + pnl, 2)
+            st = sig.get("status")
+            if st == "TARGET_HIT":
+                self.today_target_hits += 1
+            elif st == "STOP_HIT":
+                self.today_stop_hits += 1
+            elif st == "INVALID_CHASE_PREVENTED":
+                self.today_chase_prevented += 1
 
             # Update Risk Governor realized PnL
             if pnl != 0.0:

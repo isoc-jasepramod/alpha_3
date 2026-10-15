@@ -199,7 +199,7 @@ export default function App() {
       ) : activeTab === 'journal' ? (
         <SignalHistoryTable />
       ) : (
-        <LiveTradeTerminal />
+        <LiveTradeTerminal activeSignals={activeSignals} />
       )}
 
       {/* Market Replay Modal */}

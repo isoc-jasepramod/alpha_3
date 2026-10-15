@@ -77,19 +77,23 @@ class PeriodicAnalysisReporter:
         sensex_p = float(sensex_info.get("ltp") or getattr(self.server, "sensex_spot", 0.0))
 
         # 2. VWAP
-        regime_vwaps = getattr(self.server, "regime_vwap", {})
-        nifty_vwap = regime_vwaps.get("NIFTY").value if regime_vwaps.get("NIFTY") else None
-        sensex_vwap = regime_vwaps.get("SENSEX").value if regime_vwaps.get("SENSEX") else None
+        regime_vwaps = getattr(self.server, "regime_vwap", {}) if self.server else {}
+        n_vwap_obj = regime_vwaps.get("NIFTY") if isinstance(regime_vwaps, dict) else None
+        s_vwap_obj = regime_vwaps.get("SENSEX") if isinstance(regime_vwaps, dict) else None
+        nifty_vwap = getattr(n_vwap_obj, "value", None) if n_vwap_obj else None
+        sensex_vwap = getattr(s_vwap_obj, "value", None) if s_vwap_obj else None
 
         # 3. Regime Filter
         rf = getattr(self.server, "regime_filter", None)
-        nifty_regime = rf.regimes.get("NIFTY") if rf else None
-        sensex_regime = rf.regimes.get("SENSEX") if rf else None
+        rf_dict = getattr(rf, "latest_regime", None) or getattr(rf, "regimes", {}) if rf else {}
+        nifty_regime = rf_dict.get("NIFTY") if isinstance(rf_dict, dict) else None
+        sensex_regime = rf_dict.get("SENSEX") if isinstance(rf_dict, dict) else None
 
         # 4. Option Chain Metrics
         cp = getattr(self.server, "chain_poller", None)
-        nifty_chain = cp.chain_metrics.get("NIFTY", {}) if cp else {}
-        sensex_chain = cp.chain_metrics.get("SENSEX", {}) if cp else {}
+        cp_metrics = getattr(cp, "chain_metrics", {}) if cp else {}
+        nifty_chain = cp_metrics.get("NIFTY", {}) if isinstance(cp_metrics, dict) else {}
+        sensex_chain = cp_metrics.get("SENSEX", {}) if isinstance(cp_metrics, dict) else {}
 
         # 5. Signal Tracker & Performance
         st = getattr(self.server, "signal_tracker", None)
@@ -143,14 +147,32 @@ class PeriodicAnalysisReporter:
         # Regime fallback from telemetry
         t_regimes = t_data.get("regimes", {})
         n_reg = t_regimes.get("NIFTY", {})
-        nifty_regime_name = nifty_regime.state.name if nifty_regime else n_reg.get("regime", "BALANCED_RANGE")
-        nifty_regime_score = nifty_regime.trend_score if nifty_regime else float(n_reg.get("score", 50.0))
-        nifty_adx = nifty_regime.adx if nifty_regime else float(n_reg.get("adx_value", 20.0))
+        if isinstance(nifty_regime, dict):
+            nifty_regime_name = nifty_regime.get("regime") or n_reg.get("regime", "BALANCED_RANGE")
+            nifty_regime_score = float(nifty_regime.get("score") or n_reg.get("score", 50.0))
+            nifty_adx = float(nifty_regime.get("adx_value") or nifty_regime.get("adx") or n_reg.get("adx_value", 20.0))
+        elif nifty_regime:
+            nifty_regime_name = getattr(getattr(nifty_regime, "state", None), "name", None) or n_reg.get("regime", "BALANCED_RANGE")
+            nifty_regime_score = getattr(nifty_regime, "trend_score", 50.0)
+            nifty_adx = getattr(nifty_regime, "adx", 20.0)
+        else:
+            nifty_regime_name = n_reg.get("regime", "BALANCED_RANGE")
+            nifty_regime_score = float(n_reg.get("score", 50.0))
+            nifty_adx = float(n_reg.get("adx_value", 20.0))
 
         s_reg = t_regimes.get("SENSEX", {})
-        sensex_regime_name = sensex_regime.state.name if sensex_regime else s_reg.get("regime", "BALANCED_RANGE")
-        sensex_regime_score = sensex_regime.trend_score if sensex_regime else float(s_reg.get("score", 50.0))
-        sensex_adx = sensex_regime.adx if sensex_regime else float(s_reg.get("adx_value", 20.0))
+        if isinstance(sensex_regime, dict):
+            sensex_regime_name = sensex_regime.get("regime") or s_reg.get("regime", "BALANCED_RANGE")
+            sensex_regime_score = float(sensex_regime.get("score") or s_reg.get("score", 50.0))
+            sensex_adx = float(sensex_regime.get("adx_value") or sensex_regime.get("adx") or s_reg.get("adx_value", 20.0))
+        elif sensex_regime:
+            sensex_regime_name = getattr(getattr(sensex_regime, "state", None), "name", None) or s_reg.get("regime", "BALANCED_RANGE")
+            sensex_regime_score = getattr(sensex_regime, "trend_score", 50.0)
+            sensex_adx = getattr(sensex_regime, "adx", 20.0)
+        else:
+            sensex_regime_name = s_reg.get("regime", "BALANCED_RANGE")
+            sensex_regime_score = float(s_reg.get("score", 50.0))
+            sensex_adx = float(s_reg.get("adx_value", 20.0))
 
         # Robust VWAP fallback: compute typical price approximation if server object missing
         if not nifty_vwap or nifty_vwap <= 0:

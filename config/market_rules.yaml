@@ -202,8 +202,14 @@ strategies:
     rsi_pe_max: 50.0
     min_bottom_wick_ratio: 0.35
     min_top_wick_ratio: 0.15
-    min_opt_rvol: 1.20
+    macro_veto_enabled: true
+    macro_veto_pct: 1.60            # Raised from 1.20% to 1.60% (intraday)
+    min_opt_rvol: 0.80              # Relaxed from 1.20x to 0.80x
     require_opt_rvol: true
+    pending_expiry_sec: 90.0        # Extended from 45.0s to 90.0s
+    atm_strike_step_multiplier: 1.25 # Widened from 0.75x to 1.25x
+    spot_invalidation_nifty: 25.0   # Widened from 15.0 to 25.0 pts
+    spot_invalidation_sensex: 75.0  # Widened from 50.0 to 75.0 pts
     max_ema21_dist_nifty: 35.0
     max_ema21_dist_sensex: 100.0
     max_consecutive_stops_dir: 2

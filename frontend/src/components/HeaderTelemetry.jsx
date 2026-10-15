@@ -10,8 +10,8 @@ export function HeaderTelemetry({
   onToggleSound,
   onOpenReplay
 }) {
-  const pnl = telemetry.realized_pnl || 0.0;
-  const pnlPct = telemetry.realized_pnl_pct || 0.0;
+  const pnl = telemetry.theoretical_pnl !== undefined ? telemetry.theoretical_pnl : (telemetry.realized_pnl || 0.0);
+  const pnlPct = telemetry.theoretical_pnl_pct !== undefined ? telemetry.theoretical_pnl_pct : (telemetry.realized_pnl_pct || 0.0);
   const isPos = pnl >= 0;
   const isTripped = telemetry.circuit_breaker_tripped;
 

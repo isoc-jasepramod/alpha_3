@@ -3,11 +3,30 @@ import { History, RefreshCw, CheckCircle2, XCircle, AlertTriangle, Timer } from 
 
 export function SignalHistoryTable() {
   const [history, setHistory] = useState([]);
+  const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [dateFilter, setDateFilter] = useState('today'); // 'today' | 'all'
+
+  const fetchSummary = async () => {
+    try {
+      const res = await fetch('/api/signals/today-summary');
+      if (res.ok) {
+        const data = await res.json();
+        setSummary(data);
+      }
+    } catch (e) {
+      console.error('Failed to fetch summary:', e);
+    }
+  };
 
   const fetchHistory = async () => {
     try {
-      const res = await fetch('/api/signals/history?limit=30');
+      setLoading(true);
+      fetchSummary();
+      const url = dateFilter === 'today'
+        ? '/api/signals/history?limit=100&date_filter=today'
+        : '/api/signals/history?limit=100';
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
         setHistory(data);
@@ -23,25 +42,114 @@ export function SignalHistoryTable() {
     fetchHistory();
     const interval = setInterval(fetchHistory, 4000);
     return () => clearInterval(interval);
-  }, []);
+  }, [dateFilter]);
+
+  const todayPnl = summary?.theoretical_pnl !== undefined
+    ? summary.theoretical_pnl
+    : history.reduce((acc, h) => acc + (h.theoretical_pnl || 0), 0);
+  const isPos = todayPnl >= 0;
 
   return (
     <div className="glass-panel" style={{ padding: '1.25rem' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+      {/* Header & Controls */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.75rem' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <History size={16} color="var(--accent-cyan)" />
-          <h3 style={{ fontSize: '1rem', fontWeight: '700' }}>Advisory Signal Journal (PostgreSQL)</h3>
+          <History size={18} color="var(--accent-cyan)" />
+          <h3 style={{ fontSize: '1.05rem', fontWeight: '700' }}>Advisory Signal Journal (PostgreSQL)</h3>
         </div>
-        <button className="btn-secondary" onClick={fetchHistory} disabled={loading}>
-          <RefreshCw size={13} className={loading ? 'pulse-indicator' : ''} />
-          <span>Refresh</span>
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <div style={{ display: 'flex', background: 'rgba(0,0,0,0.3)', borderRadius: 'var(--radius-sm)', padding: '2px', border: '1px solid var(--border-subtle)' }}>
+            <button
+              className="btn-secondary"
+              style={{
+                padding: '3px 10px',
+                fontSize: '0.72rem',
+                border: 'none',
+                background: dateFilter === 'today' ? 'rgba(0, 240, 255, 0.15)' : 'transparent',
+                color: dateFilter === 'today' ? 'var(--accent-cyan)' : 'var(--text-muted)'
+              }}
+              onClick={() => setDateFilter('today')}
+            >
+              Today ({summary?.total_signals || history.length})
+            </button>
+            <button
+              className="btn-secondary"
+              style={{
+                padding: '3px 10px',
+                fontSize: '0.72rem',
+                border: 'none',
+                background: dateFilter === 'all' ? 'rgba(0, 240, 255, 0.15)' : 'transparent',
+                color: dateFilter === 'all' ? 'var(--accent-cyan)' : 'var(--text-muted)'
+              }}
+              onClick={() => setDateFilter('all')}
+            >
+              All Records
+            </button>
+          </div>
+          <button className="btn-secondary" onClick={fetchHistory} disabled={loading} style={{ padding: '4px 10px' }}>
+            <RefreshCw size={13} className={loading ? 'pulse-indicator' : ''} />
+            <span style={{ fontSize: '0.75rem' }}>Refresh</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Executive Summary Metrics Card */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gap: '0.75rem',
+        marginBottom: '1.25rem',
+        padding: '0.9rem',
+        background: 'rgba(255,255,255,0.02)',
+        borderRadius: 'var(--radius-md)',
+        border: '1px solid var(--border-subtle)'
+      }}>
+        <div>
+          <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            TODAY'S THEORETICAL PNL
+          </div>
+          <div className="mono" style={{ fontSize: '1.35rem', fontWeight: '800', color: isPos ? 'var(--ce-green)' : 'var(--pe-red)', marginTop: '2px' }}>
+            {isPos ? '+' : ''}₹{todayPnl.toFixed(2)}
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            TRADING DAY (IST)
+          </div>
+          <div style={{ fontSize: '0.95rem', fontWeight: '600', color: 'var(--text-primary)', marginTop: '4px' }}>
+            {summary?.date || new Date().toISOString().split('T')[0]} (Today)
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            OUTCOMES (W / L)
+          </div>
+          <div style={{ fontSize: '0.82rem', fontWeight: '600', display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px' }}>
+            <span style={{ color: 'var(--ce-green)' }}>{summary?.target_hits ?? 0} Hits</span>
+            <span style={{ color: 'var(--text-muted)' }}>/</span>
+            <span style={{ color: 'var(--pe-red)' }}>{summary?.stop_hits ?? 0} Stops</span>
+            <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem' }}>
+              ({summary?.win_rate ?? 0}% Win Rate)
+            </span>
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            CHASE GUARDED
+          </div>
+          <div style={{ fontSize: '0.85rem', fontWeight: '600', color: 'var(--accent-amber)', marginTop: '4px' }}>
+            {summary?.chase_prevented ?? 0} Saved Exits
+          </div>
+        </div>
       </div>
 
       <div className="table-container">
         {history.length === 0 ? (
           <p style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            No journal entries recorded yet today. Signals will appear here as they are generated and resolved.
+            No journal entries recorded for {dateFilter === 'today' ? 'today' : 'the selected filter'} yet. Signals will appear here as they are generated and resolved.
           </p>
         ) : (
           <table className="journal-table">
