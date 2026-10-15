@@ -279,7 +279,33 @@ async def get_execution_orders(date_str: Optional[str] = None):
                 o = dict(ord)
                 meta = o.get("metadata") or {}
                 broker = o.get("broker_payload") or {}
-                o["timestamp"] = o.get("closed_at") or o.get("filled_at") or o.get("placed_at")
+                entry_t = o.get("filled_at") or o.get("placed_at")
+                exit_t = o.get("closed_at")
+                o["entry_time"] = entry_t
+                o["exit_time"] = exit_t
+                o["timestamp"] = exit_t or entry_t
+
+                # Duration calculation
+                dur_sec, dur_str = None, None
+                if entry_t and exit_t:
+                    try:
+                        t1 = datetime.fromisoformat(entry_t)
+                        t2 = datetime.fromisoformat(exit_t)
+                        dur_sec = int(abs((t2 - t1).total_seconds()))
+                        if dur_sec < 60:
+                            dur_str = f"{dur_sec}s"
+                        elif dur_sec < 3600:
+                            m, s = divmod(dur_sec, 60)
+                            dur_str = f"{m}m {s}s" if s > 0 else f"{m}m"
+                        else:
+                            h, rem = divmod(dur_sec, 3600)
+                            m = rem // 60
+                            dur_str = f"{h}h {m}m"
+                    except Exception:
+                        pass
+                o["duration_seconds"] = dur_sec
+                o["duration_str"] = dur_str
+
                 o["symbol"] = o.get("symbol") or meta.get("option_symbol") or broker.get("tradingsymbol") or "-"
                 o["direction"] = o.get("direction") or meta.get("direction") or ("PE" if str(o["symbol"]).endswith("PE") else "CE")
                 o["action"] = o.get("action") or broker.get("transactiontype") or "BUY"
@@ -300,7 +326,32 @@ async def get_execution_orders(date_str: Optional[str] = None):
         o = dict(ord)
         meta = o.get("metadata") or {}
         broker = o.get("broker_payload") or {}
-        o["timestamp"] = o.get("closed_at") or o.get("filled_at") or o.get("placed_at")
+        entry_t = o.get("filled_at") or o.get("placed_at")
+        exit_t = o.get("closed_at")
+        o["entry_time"] = entry_t
+        o["exit_time"] = exit_t
+        o["timestamp"] = exit_t or entry_t
+
+        dur_sec, dur_str = None, None
+        if entry_t and exit_t:
+            try:
+                t1 = datetime.fromisoformat(entry_t)
+                t2 = datetime.fromisoformat(exit_t)
+                dur_sec = int(abs((t2 - t1).total_seconds()))
+                if dur_sec < 60:
+                    dur_str = f"{dur_sec}s"
+                elif dur_sec < 3600:
+                    m, s = divmod(dur_sec, 60)
+                    dur_str = f"{m}m {s}s" if s > 0 else f"{m}m"
+                else:
+                    h, rem = divmod(dur_sec, 3600)
+                    m = rem // 60
+                    dur_str = f"{h}h {m}m"
+            except Exception:
+                pass
+        o["duration_seconds"] = dur_sec
+        o["duration_str"] = dur_str
+
         o["symbol"] = o.get("symbol") or meta.get("option_symbol") or broker.get("tradingsymbol") or "-"
         o["direction"] = o.get("direction") or meta.get("direction") or ("PE" if str(o["symbol"]).endswith("PE") else "CE")
         o["action"] = o.get("action") or broker.get("transactiontype") or "BUY"
@@ -336,8 +387,16 @@ async def get_execution_daily_summary():
             win_rate = round((len(wins) / decided * 100.0), 1) if decided > 0 else 0.0
             profit_factor = round(abs(gross_win / gross_loss), 2) if gross_loss != 0 else 0.0
 
+            # Session timing (first entry & last exit)
+            entry_timestamps = [r.get("filled_at") or r.get("placed_at") for r in orders if r.get("filled_at") or r.get("placed_at")]
+            exit_timestamps = [r.get("timestamp") for r in exits if r.get("timestamp")]
+            first_entry_time = min(entry_timestamps) if entry_timestamps else None
+            last_exit_time = max(exit_timestamps) if exit_timestamps else None
+
             summaries.append({
                 "date": d_str,
+                "first_entry_time": first_entry_time,
+                "last_exit_time": last_exit_time,
                 "orders_count": len(orders),
                 "trades_count": len(exits),
                 "wins": len(wins),

@@ -861,11 +861,14 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-muted)', textAlign: 'left' }}>
                   <th style={{ padding: '8px' }}>Order ID</th>
-                  <th style={{ padding: '8px' }}>Time</th>
+                  <th style={{ padding: '8px' }}>Entry Time</th>
+                  <th style={{ padding: '8px' }}>Exit Time</th>
+                  <th style={{ padding: '8px' }}>Duration</th>
                   <th style={{ padding: '8px' }}>Symbol</th>
                   <th style={{ padding: '8px' }}>Type</th>
                   <th style={{ padding: '8px' }}>Qty</th>
                   <th style={{ padding: '8px' }}>Fill Price</th>
+                  <th style={{ padding: '8px' }}>Exit Price</th>
                   <th style={{ padding: '8px' }}>Status</th>
                   <th style={{ padding: '8px' }}>Realized P&L</th>
                 </tr>
@@ -874,20 +877,45 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                 {orders.map((ord, idx) => {
                   const meta = ord.metadata || {};
                   const broker = ord.broker_payload || {};
-                  const timeVal = ord.timestamp || ord.closed_at || ord.filled_at || ord.placed_at;
-                  const timeStr = timeVal ? new Date(timeVal).toLocaleTimeString() : '-';
+                  const entryVal = ord.entry_time || ord.filled_at || ord.placed_at;
+                  const entryStr = entryVal ? new Date(entryVal).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '-';
+                  const exitVal = ord.exit_time || ord.closed_at;
+                  const exitStr = exitVal ? new Date(exitVal).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : null;
                   const sym = ord.symbol || ord.option_symbol || broker.tradingsymbol || meta.option_symbol || '-';
                   const dir = ord.direction || meta.direction || (sym.endsWith('PE') ? 'PE' : 'CE');
                   const actionType = ord.action || broker.transactiontype || 'BUY';
                   const qtyVal = ord.quantity || ord.quantity_sold || meta.quantity || '-';
-                  const fillVal = ord.fill_price || ord.exit_price || meta.expected_entry || '-';
+                  const fillVal = ord.fill_price || meta.expected_entry || '-';
+                  const exitPriceVal = ord.exit_price;
                   const pnl = ord.total_realized_pnl !== undefined ? ord.total_realized_pnl : (ord.realized_pnl !== undefined ? ord.realized_pnl : 0);
                   const isProfit = pnl >= 0;
 
                   return (
                     <tr key={ord.order_id || idx} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
                       <td className="mono" style={{ padding: '8px', color: 'var(--accent-cyan)' }}>{ord.order_id}</td>
-                      <td style={{ padding: '8px', color: 'var(--text-muted)' }}>{timeStr}</td>
+                      <td className="mono" style={{ padding: '8px', color: 'var(--text-primary)', whiteSpace: 'nowrap' }}>{entryStr}</td>
+                      <td className="mono" style={{ padding: '8px', whiteSpace: 'nowrap' }}>
+                        {exitStr ? (
+                          <span style={{ color: 'var(--text-secondary)' }}>{exitStr}</span>
+                        ) : (
+                          <span style={{ color: 'var(--accent-cyan)', fontSize: '0.7rem', fontWeight: '600' }}>HOLDING</span>
+                        )}
+                      </td>
+                      <td className="mono" style={{ padding: '8px', color: 'var(--text-muted)', fontSize: '0.72rem' }}>
+                        {ord.duration_str ? (
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: 'var(--radius-sm)',
+                            background: 'rgba(255, 255, 255, 0.05)',
+                            color: 'var(--accent-cyan)',
+                            fontWeight: '600'
+                          }}>
+                            {ord.duration_str}
+                          </span>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
                       <td style={{ padding: '8px', fontWeight: '600' }}>{sym}</td>
                       <td style={{ padding: '8px' }}>
                         <span style={{
@@ -903,6 +931,9 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                       </td>
                       <td className="mono" style={{ padding: '8px' }}>{qtyVal}</td>
                       <td className="mono" style={{ padding: '8px' }}>₹{typeof fillVal === 'number' ? fillVal.toFixed(2) : fillVal}</td>
+                      <td className="mono" style={{ padding: '8px', color: exitPriceVal ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                        {exitPriceVal !== undefined && exitPriceVal !== null ? `₹${Number(exitPriceVal).toFixed(2)}` : '—'}
+                      </td>
                       <td style={{ padding: '8px' }}>
                         {ord.status === 'FILLED' && !ord.exit_reason ? (
                           <span style={{
@@ -1070,6 +1101,7 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                   <thead>
                     <tr style={{ borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-muted)', textAlign: 'left' }}>
                       <th style={{ padding: '10px 8px' }}>Date</th>
+                      <th style={{ padding: '10px 8px' }}>Trading Window (Entry → Exit)</th>
                       <th style={{ padding: '10px 8px' }}>Trades (Exits)</th>
                       <th style={{ padding: '10px 8px' }}>Wins / Losses</th>
                       <th style={{ padding: '10px 8px' }}>Win Rate</th>
@@ -1106,6 +1138,23 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                                 </span>
                               )}
                             </div>
+                          </td>
+
+                          <td style={{ padding: '10px 8px' }}>
+                            {day.first_entry_time && day.last_exit_time ? (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.74rem' }}>
+                                <Clock size={12} color="var(--accent-cyan)" />
+                                <span className="mono" style={{ color: 'var(--text-primary)', fontWeight: '600' }}>
+                                  {new Date(day.first_entry_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                                </span>
+                                <span style={{ color: 'var(--text-muted)' }}>→</span>
+                                <span className="mono" style={{ color: 'var(--text-secondary)' }}>
+                                  {new Date(day.last_exit_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                                </span>
+                              </div>
+                            ) : (
+                              <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem' }}>—</span>
+                            )}
                           </td>
 
                           <td className="mono" style={{ padding: '10px 8px' }}>
