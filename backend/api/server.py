@@ -53,7 +53,11 @@ class EngineCoordinator:
         self.auth = AngelOneAuth()
         self.telegram = TelegramNotifier()
         self.periodic_reporter = PeriodicAnalysisReporter(self)
-        self.execution_bridge = AngelExecutionBridge(auth=self.auth, redis_bus=self.redis_bus, force_dry_run=False)
+        # DELIBERATE RE-ARM: the bridge ALWAYS boots in PAPER (force_dry_run hard-forces it in
+        # _load_config, ignoring whatever mode is on disk). Going LIVE is a per-session action via
+        # POST /api/execution/mode?mode=LIVE (set_execution_mode flips force_dry_run off at runtime).
+        # Live state is never persisted, so a restart always comes back up safe and must be re-armed.
+        self.execution_bridge = AngelExecutionBridge(auth=self.auth, redis_bus=self.redis_bus, force_dry_run=True)
         self.ws_client: Optional[SmartAPIWebSocketClient] = None
         
         # Load strategy configuration
@@ -133,6 +137,9 @@ class EngineCoordinator:
 
         self.running = False
         self.tasks: List[asyncio.Task] = []
+        # Ephemeral per-order execution tasks (fire-and-forget so the tick loop never stalls
+        # on a live fill-confirmation poll). Held in a set to prevent premature GC.
+        self._execution_tasks: set = set()
         self.token_meta_cache: Dict[str, Dict[str, Any]] = {}
         self.nifty_spot = 23346.4
         self.sensex_spot = 74294.96
@@ -599,6 +606,10 @@ class EngineCoordinator:
         self.tasks.append(asyncio.create_task(self._throttle_broadcast_loop()))
         self.tasks.append(asyncio.create_task(self._signals_listener_loop()))
         self.tasks.append(asyncio.create_task(self._eod_sweep_scheduler()))
+        # Reconcile in-memory positions against the broker on startup and periodically so local
+        # state can't silently diverge from reality (no-op in paper / when unauthenticated).
+        if hasattr(self, "execution_bridge") and self.execution_bridge:
+            self.tasks.append(asyncio.create_task(self._broker_reconciliation_loop()))
         # Breadth poller feeds Regime Filter v2's participation dimension (A/B, non-gating).
         if self.regime_v2_enabled and getattr(self.regime_filter_v2, "use_participation", False):
             self.tasks.append(asyncio.create_task(self.breadth_poller.start()))
@@ -914,22 +925,54 @@ class EngineCoordinator:
             "signal": evaluated_sig
         })
 
-        # Order Execution: Validate risk gates and route order (Paper or Live)
+        # Order Execution: route order WITHOUT blocking the tick pipeline.
+        # execute_signal can poll the broker for up to limit_timeout_sec on a live order; awaiting
+        # it inline here would freeze tick consumption (and thus stop/target monitoring of all open
+        # positions) for that whole window. Dispatch as a background task so the tick loop keeps
+        # flowing; the task is held in a set so it isn't garbage-collected mid-flight.
         if hasattr(self, "execution_bridge") and self.execution_bridge:
+            task = asyncio.create_task(self._dispatch_execution(evaluated_sig))
+            self._execution_tasks.add(task)
+            task.add_done_callback(self._execution_tasks.discard)
+
+    async def _dispatch_execution(self, evaluated_sig: Dict[str, Any]):
+        """Runs the execution bridge for one signal off the tick loop's critical path."""
+        try:
+            exec_res = await self.execution_bridge.execute_signal(evaluated_sig)
+            if exec_res and exec_res.get("status") == "REJECTED":
+                logger.warning(f"⚠️ Order unplaced for {evaluated_sig.get('signal_id')}: {exec_res.get('reason')}")
+                if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
+                    await self.telegram.notify_order_rejected({
+                        "signal_id": evaluated_sig.get("signal_id"),
+                        "instrument": evaluated_sig.get("instrument"),
+                        "option_symbol": evaluated_sig.get("option_symbol"),
+                        "reason": exec_res.get("reason"),
+                        "mode": self.execution_bridge.mode
+                    })
+        except Exception as e:
+            logger.error(f"Execution bridge error for signal {evaluated_sig.get('signal_id')}: {e}")
+
+    async def _broker_reconciliation_loop(self, interval_sec: int = 60):
+        """
+        Periodically reconciles the execution bridge's in-memory positions against the broker's
+        real position book, so a crash/restart or a broker-side change can't leave local state
+        silently out of sync. Self-guards: no-op in paper/dry-run or when unauthenticated.
+        Runs an initial pass shortly after startup, then every interval_sec.
+        """
+        await asyncio.sleep(10)  # let auth / ws settle before the first pass
+        while self.running:
             try:
-                exec_res = await self.execution_bridge.execute_signal(evaluated_sig)
-                if exec_res and exec_res.get("status") == "REJECTED":
-                    logger.warning(f"⚠️ Order unplaced for {evaluated_sig.get('signal_id')}: {exec_res.get('reason')}")
-                    if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
-                        await self.telegram.notify_order_rejected({
-                            "signal_id": evaluated_sig.get("signal_id"),
-                            "instrument": evaluated_sig.get("instrument"),
-                            "option_symbol": evaluated_sig.get("option_symbol"),
-                            "reason": exec_res.get("reason"),
-                            "mode": self.execution_bridge.mode
-                        })
+                if hasattr(self, "execution_bridge") and self.execution_bridge:
+                    res = await self.execution_bridge.reconcile_with_broker()
+                    status = (res or {}).get("status")
+                    if status == "SUCCESS" and (res.get("reconciled_actions")):
+                        logger.warning(
+                            f"🔄 [RECONCILIATION] Synced {len(res['reconciled_actions'])} divergent "
+                            f"position(s) against broker."
+                        )
             except Exception as e:
-                logger.error(f"Execution bridge error for signal {evaluated_sig.get('signal_id')}: {e}")
+                logger.error(f"Broker reconciliation loop error: {e}")
+            await asyncio.sleep(interval_sec)
 
     async def _signals_listener_loop(self):
         """Listens to channel:signals and pushes immediately to WebSocket clients and Telegram"""

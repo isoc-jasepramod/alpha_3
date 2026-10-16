@@ -206,8 +206,11 @@ class AngelExecutionBridge:
             
             exec_cfg = full_cfg.get("execution", {})
             exec_cfg["enabled"] = self.enabled
-            exec_cfg["mode"] = self.mode
-            exec_cfg["dry_run"] = self.dry_run
+            # DELIBERATE RE-ARM: never persist a LIVE/armed state to the boot config. The on-disk
+            # file always reflects the safe boot state (PAPER) so a restart can never come up live
+            # off stale config; going LIVE is an explicit per-session API action that is not saved.
+            exec_cfg["mode"] = "PAPER"
+            exec_cfg["dry_run"] = True
             exec_cfg["default_order_type"] = self.default_order_type
             exec_cfg["slippage_buffer_pct"] = float(self.slippage_buffer_pct)
             exec_cfg["limit_timeout_sec"] = int(self.limit_timeout_sec)
