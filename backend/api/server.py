@@ -53,7 +53,7 @@ class EngineCoordinator:
         self.auth = AngelOneAuth()
         self.telegram = TelegramNotifier()
         self.periodic_reporter = PeriodicAnalysisReporter(self)
-        self.execution_bridge = AngelExecutionBridge(auth=self.auth, redis_bus=self.redis_bus, force_dry_run=True)
+        self.execution_bridge = AngelExecutionBridge(auth=self.auth, redis_bus=self.redis_bus, force_dry_run=False)
         self.ws_client: Optional[SmartAPIWebSocketClient] = None
         
         # Load strategy configuration
@@ -914,10 +914,20 @@ class EngineCoordinator:
             "signal": evaluated_sig
         })
 
-        # Phase 1 Paper Execution: Validate risk gates and simulate order placement
+        # Order Execution: Validate risk gates and route order (Paper or Live)
         if hasattr(self, "execution_bridge") and self.execution_bridge:
             try:
-                await self.execution_bridge.execute_signal(evaluated_sig)
+                exec_res = await self.execution_bridge.execute_signal(evaluated_sig)
+                if exec_res and exec_res.get("status") == "REJECTED":
+                    logger.warning(f"⚠️ Order unplaced for {evaluated_sig.get('signal_id')}: {exec_res.get('reason')}")
+                    if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
+                        await self.telegram.notify_order_rejected({
+                            "signal_id": evaluated_sig.get("signal_id"),
+                            "instrument": evaluated_sig.get("instrument"),
+                            "option_symbol": evaluated_sig.get("option_symbol"),
+                            "reason": exec_res.get("reason"),
+                            "mode": self.execution_bridge.mode
+                        })
             except Exception as e:
                 logger.error(f"Execution bridge error for signal {evaluated_sig.get('signal_id')}: {e}")
 
@@ -933,7 +943,7 @@ class EngineCoordinator:
                 except Exception:
                     pass
 
-            # Telegram dispatch and execution bridge lifecycle tracking
+            # 1. Telegram dispatch (independent notification channel)
             if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
                 try:
                     evt = msg.get("event")
@@ -941,20 +951,36 @@ class EngineCoordinator:
                         await self.telegram.notify_new_signal(msg["signal"])
                     elif evt == "RADAR_PRE_ALERT" and "alert" in msg:
                         await self.telegram.notify_radar_alert(msg["alert"])
-                    elif evt == "SIGNAL_PARTIAL_PROFIT" and "signal" in msg:
-                        if hasattr(self, "execution_bridge") and self.execution_bridge:
-                            sig = msg["signal"]
-                            tgt_1r = float(sig.get("target_1r") or sig.get("target", 0.0))
-                            await self.execution_bridge.handle_partial_exit(sig, exit_price=tgt_1r)
                     elif evt == "SIGNAL_RESOLVED" and "signal" in msg:
                         await self.telegram.notify_signal_resolved(msg["signal"])
-                        if hasattr(self, "execution_bridge") and self.execution_bridge:
-                            sig = msg["signal"]
-                            exit_p = float(sig.get("exit_price") or sig.get("entry_price", 0.0))
-                            reason = str(sig.get("status", "RESOLVED"))
-                            await self.execution_bridge.handle_full_exit(sig, exit_price=exit_p, reason=reason)
+                    elif evt == "EXECUTION_EXIT_FAILED":
+                        await self.telegram.notify_exit_failed(msg)
                 except Exception as e:
-                    logger.warning(f"Signals listener error: {e}")
+                    logger.warning(f"Telegram dispatch error: {e}")
+
+            # 2. Execution bridge lifecycle tracking (strictly decoupled from notifier)
+            if hasattr(self, "execution_bridge") and self.execution_bridge:
+                try:
+                    evt = msg.get("event")
+                    if evt == "SIGNAL_PARTIAL_PROFIT" and "signal" in msg:
+                        sig = msg["signal"]
+                        tgt_1r = float(sig.get("target_1r") or sig.get("target", 0.0))
+                        await self.execution_bridge.handle_partial_exit(sig, exit_price=tgt_1r)
+                    elif evt == "SIGNAL_RESOLVED" and "signal" in msg:
+                        sig = msg["signal"]
+                        exit_p = float(sig.get("exit_price") or sig.get("entry_price", 0.0))
+                        reason = str(sig.get("status", "RESOLVED"))
+                        exit_res = await self.execution_bridge.handle_full_exit(sig, exit_price=exit_p, reason=reason)
+                        if exit_res and exit_res.get("status") == "EXIT_FAILED":
+                            if hasattr(self, "telegram") and self.telegram and self.telegram.enabled:
+                                await self.telegram.notify_exit_failed({
+                                    "signal_id": sig.get("signal_id"),
+                                    "option_symbol": sig.get("option_symbol"),
+                                    "reason": exit_res.get("reason"),
+                                    "quantity": sig.get("quantity")
+                                })
+                except Exception as e:
+                    logger.error(f"Execution bridge exit routing error: {e}")
 
     async def _throttle_broadcast_loop(self):
         """

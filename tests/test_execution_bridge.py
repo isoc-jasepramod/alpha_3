@@ -16,11 +16,12 @@ TEST_AUDIT_DIR = "data/test_execution_logs"
 @pytest.fixture
 def bridge():
     # Setup test instance with a clean test audit dir
-    b = AngelExecutionBridge(force_dry_run=True)
-    b.audit_dir = TEST_AUDIT_DIR
+    os.makedirs(TEST_AUDIT_DIR, exist_ok=True)
+    b = AngelExecutionBridge(force_dry_run=True, audit_dir=TEST_AUDIT_DIR)
     b.max_capital_per_trade = 25000.0
     b.max_active_orders = 3
-    os.makedirs(TEST_AUDIT_DIR, exist_ok=True)
+    b.risk_governor.expiry_gate_enabled = False  # Avoid wall-clock Friday cutoff during testing
+    b.risk_governor.force_single_lot = False     # Allow multi-lot verification in test suite
     yield b
     # Teardown
     if os.path.exists(TEST_AUDIT_DIR):
@@ -59,8 +60,8 @@ async def test_nifty_order_payload_validation(bridge):
     assert payload["producttype"] == "INTRADAY"
     assert payload["ordertype"] == "LIMIT"
     assert int(payload["quantity"]) == 130
-    # Entry 76.55 * 1.005 = 76.93 -> rounded to 76.9
-    assert float(payload["price"]) == round(76.55 * 1.005, 1)
+    # Entry 76.55 * 1.005 = 76.93275 -> aligned to 0.05 tick size = 76.95
+    assert float(payload["price"]) == bridge.align_tick_size(76.55 * 1.005, 0.05)
 
     # Execute simulation
     res = await bridge.execute_signal(signal)
@@ -246,13 +247,33 @@ async def test_multi_lot_lifecycle_partial_exit(bridge):
 
 
 @pytest.mark.asyncio
-async def test_phase1_live_safety_lock(bridge):
-    """In Phase 1, any attempt to bypass dry_run must be blocked with RuntimeError."""
-    bridge.dry_run = False
-    bridge.mode = "LIVE"
+async def test_execution_mode_toggle(bridge):
+    """Verifies seamless switching between Phase 1 Paper and Phase 2 Live modes."""
+    # Default is PAPER
+    assert bridge.mode == "PAPER"
+    assert bridge.dry_run is True
+
+    # Toggle to LIVE
+    res_live = bridge.set_execution_mode("LIVE")
+    assert res_live["status"] == "SUCCESS"
+    assert bridge.mode == "LIVE"
+    assert bridge.dry_run is False
+
+    # Toggle back to PAPER (e.g. Monday morning change of mind)
+    res_paper = bridge.set_execution_mode("PAPER")
+    assert res_paper["status"] == "SUCCESS"
+    assert bridge.mode == "PAPER"
+    assert bridge.dry_run is True
+
+
+@pytest.mark.asyncio
+async def test_live_execution_unauthenticated_guard(bridge):
+    """When in LIVE mode without broker session, orders must be safely rejected."""
+    bridge.set_execution_mode("LIVE")
+    bridge.auth = None
 
     signal = {
-        "signal_id": "SIG-LOCKOUT-008",
+        "signal_id": "SIG-LIVE-UNAUTH-008",
         "instrument": "NIFTY",
         "direction": "CE",
         "strike": 22500.0,
@@ -266,5 +287,242 @@ async def test_phase1_live_safety_lock(bridge):
         "target": 90.0
     }
 
-    with pytest.raises(RuntimeError, match="Live exchange order execution is strictly locked out in Phase 1"):
-        await bridge.execute_signal(signal)
+    res = await bridge.execute_signal(signal)
+    assert res["status"] == "REJECTED"
+    assert "REJECTED_BROKER_UNAUTHENTICATED" in res["reason"]
+
+
+@pytest.mark.asyncio
+async def test_phase2_live_order_routing_and_lifecycle(bridge):
+    """Phase 2: Validates live order routing to Angel One SmartAPI and live exit placement."""
+    from unittest.mock import MagicMock
+
+    # Setup mock SmartConnect on auth
+    mock_sc = MagicMock()
+    mock_sc.placeOrder.return_value = "24101600098765"
+    mock_auth = MagicMock()
+    mock_auth.smart_connect = mock_sc
+    bridge.auth = mock_auth
+
+    # Switch to LIVE mode
+    bridge.set_execution_mode("LIVE")
+
+    signal = {
+        "signal_id": "SIG-PHASE2-LIVE-009",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "strike": 22500.0,
+        "option_type": "CE",
+        "option_token": "44612",
+        "option_symbol": "NIFTY13OCT2622500CE",
+        "entry_price": 60.0,
+        "quantity": 130,  # 2 lots
+        "lot_size": 65,
+        "stop_loss": 45.0,
+        "target": 90.0,
+        "target_1r": 75.0,
+        "target_2r": 90.0
+    }
+
+    # 1. Live Entry Order Execution
+    entry_res = await bridge.execute_signal(signal)
+    assert entry_res["status"] == "LIVE_FILLED"
+    assert entry_res["order_id"] == "24101600098765"
+    assert mock_sc.placeOrder.call_count == 1
+
+    # Verify order payload sent to Angel One
+    placed_payload = mock_sc.placeOrder.call_args[0][0]
+    assert placed_payload["exchange"] == "NFO"
+    assert placed_payload["tradingsymbol"] == "NIFTY13OCT2622500CE"
+    assert placed_payload["transactiontype"] == "BUY"
+    assert int(placed_payload["quantity"]) == 130
+
+    pos = bridge.active_positions[signal["signal_id"]]
+    assert pos["mode"] == "LIVE_EXCHANGE"
+    assert pos["remaining_quantity"] == 130
+
+    # 2. Live Target 1 Partial Exit (Lot 1)
+    mock_sc.placeOrder.return_value = "24101600098766"
+    p_exit = await bridge.handle_partial_exit(signal, exit_price=75.0)
+    assert p_exit["action"] == "PARTIAL_EXIT_T1"
+    assert p_exit["quantity_sold"] == 65
+    assert p_exit["realized_pnl"] == (75.0 - 60.0) * 65
+
+    # Verify SELL payload sent to Angel One for Lot 1
+    sell_payload_1 = mock_sc.placeOrder.call_args[0][0]
+    assert sell_payload_1["transactiontype"] == "SELL"
+    assert int(sell_payload_1["quantity"]) == 65
+
+    # 3. Live Full Exit (Lot 2 at Breakeven)
+    mock_sc.placeOrder.return_value = "24101600098767"
+    f_exit = await bridge.handle_full_exit(signal, exit_price=60.0, reason="BREAKEVEN_SL")
+    assert f_exit["action"] == "FULL_EXIT"
+    assert f_exit["quantity_sold"] == 65
+    assert f_exit["total_realized_pnl"] == (75.0 - 60.0) * 65
+    assert signal["signal_id"] not in bridge.active_positions
+
+    # Verify SELL payload sent to Angel One for Lot 2
+    sell_payload_2 = mock_sc.placeOrder.call_args[0][0]
+    assert sell_payload_2["transactiontype"] == "SELL"
+    assert int(sell_payload_2["quantity"]) == 65
+
+
+def test_api_mode_toggle_endpoint(bridge):
+    """Verifies FastAPI route /api/execution/mode switches execution mode dynamically."""
+    from fastapi.testclient import TestClient
+    from fastapi import FastAPI
+    from backend.api.routes import router, app_state
+
+    app = FastAPI()
+    app.include_router(router)
+    app_state.execution_bridge = bridge
+    client = TestClient(app)
+
+    # Check default status
+    res = client.get("/api/execution/status")
+    assert res.status_code == 200
+    assert res.json()["mode"] == "PAPER"
+    assert res.json()["dry_run"] is True
+
+    # Toggle to LIVE via query parameter ?mode=LIVE
+    res_toggle = client.post("/api/execution/mode?mode=LIVE")
+    assert res_toggle.status_code == 200
+    assert res_toggle.json()["status"] == "SUCCESS"
+    assert res_toggle.json()["mode"] == "LIVE"
+    assert res_toggle.json()["dry_run"] is False
+
+    # Check status endpoint reflects LIVE
+    res_status2 = client.get("/api/execution/status")
+    assert res_status2.json()["mode"] == "LIVE"
+    assert res_status2.json()["dry_run"] is False
+
+    # Toggle back to PAPER via JSON body {"mode": "PAPER"}
+    res_toggle_paper = client.post("/api/execution/mode", json={"mode": "PAPER"})
+    assert res_toggle_paper.status_code == 200
+    assert res_toggle_paper.json()["mode"] == "PAPER"
+    assert res_toggle_paper.json()["dry_run"] is True
+
+    # Verify status is back to PAPER
+    res_status3 = client.get("/api/execution/status")
+    assert res_status3.json()["mode"] == "PAPER"
+    assert res_status3.json()["dry_run"] is True
+
+
+def test_tick_size_alignment():
+    """Validates that align_tick_size rounds strictly to 0.05 multiples for Indian options."""
+    assert AngelExecutionBridge.align_tick_size(76.53, 0.05) == 76.55
+    assert AngelExecutionBridge.align_tick_size(76.52, 0.05) == 76.50
+    assert AngelExecutionBridge.align_tick_size(76.93275, 0.05) == 76.95
+    assert AngelExecutionBridge.align_tick_size(100.01, 0.05) == 100.00
+    assert AngelExecutionBridge.align_tick_size(100.03, 0.05) == 100.05
+    assert AngelExecutionBridge.align_tick_size(0.01, 0.05) == 0.05
+    assert AngelExecutionBridge.align_tick_size(-5.0, 0.05) == 0.05
+
+
+@pytest.mark.asyncio
+async def test_order_rejected_by_broker_rms(bridge):
+    """
+    When broker RMS rejects an order (e.g. margin shortfall or strike band lock),
+    the bridge must record the rejection in audit logs, publish REJECTED event,
+    and NOT create any active position or allocate margin.
+    """
+    from unittest.mock import MagicMock
+
+    # Setup mock broker rejecting the order with RMS error
+    mock_sc = MagicMock()
+    mock_sc.placeOrder.return_value = {
+        "status": False,
+        "message": "RMS: Margin Insufficient. Required: 25000, Available: 12000",
+        "errorcode": "AB1004"
+    }
+    mock_auth = MagicMock()
+    mock_auth.smart_connect = mock_sc
+    bridge.auth = mock_auth
+    bridge.set_execution_mode("LIVE")
+
+    signal = {
+        "signal_id": "SIG-RMS-REJECT-001",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "strike": 22500.0,
+        "option_type": "CE",
+        "option_token": "44612",
+        "option_symbol": "NIFTY13OCT2622500CE",
+        "entry_price": 80.0,
+        "quantity": 65,
+        "lot_size": 65,
+        "stop_loss": 60.0,
+        "target": 120.0
+    }
+
+    res = await bridge.execute_signal(signal)
+    assert res["status"] == "REJECTED"
+    assert "BROKER_ERROR: RMS: Margin Insufficient" in res["reason"]
+
+    # Verify no position is created in memory
+    assert "SIG-RMS-REJECT-001" not in bridge.active_positions
+    assert "SIG-RMS-REJECT-001" not in bridge.signal_to_order
+
+    # Verify audit log recorded the rejection
+    today_records = bridge.get_today_orders()
+    rejections = [r for r in today_records if r.get("signal_id") == "SIG-RMS-REJECT-001"]
+    assert len(rejections) == 1
+    assert rejections[0]["status"] == "REJECTED_BY_BROKER"
+    assert "RMS: Margin Insufficient" in rejections[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_exit_order_broker_failure_preserves_position(bridge):
+    """
+    If an exit order fails at the broker (e.g. API disconnect or exchange rejection),
+    the position MUST NOT be removed from active_positions. It should be flagged
+    with exit_failed=True so the trader can safely retry square-off.
+    """
+    from unittest.mock import MagicMock
+
+    mock_sc = MagicMock()
+    mock_auth = MagicMock()
+    mock_auth.smart_connect = mock_sc
+    bridge.auth = mock_auth
+    bridge.set_execution_mode("LIVE")
+
+    # 1. Successful entry
+    mock_sc.placeOrder.return_value = "24101600099901"
+    signal = {
+        "signal_id": "SIG-EXIT-FAIL-001",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "strike": 22500.0,
+        "option_type": "CE",
+        "option_token": "44612",
+        "option_symbol": "NIFTY13OCT2622500CE",
+        "entry_price": 50.0,
+        "quantity": 65,
+        "lot_size": 65,
+        "stop_loss": 40.0,
+        "target": 70.0
+    }
+
+    entry_res = await bridge.execute_signal(signal)
+    assert entry_res["status"] == "LIVE_FILLED"
+    assert "SIG-EXIT-FAIL-001" in bridge.active_positions
+
+    # 2. Broker returns rejection on exit order
+    mock_sc.placeOrder.return_value = {
+        "status": False,
+        "message": "Exchange Gateway Timeout. Order not processed.",
+        "errorcode": "AG500"
+    }
+
+    exit_res = await bridge.handle_full_exit(signal, exit_price=40.0, reason="STOP_LOSS")
+    assert exit_res["status"] == "EXIT_FAILED"
+    assert "Exchange Gateway Timeout" in exit_res["reason"]
+
+    # CRITICAL: Position must STILL be held in active_positions to prevent untracked money exposure
+    assert "SIG-EXIT-FAIL-001" in bridge.active_positions
+    held_pos = bridge.active_positions["SIG-EXIT-FAIL-001"]
+    assert held_pos["exit_failed"] is True
+    assert "Exchange Gateway Timeout" in held_pos["last_exit_error"]
+
+
+

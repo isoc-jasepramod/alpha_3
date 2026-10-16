@@ -407,3 +407,58 @@ class TelegramNotifier:
         if self.notify_resolutions:
             msg = self.format_resolution_html(sig)
             await self.enqueue_message(msg)
+
+    def format_order_rejected_html(self, event: Dict[str, Any]) -> str:
+        """Formats an order unplaced / rejected alert."""
+        sig_id = event.get("signal_id", "UNKNOWN")
+        symbol = event.get("option_symbol") or event.get("tradingsymbol") or "N/A"
+        reason = event.get("reason", "Unknown error")
+        mode = event.get("mode", "LIVE")
+        now_str = datetime.now(IST).strftime("%H:%M:%S IST")
+
+        return (
+            f"⚠️ <b>ORDER NOT PLACED ({mode})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Contract:</b> <code>{symbol}</code>\n"
+            f"<b>Signal ID:</b> <code>{sig_id}</code>\n"
+            f"<b>Status:</b> ❌ <b>REJECTED / UNPLACED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Failure Reason:</b>\n"
+            f"<code>{reason}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡️ <i>No broker position opened. Capital preserved.</i>\n"
+            f"🕒 <i>{now_str}</i>"
+        )
+
+    def format_exit_failed_html(self, event: Dict[str, Any]) -> str:
+        """Formats a critical exit order failure alert requiring user intervention."""
+        sig_id = event.get("signal_id", "UNKNOWN")
+        symbol = event.get("option_symbol") or event.get("tradingsymbol") or "N/A"
+        reason = event.get("reason", "Unknown broker error")
+        qty = event.get("quantity", "N/A")
+        now_str = datetime.now(IST).strftime("%H:%M:%S IST")
+
+        return (
+            f"🚨🚨 <b>CRITICAL: LIVE EXIT ORDER FAILED!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Contract:</b> <code>{symbol}</code>\n"
+            f"<b>Signal ID:</b> <code>{sig_id}</code>\n"
+            f"<b>Open Quantity:</b> <code>{qty}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Broker Error:</b>\n"
+            f"<code>{reason}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <b>ACTION REQUIRED:</b>\n"
+            f"Position remains <b>OPEN</b> in broker terminal.\n"
+            f"Please verify Angel One app or retry manual square-off immediately.\n"
+            f"🕒 <i>{now_str}</i>"
+        )
+
+    async def notify_order_rejected(self, event: Dict[str, Any]):
+        msg = self.format_order_rejected_html(event)
+        await self.enqueue_message(msg)
+
+    async def notify_exit_failed(self, event: Dict[str, Any]):
+        msg = self.format_exit_failed_html(event)
+        await self.enqueue_message(msg)
+

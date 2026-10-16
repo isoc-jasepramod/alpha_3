@@ -7,7 +7,7 @@ from backend.strategies.indicators import IncrementalEMA, IncrementalADX, Candle
 
 class OISqueezeSentinel(BaseStrategy):
     """
-    The Always-On Sentinel: Live OI Squeeze (09:15 - 15:30)
+    The Always-On Sentinel: Live OI Squeeze (09:15 - 14:30)
     Monitors ATM, ATM +/- 1, and ATM +/- 2 strikes over rolling tau = 300s.
     CE Trigger: Delta OI <= -5.0%, Delta Price >= +3.0%, Spot > EMA20, ADX >= 20, Option Vol >= 2x 20-period avg.
     PE Trigger: Delta OI <= -5.0%, Delta Price >= +3.0%, Spot < EMA20, ADX >= 20, Option Vol >= 2x 20-period avg.
@@ -18,7 +18,7 @@ class OISqueezeSentinel(BaseStrategy):
         self.regime_filter = regime_filter
         cfg = config or {}
         self.start_time = cfg.get("start_time", "09:15:00")
-        self.end_time = cfg.get("end_time", "15:30:00")
+        self.end_time = cfg.get("end_time", "14:30:00")
         self.tau = cfg.get("lookback_window_sec", 300) # 300 seconds (5 min)
         self.min_oi_drop_pct = cfg.get("min_oi_drop_pct", -5.0) # -5.0%
         self.min_price_spike_pct = cfg.get("min_price_spike_pct", 3.0) # +3.0%
@@ -275,7 +275,7 @@ class OISqueezeSentinel(BaseStrategy):
 
         now_dt = self.parse_ist_time(ts)
         
-        # Check time gating (09:15 - 15:30)
+        # Check time gating (09:15 - 14:30)
         if not self.is_time_gated(now_dt, self.start_time, self.end_time):
             return None
 

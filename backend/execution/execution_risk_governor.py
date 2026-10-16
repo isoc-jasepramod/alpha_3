@@ -219,6 +219,24 @@ class ExecutionRiskGovernor:
                     logger.warning(f"⏳ [ANTI-THETA GATE] {sig_id}: {reason}")
                     return False, reason, {}
 
+        # 2b. Strategy Cutoff Gate: OI_SQUEEZE strict daily cutoff at 14:30 IST
+        strategy_name = str(signal.get("strategy", "")).upper()
+        if "OI_SQUEEZE" in strategy_name and self.expiry_gate_enabled:
+            IST = timezone(timedelta(hours=5, minutes=30))
+            created_at_str = signal.get("created_at")
+            if created_at_str:
+                try:
+                    now_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00")).astimezone(IST)
+                except Exception:
+                    now_dt = datetime.now(IST)
+            else:
+                now_dt = datetime.now(IST)
+
+            if (now_dt.hour > 14) or (now_dt.hour == 14 and now_dt.minute >= 30):
+                reason = "REJECTED_OI_SQUEEZE_AFTER_1430_CUTOFF (OI_SQUEEZE entries disabled after 14:30 IST)"
+                logger.warning(f"⏳ [OI_SQUEEZE CUTOFF GATE] {sig_id}: {reason}")
+                return False, reason, {}
+
         # 3. Concurrency cap check
         if len(active_positions) >= self.max_active_positions:
             reason = f"REJECTED_MAX_CONCURRENT_POSITIONS ({len(active_positions)}/{self.max_active_positions})"
@@ -230,6 +248,12 @@ class ExecutionRiskGovernor:
         lot_size = int(signal.get("lot_size", 0))
         if entry_price <= 0.0 or lot_size <= 0:
             return False, "REJECTED_INVALID_PRICE_OR_LOT_SIZE", {}
+
+        requested_qty = int(signal.get("quantity", lot_size))
+        if requested_qty <= 0 or (requested_qty % lot_size != 0):
+            reason = f"REJECTED_NOT_MULTIPLE_OF_LOT_SIZE (Quantity: {requested_qty} is not a multiple of lot size {lot_size})"
+            logger.warning(f"🚫 [LOT MULTIPLE GUARD] {sig_id}: {reason}")
+            return False, reason, {}
 
         # 5. Volatility Stop Loss Validation (No Guessing)
         stop_loss = float(signal.get("stop_loss", 0.0))
@@ -298,7 +322,7 @@ class ExecutionRiskGovernor:
 
         # 9. Check single-trade ceiling
         if final_capital > self.max_capital_per_trade:
-            reason = f"REJECTED_CAPITAL_EXCEEDS_TRADE_LIMIT (Req: ₹{final_capital:.2f} > Max: ₹{self.max_capital_per_trade:.2f})"
+            reason = f"REJECTED_CAPITAL_EXCEEDS_LIMIT (Req: ₹{final_capital:.2f} > Max: ₹{self.max_capital_per_trade:.2f})"
             logger.warning(f"🚫 {reason}")
             return False, reason, {}
 

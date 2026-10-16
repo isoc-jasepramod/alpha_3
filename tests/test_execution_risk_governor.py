@@ -239,7 +239,7 @@ def test_angel_execution_bridge_integration():
 
 @pytest.mark.asyncio
 async def test_1_lot_exits_at_target_1_policy():
-    bridge = AngelExecutionBridge(force_dry_run=True)
+    bridge = AngelExecutionBridge(force_dry_run=True, audit_dir="data/test_execution_logs")
     bridge.enabled = True
     bridge.risk_governor.total_capital = 25000.0
     bridge.risk_governor.force_single_lot = True
@@ -282,7 +282,7 @@ async def test_1_lot_exits_at_target_1_policy():
 
 @pytest.mark.asyncio
 async def test_2_lot_scale_and_trail_policy():
-    bridge = AngelExecutionBridge(force_dry_run=True)
+    bridge = AngelExecutionBridge(force_dry_run=True, audit_dir="data/test_execution_logs")
     bridge.enabled = True
     bridge.risk_governor.total_capital = 25000.0
     bridge.risk_governor.force_single_lot = False  # Multi-lot allowed

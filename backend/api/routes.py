@@ -321,12 +321,24 @@ async def get_execution_orders(date_str: Optional[str] = None):
 
     if not bridge:
         return []
+
+    # 1. Start with placed orders
+    orders_map = {oid: dict(ord) for oid, ord in bridge.placed_orders.items()}
+
+    # 2. Also include any rejected/unplaced orders from today's audit logs
+    if hasattr(bridge, "get_today_orders"):
+        for r in bridge.get_today_orders():
+            if r.get("action") == "ORDER_REJECTED" or str(r.get("status", "")).startswith("REJECTED") or r.get("status") == "UNPLACED_AUTH_FAIL":
+                rej_key = f"REJ-{r.get('signal_id', 'UNKNOWN')}"
+                if rej_key not in orders_map:
+                    orders_map[rej_key] = dict(r)
+
     flattened = []
-    for ord in bridge.placed_orders.values():
+    for ord in orders_map.values():
         o = dict(ord)
         meta = o.get("metadata") or {}
         broker = o.get("broker_payload") or {}
-        entry_t = o.get("filled_at") or o.get("placed_at")
+        entry_t = o.get("filled_at") or o.get("placed_at") or o.get("timestamp")
         exit_t = o.get("closed_at")
         o["entry_time"] = entry_t
         o["exit_time"] = exit_t
@@ -352,9 +364,11 @@ async def get_execution_orders(date_str: Optional[str] = None):
         o["duration_seconds"] = dur_sec
         o["duration_str"] = dur_str
 
-        o["symbol"] = o.get("symbol") or meta.get("option_symbol") or broker.get("tradingsymbol") or "-"
+        o["order_id"] = o.get("order_id") or f"REJ-{o.get('signal_id', 'ERROR')}"
+        o["symbol"] = o.get("symbol") or o.get("option_symbol") or meta.get("option_symbol") or broker.get("tradingsymbol") or "-"
         o["direction"] = o.get("direction") or meta.get("direction") or ("PE" if str(o["symbol"]).endswith("PE") else "CE")
         o["action"] = o.get("action") or broker.get("transactiontype") or "BUY"
+        o["rejection_reason"] = o.get("reason") or meta.get("rejection_reason")
         pnl = o.get("total_realized_pnl")
         if pnl is None:
             pnl = o.get("realized_pnl", 0.0)
@@ -508,6 +522,36 @@ async def toggle_execution_arm(armed: bool = Query(...)):
     bridge.enabled = armed
     return {"status": "SUCCESS", "armed": bridge.enabled}
 
+@router.post("/api/execution/mode")
+async def set_execution_mode_endpoint(
+    mode: Optional[str] = Query(None),
+    payload: Optional[Dict[str, Any]] = None
+):
+    """
+    Switches between Phase 1 (PAPER / DRY_RUN) and Phase 2 (LIVE / REAL BROKER TRADE).
+    Accepts query param ?mode=PAPER|LIVE or JSON payload {"mode": "LIVE"}.
+    """
+    bridge = getattr(app_state, "execution_bridge", None)
+    if not bridge:
+        return {"status": "ERROR", "message": "Execution bridge not active on engine"}
+
+    target_mode = mode
+    if not target_mode and payload:
+        target_mode = payload.get("mode")
+    if not target_mode:
+        return {"status": "ERROR", "message": "Missing 'mode' parameter. Expected 'PAPER' or 'LIVE'."}
+
+    try:
+        res = bridge.set_execution_mode(target_mode)
+        return {
+            "status": "SUCCESS",
+            "mode": res["mode"],
+            "dry_run": res["dry_run"],
+            "message": f"Execution mode successfully updated to {res['mode']}"
+        }
+    except Exception as e:
+        return {"status": "ERROR", "message": str(e)}
+
 @router.get("/api/execution/config")
 async def get_execution_config():
     """Returns execution configuration options."""
@@ -517,6 +561,12 @@ async def get_execution_config():
     cap_metrics = bridge.get_capital_metrics() if hasattr(bridge, "get_capital_metrics") else {}
     return {
         "enabled": bridge.enabled,
+        "mode": bridge.mode,
+        "dry_run": bridge.dry_run,
+        "default_order_type": getattr(bridge, "default_order_type", "LIMIT"),
+        "slippage_buffer_pct": getattr(bridge, "slippage_buffer_pct", 0.5),
+        "limit_timeout_sec": getattr(bridge, "limit_timeout_sec", 15),
+        "retry_on_network_failure": getattr(bridge, "retry_on_network_failure", True),
         "allowed_strategies": getattr(bridge, "allowed_strategies", []),
         "max_capital_per_trade": bridge.max_capital_per_trade,
         "max_daily_loss": bridge.max_daily_loss,
@@ -533,6 +583,21 @@ async def update_execution_config(payload: Dict[str, Any]):
     bridge = getattr(app_state, "execution_bridge", None)
     if not bridge:
         return {"status": "ERROR", "message": "Execution bridge not active"}
+    if "mode" in payload or "dry_run" in payload:
+        target_mode = payload.get("mode", bridge.mode)
+        dry_run_val = payload.get("dry_run", None)
+        try:
+            bridge.set_execution_mode(target_mode, dry_run=dry_run_val)
+        except Exception as e:
+            logger.warning(f"Failed to set execution mode in config update: {e}")
+    if "default_order_type" in payload:
+        bridge.default_order_type = str(payload["default_order_type"]).upper()
+    if "slippage_buffer_pct" in payload:
+        bridge.slippage_buffer_pct = max(0.0, min(5.0, float(payload["slippage_buffer_pct"])))
+    if "limit_timeout_sec" in payload:
+        bridge.limit_timeout_sec = max(5, int(payload["limit_timeout_sec"]))
+    if "retry_on_network_failure" in payload:
+        bridge.retry_on_network_failure = bool(payload["retry_on_network_failure"])
     if "allowed_strategies" in payload:
         bridge.allowed_strategies = list(payload["allowed_strategies"])
     if "max_capital_per_trade" in payload:
@@ -555,6 +620,12 @@ async def update_execution_config(payload: Dict[str, Any]):
     return {
         "status": "SUCCESS",
         "config": {
+            "mode": bridge.mode,
+            "dry_run": bridge.dry_run,
+            "default_order_type": getattr(bridge, "default_order_type", "LIMIT"),
+            "slippage_buffer_pct": getattr(bridge, "slippage_buffer_pct", 0.5),
+            "limit_timeout_sec": getattr(bridge, "limit_timeout_sec", 15),
+            "retry_on_network_failure": getattr(bridge, "retry_on_network_failure", True),
             "allowed_strategies": bridge.allowed_strategies,
             "max_capital_per_trade": bridge.max_capital_per_trade,
             "total_capital": cap_metrics.get("total_capital", 25000.0),

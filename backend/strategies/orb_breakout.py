@@ -6,7 +6,9 @@ from backend.strategies.base_strategy import BaseStrategy
 from backend.strategies.indicators import (
     CandleAggregator,
     VolumeContactDetector,
-    VolumeDryUpDetector
+    VolumeDryUpDetector,
+    IncrementalEMA,
+    IncrementalRSI
 )
 
 
@@ -17,6 +19,7 @@ class VolumeBackedORB(BaseStrategy):
     Buffer margin delta = Spot * 0.0003.
     CE Trigger: 5-min candle closes > (H_ORB + delta) with RVOL >= 1.50.
     PE Trigger: 5-min candle closes < (L_ORB - delta) with RVOL >= 1.50.
+    Guarded by: Rubberband (EMA21 distance) & RSI Exhaustion guards.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -33,6 +36,24 @@ class VolumeBackedORB(BaseStrategy):
         self.breakout_strength_pct = cfg.get("breakout_strength_pct", 0.05)
         self.max_gap_pct = cfg.get("max_gap_pct", 0.40) # 0.40% gap threshold for Gap-and-Go
         self.extreme_gap_pct = cfg.get("extreme_gap_pct", 1.50) # 1.50% hard cutoff for hazardous gaps
+
+        # Rubberband & RSI Exhaustion Guards (Universal for ORB Breakout)
+        # Efficiently calibrated: allows healthy momentum expansions (RSI 70-76, dist < 110)
+        # while strictly cutting off parabolic exhaustion top-ticks (RSI > 78, dist > 110)
+        self.max_ema21_dist_nifty = float(cfg.get("max_ema21_dist_nifty", 110.0))
+        self.max_ema21_dist_sensex = float(cfg.get("max_ema21_dist_sensex", 300.0))
+        self.rsi_ce_max = float(cfg.get("rsi_ce_max", 78.0))
+        self.rsi_pe_min = float(cfg.get("rsi_pe_min", 22.0))
+
+        # Spot indicators for Rubberband & RSI Exhaustion
+        self.spot_ema21: Dict[str, IncrementalEMA] = {
+            "NIFTY": IncrementalEMA(period=21),
+            "SENSEX": IncrementalEMA(period=21)
+        }
+        self.spot_rsi: Dict[str, IncrementalRSI] = {
+            "NIFTY": IncrementalRSI(period=14),
+            "SENSEX": IncrementalRSI(period=14)
+        }
 
         # High/Low for ORB range per instrument
         self.orb_ranges: Dict[str, Dict[str, Any]] = {
@@ -113,6 +134,11 @@ class VolumeBackedORB(BaseStrategy):
         if hi <= 0 or hi < ltp or abs(hi - ltp) / ltp > 0.08: hi = max(ltp, op)
         if lo <= 0 or lo > ltp or abs(lo - ltp) / ltp > 0.08: lo = min(ltp, op)
 
+        if inst in self.spot_ema21 and self.spot_ema21[inst].value is None:
+            self.spot_ema21[inst].seed(ltp)
+        if inst in self.spot_rsi and self.spot_rsi[inst].prev_close is None:
+            self.spot_rsi[inst].seed(50.0, reference_price=ltp)
+
         now_dt = self.parse_ist_time(datetime.now(timezone.utc).timestamp())
         t = now_dt.time()
         if t >= time(9, 30, 0):
@@ -162,6 +188,19 @@ class VolumeBackedORB(BaseStrategy):
                 )
             elif prev_close > 0:
                 logger.info(f"⚡ [ORB_BREAKOUT] {inst} seeded prior close {prev_close:.1f}; gap pending first 09:15 candle.")
+
+            # Warm up spot indicators for Rubberband & RSI Exhaustion guards
+            for c in valid:
+                cl = float(c.get("close", 0.0))
+                if cl > 0:
+                    if inst in self.spot_ema21:
+                        self.spot_ema21[inst].update(cl)
+                    if inst in self.spot_rsi:
+                        self.spot_rsi[inst].update(cl)
+            if inst in self.spot_ema21 and self.spot_ema21[inst].value is not None:
+                e_val = self.spot_ema21[inst].value
+                r_val = self.spot_rsi[inst].value
+                logger.info(f"⚡ [ORB_BREAKOUT] {inst} warmed EMA21={e_val:.1f}, RSI={r_val:.1f}")
         except Exception as e:
             logger.warning(f"ORB seed_from_candles failed for {inst}: {e}")
 
@@ -257,6 +296,14 @@ class VolumeBackedORB(BaseStrategy):
 
             # 2. Update 5m Spot candle
             closed_spot_candle = self.spot_5m_aggregators[inst].on_tick(ts, ltp, volume=vol)
+            if closed_spot_candle:
+                close_p = closed_spot_candle["close"]
+                open_p = closed_spot_candle["open"]
+                if inst in self.spot_ema21:
+                    self.spot_ema21[inst].update(close_p)
+                if inst in self.spot_rsi:
+                    self.spot_rsi[inst].update(close_p)
+
             if closed_spot_candle and self._in_breakout_window(now_dt) and self.orb_ranges[inst]["finalized"]:
                 # Suppress only if opening gap was extreme (>1.50%)
                 if dt_info.get("excessive_gap", False):
@@ -331,10 +378,27 @@ class VolumeBackedORB(BaseStrategy):
                     gap_pct = dt_info.get("gap_pct", 0.0)
                     gap_dir = dt_info.get("gap_dir")
 
+                    e21 = self.spot_ema21[inst].value
+                    rsi = self.spot_rsi[inst].value
+                    max_dist = self.max_ema21_dist_nifty if inst == "NIFTY" else self.max_ema21_dist_sensex
+                    dist21 = abs(close_p - e21) if (e21 is not None) else 0.0
+
                     if h_orb > 0 and close_p > ce_threshold:
                         # If market opened with gap-down > max_gap_pct, do NOT take CE (avoid counter-trend trap)
                         if gap_pct > self.max_gap_pct and gap_dir == "DOWN":
                             logger.info(f"🚧 [ORB GAP FILTER] CE breakout suppressed: {inst} gap was -{gap_pct:.2f}% (counter-trend fade).")
+                        # Rubberband Guard: Overextended distance from EMA21
+                        elif e21 is not None and dist21 > max_dist:
+                            logger.warning(
+                                f"🚧 [ORB RUBBERBAND GUARD] CE breakout suppressed: {inst} distance from EMA21 "
+                                f"({dist21:.1f} pts) > max allowed {max_dist:.1f} pts. Overextended rubberband."
+                            )
+                        # RSI Exhaustion Guard: Overbought top-tick exhaustion
+                        elif rsi > self.rsi_ce_max:
+                            logger.warning(
+                                f"🚧 [ORB RSI EXHAUSTION] CE breakout suppressed: {inst} RSI={rsi:.1f} > "
+                                f"{self.rsi_ce_max}. Overbought top-tick exhaustion."
+                            )
                         else:
                             # Bullish Long Breakout with adaptive SL (entry - 0.5 * range)
                             adaptive_sl = close_p - (0.5 * orb_range)
@@ -349,6 +413,8 @@ class VolumeBackedORB(BaseStrategy):
                                 "delta": delta,
                                 "volume_contact": v_contact_h,
                                 "volume_dryup": v_dryup,
+                                "dist_ema21": round(dist21, 1),
+                                "rsi": round(rsi, 1),
                                 "time": ts
                             }
                             self.emit_radar_alert(
@@ -356,13 +422,25 @@ class VolumeBackedORB(BaseStrategy):
                                 instrument=inst,
                                 direction="CE",
                                 title=f"🚀 {inst} ORB Breakout Imminent",
-                                message=f"{inst} 5m candle closed above ORB High ({close_p:.1f} > {h_orb:.1f}). Confirming ATM CE option volume!",
+                                message=f"{inst} 5m candle closed above ORB High ({close_p:.1f} > {h_orb:.1f}) [RSI={rsi:.1f}, dist21={dist21:.1f}]. Confirming ATM CE option volume!",
                                 now_ts=ts
                             )
                     elif l_orb < 1e9 and close_p < pe_threshold:
                         # If market opened with gap-up > max_gap_pct, do NOT take PE (avoid counter-trend trap)
                         if gap_pct > self.max_gap_pct and gap_dir == "UP":
                             logger.info(f"🚧 [ORB GAP FILTER] PE breakdown suppressed: {inst} gap was +{gap_pct:.2f}% (counter-trend fade).")
+                        # Rubberband Guard: Overextended distance from EMA21
+                        elif e21 is not None and dist21 > max_dist:
+                            logger.warning(
+                                f"🚧 [ORB RUBBERBAND GUARD] PE breakdown suppressed: {inst} distance from EMA21 "
+                                f"({dist21:.1f} pts) > max allowed {max_dist:.1f} pts. Overextended rubberband."
+                            )
+                        # RSI Exhaustion Guard: Oversold bottom-tick exhaustion
+                        elif rsi < self.rsi_pe_min:
+                            logger.warning(
+                                f"🚧 [ORB RSI EXHAUSTION] PE breakdown suppressed: {inst} RSI={rsi:.1f} < "
+                                f"{self.rsi_pe_min}. Oversold bottom-tick exhaustion."
+                            )
                         else:
                             # Bearish Short Breakdown (Gap-and-Go continuation!)
                             adaptive_sl = close_p + (0.5 * orb_range)
@@ -377,6 +455,8 @@ class VolumeBackedORB(BaseStrategy):
                                 "delta": delta,
                                 "volume_contact": v_contact_l,
                                 "volume_dryup": v_dryup,
+                                "dist_ema21": round(dist21, 1),
+                                "rsi": round(rsi, 1),
                                 "time": ts
                             }
                             self.emit_radar_alert(
@@ -384,7 +464,7 @@ class VolumeBackedORB(BaseStrategy):
                                 instrument=inst,
                                 direction="PE",
                                 title=f"🚀 {inst} ORB Breakdown Imminent",
-                                message=f"{inst} 5m candle closed below ORB Low ({close_p:.1f} < {l_orb:.1f}). Confirming ATM PE option volume!",
+                                message=f"{inst} 5m candle closed below ORB Low ({close_p:.1f} < {l_orb:.1f}) [RSI={rsi:.1f}, dist21={dist21:.1f}]. Confirming ATM PE option volume!",
                                 now_ts=ts
                             )
 
@@ -496,6 +576,8 @@ class VolumeBackedORB(BaseStrategy):
                             "adaptive_sl": round(pending.get("adaptive_sl", 0.0), 1),
                             "delta": round(pending.get("delta", 0.0), 2),
                             "confidence": confidence,
+                            "dist_ema21": pending.get("dist_ema21"),
+                            "rsi": pending.get("rsi"),
                             "volume_contact": pending.get("volume_contact"),
                             "volume_dryup": pending.get("volume_dryup")
                         }

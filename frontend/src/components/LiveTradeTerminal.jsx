@@ -17,7 +17,8 @@ import {
   ChevronDown,
   ChevronUp,
   Calendar,
-  ArrowRight
+  ArrowRight,
+  Zap
 } from 'lucide-react';
 
 export function LiveTradeTerminal({ activeSignals = [] }) {
@@ -36,13 +37,22 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
   const [actionError, setActionError] = useState(null);
   const [actionSuccess, setActionSuccess] = useState(null);
 
+  // Phase 1 / Phase 2 Mode Toggle State
+  const [isModeModalOpen, setIsModeModalOpen] = useState(false);
+  const [pendingMode, setPendingMode] = useState(null);
+  const [modeSwitching, setModeSwitching] = useState(false);
+
   // Runtime Configuration state
   const [config, setConfig] = useState({
     allowed_strategies: ['OI_SQUEEZE', 'ORB_BREAKOUT', 'BREAKOUT_ORB', 'VWAP_EMA', 'SIMPLIFIED_VWAP_EMA', 'GAMMA_SCALP', 'MOMENTUM_IMPULSE'],
     max_capital_per_trade: 25000,
     max_daily_loss: 4000,
     nifty_lots: 1,
-    sensex_lots: 1
+    sensex_lots: 1,
+    default_order_type: 'LIMIT',
+    slippage_buffer_pct: 0.5,
+    limit_timeout_sec: 15,
+    retry_on_network_failure: true
   });
   const [configSaving, setConfigSaving] = useState(false);
   const [isConfigDirty, setIsConfigDirty] = useState(false);
@@ -60,7 +70,11 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
           max_capital_per_trade: cfg.max_capital_per_trade || prev.max_capital_per_trade,
           max_daily_loss: cfg.max_daily_loss || prev.max_daily_loss,
           nifty_lots: cfg.nifty_lots || prev.nifty_lots,
-          sensex_lots: cfg.sensex_lots || prev.sensex_lots
+          sensex_lots: cfg.sensex_lots || prev.sensex_lots,
+          default_order_type: cfg.default_order_type || prev.default_order_type,
+          slippage_buffer_pct: cfg.slippage_buffer_pct !== undefined ? cfg.slippage_buffer_pct : prev.slippage_buffer_pct,
+          limit_timeout_sec: cfg.limit_timeout_sec !== undefined ? cfg.limit_timeout_sec : prev.limit_timeout_sec,
+          retry_on_network_failure: cfg.retry_on_network_failure !== undefined ? cfg.retry_on_network_failure : prev.retry_on_network_failure
         }));
       })
       .catch(err => console.error('Failed to load initial execution config:', err));
@@ -100,6 +114,48 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
     const interval = setInterval(fetchData, 1500);
     return () => clearInterval(interval);
   }, [fetchData]);
+
+  // Phase 1 (Paper) vs Phase 2 (Real Trade) Toggle Handlers
+  const handleToggleMode = (targetMode) => {
+    if (targetMode === 'LIVE') {
+      setPendingMode('LIVE');
+      setIsModeModalOpen(true);
+    } else {
+      executeModeSwitch('PAPER');
+    }
+  };
+
+  const executeModeSwitch = async (targetMode) => {
+    setModeSwitching(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`http://localhost:8001/api/execution/mode?mode=${targetMode}`, {
+        method: 'POST'
+      }).then(r => r.json());
+
+      if (res.status === 'SUCCESS') {
+        setStatus(prev => ({
+          ...prev,
+          mode: res.mode,
+          dry_run: res.dry_run
+        }));
+        setIsModeModalOpen(false);
+        setPendingMode(null);
+        const msg = res.mode === 'LIVE'
+          ? '🚨 PHASE 2 REAL TRADE ACTIVATED: Real orders will route to Angel One exchange via SmartAPI.'
+          : '🛡️ PHASE 1 PAPER TRADE ACTIVATED: Switched to dry-run mode. Zero real exchange risk.';
+        setActionSuccess(msg);
+        fetchData();
+        setTimeout(() => setActionSuccess(null), 5000);
+      } else {
+        setActionError(res.message || 'Failed to switch execution mode');
+      }
+    } catch (err) {
+      setActionError('Network error while switching execution mode');
+    } finally {
+      setModeSwitching(false);
+    }
+  };
 
   // Master Arm/Disarm Toggle
   const handleToggleArm = async () => {
@@ -195,7 +251,11 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
             max_capital_per_trade: res.config.max_capital_per_trade || prev.max_capital_per_trade,
             max_daily_loss: res.config.max_daily_loss || prev.max_daily_loss,
             nifty_lots: res.config.nifty_lots || prev.nifty_lots,
-            sensex_lots: res.config.sensex_lots || prev.sensex_lots
+            sensex_lots: res.config.sensex_lots || prev.sensex_lots,
+            default_order_type: res.config.default_order_type || prev.default_order_type,
+            slippage_buffer_pct: res.config.slippage_buffer_pct !== undefined ? res.config.slippage_buffer_pct : prev.slippage_buffer_pct,
+            limit_timeout_sec: res.config.limit_timeout_sec !== undefined ? res.config.limit_timeout_sec : prev.limit_timeout_sec,
+            retry_on_network_failure: res.config.retry_on_network_failure !== undefined ? res.config.retry_on_network_failure : prev.retry_on_network_failure
           }));
           setStatus(prev => ({
             ...prev,
@@ -203,7 +263,11 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
             max_capital_per_trade: res.config.max_capital_per_trade,
             max_daily_loss: res.config.max_daily_loss,
             nifty_lots: res.config.nifty_lots,
-            sensex_lots: res.config.sensex_lots
+            sensex_lots: res.config.sensex_lots,
+            default_order_type: res.config.default_order_type,
+            slippage_buffer_pct: res.config.slippage_buffer_pct,
+            limit_timeout_sec: res.config.limit_timeout_sec,
+            retry_on_network_failure: res.config.retry_on_network_failure
           }));
         }
         setTimeout(() => setActionSuccess(null), 4000);
@@ -357,6 +421,35 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
               title="Refresh status"
             >
               <RefreshCw size={14} className={refreshing ? 'spin' : ''} />
+            </button>
+
+            {/* Phase 1 (Paper) / Phase 2 (Real Trade) Toggle Button */}
+            <button
+              onClick={() => handleToggleMode(status?.mode === 'PAPER' ? 'LIVE' : 'PAPER')}
+              disabled={modeSwitching}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                padding: '8px 16px',
+                borderRadius: 'var(--radius-sm)',
+                fontWeight: '700',
+                fontSize: '0.8rem',
+                cursor: 'pointer',
+                transition: 'all 0.25s ease',
+                background: status?.mode === 'PAPER' 
+                  ? 'rgba(0, 240, 255, 0.12)' 
+                  : 'rgba(255, 51, 102, 0.15)',
+                color: status?.mode === 'PAPER' ? 'var(--accent-cyan)' : 'var(--pe-red)',
+                border: `1px solid ${status?.mode === 'PAPER' ? 'var(--accent-cyan)' : 'var(--pe-red)'}`,
+                boxShadow: status?.mode === 'LIVE' ? '0 0 14px rgba(255, 51, 102, 0.3)' : 'none'
+              }}
+              title={status?.mode === 'PAPER' ? 'Click to switch to Phase 2 Real Trade' : 'Click to switch back to Phase 1 Paper Trade'}
+            >
+              <Zap size={15} />
+              <span>
+                {status?.mode === 'PAPER' ? '⚡ SWITCH TO REAL TRADE' : '🛡️ SWITCH TO PAPER TRADE'}
+              </span>
             </button>
 
             {/* Arm / Disarm Toggle */}
@@ -619,6 +712,45 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                       borderLeft: `4px solid ${dir === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)'}`
                     }}
                   >
+                    {pos.exit_failed && (
+                      <div style={{
+                        padding: '0.65rem 0.9rem',
+                        marginBottom: '0.85rem',
+                        borderRadius: 'var(--radius-sm)',
+                        background: 'rgba(255, 51, 102, 0.12)',
+                        border: '1px solid var(--pe-red)',
+                        color: '#ff6685',
+                        fontSize: '0.78rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: '0.6rem'
+                      }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <AlertTriangle size={16} color="var(--pe-red)" style={{ flexShrink: 0 }} />
+                          <span>
+                            <strong>🚨 BROKER EXIT PLACEMENT FAILED:</strong> {pos.last_exit_error || 'Exchange rejected exit order'}. Position is preserved in active pool.
+                          </span>
+                        </div>
+                        <button
+                          onClick={() => handleExitPosition(pos.signal_id)}
+                          style={{
+                            padding: '4px 10px',
+                            borderRadius: 'var(--radius-sm)',
+                            background: 'var(--pe-red)',
+                            color: '#fff',
+                            border: 'none',
+                            fontSize: '0.72rem',
+                            fontWeight: '700',
+                            cursor: 'pointer',
+                            whiteSpace: 'nowrap'
+                          }}
+                        >
+                          ⚡ Retry Exit Now
+                        </button>
+                      </div>
+                    )}
+
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '1rem' }}>
                       {/* Left: Info */}
                       <div>
@@ -771,19 +903,20 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                             style={{
                               padding: '8px 14px',
                               borderRadius: 'var(--radius-sm)',
-                              background: 'rgba(255, 51, 102, 0.1)',
+                              background: pos.exit_failed ? 'var(--pe-red)' : 'rgba(255, 51, 102, 0.1)',
                               border: '1px solid var(--pe-red)',
-                              color: 'var(--pe-red)',
+                              color: pos.exit_failed ? '#fff' : 'var(--pe-red)',
                               fontSize: '0.78rem',
                               fontWeight: '700',
                               cursor: 'pointer',
                               display: 'flex',
                               alignItems: 'center',
-                              gap: '0.4rem'
+                              gap: '0.4rem',
+                              boxShadow: pos.exit_failed ? '0 0 12px rgba(255, 51, 102, 0.4)' : undefined
                             }}
                           >
-                            <XCircle size={14} />
-                            <span>EXIT POSITION</span>
+                            {pos.exit_failed ? <AlertTriangle size={14} /> : <XCircle size={14} />}
+                            <span>{pos.exit_failed ? 'RETRY EXIT' : 'EXIT POSITION'}</span>
                           </button>
                         )}
                       </div>
@@ -884,25 +1017,30 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                   const sym = ord.symbol || ord.option_symbol || broker.tradingsymbol || meta.option_symbol || '-';
                   const dir = ord.direction || meta.direction || (sym.endsWith('PE') ? 'PE' : 'CE');
                   const actionType = ord.action || broker.transactiontype || 'BUY';
+                  const isRejected = ord.status === 'REJECTED' || ord.status === 'REJECTED_BY_BROKER' || ord.status === 'UNPLACED_AUTH_FAIL' || ord.status === 'BROKER_EXCEPTION' || ord.action === 'ORDER_REJECTED';
                   const qtyVal = ord.quantity || ord.quantity_sold || meta.quantity || '-';
-                  const fillVal = ord.fill_price || meta.expected_entry || '-';
-                  const exitPriceVal = ord.exit_price;
+                  const fillVal = isRejected ? '—' : (ord.fill_price || meta.expected_entry || '-');
+                  const exitPriceVal = isRejected ? null : ord.exit_price;
                   const pnl = ord.total_realized_pnl !== undefined ? ord.total_realized_pnl : (ord.realized_pnl !== undefined ? ord.realized_pnl : 0);
                   const isProfit = pnl >= 0;
 
                   return (
-                    <tr key={ord.order_id || idx} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                      <td className="mono" style={{ padding: '8px', color: 'var(--accent-cyan)' }}>{ord.order_id}</td>
+                    <tr key={ord.order_id || idx} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)', opacity: isRejected ? 0.85 : 1 }}>
+                      <td className="mono" style={{ padding: '8px', color: isRejected ? 'var(--pe-red)' : 'var(--accent-cyan)' }}>{ord.order_id}</td>
                       <td className="mono" style={{ padding: '8px', color: 'var(--text-primary)', whiteSpace: 'nowrap' }}>{entryStr}</td>
                       <td className="mono" style={{ padding: '8px', whiteSpace: 'nowrap' }}>
-                        {exitStr ? (
+                        {isRejected ? (
+                          <span style={{ color: 'var(--text-muted)' }}>—</span>
+                        ) : exitStr ? (
                           <span style={{ color: 'var(--text-secondary)' }}>{exitStr}</span>
                         ) : (
                           <span style={{ color: 'var(--accent-cyan)', fontSize: '0.7rem', fontWeight: '600' }}>HOLDING</span>
                         )}
                       </td>
                       <td className="mono" style={{ padding: '8px', color: 'var(--text-muted)', fontSize: '0.72rem' }}>
-                        {ord.duration_str ? (
+                        {isRejected ? (
+                          '—'
+                        ) : ord.duration_str ? (
                           <span style={{
                             padding: '2px 6px',
                             borderRadius: 'var(--radius-sm)',
@@ -923,19 +1061,47 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                           borderRadius: 'var(--radius-sm)',
                           fontSize: '0.7rem',
                           fontWeight: '700',
-                          background: dir === 'CE' ? 'var(--ce-green-bg)' : 'var(--pe-red-bg)',
-                          color: dir === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)'
+                          background: isRejected ? 'rgba(255, 51, 102, 0.15)' : (dir === 'CE' ? 'var(--ce-green-bg)' : 'var(--pe-red-bg)'),
+                          color: isRejected ? 'var(--pe-red)' : (dir === 'CE' ? 'var(--ce-green)' : 'var(--pe-red)')
                         }}>
                           {actionType} {dir}
                         </span>
                       </td>
                       <td className="mono" style={{ padding: '8px' }}>{qtyVal}</td>
-                      <td className="mono" style={{ padding: '8px' }}>₹{typeof fillVal === 'number' ? fillVal.toFixed(2) : fillVal}</td>
+                      <td className="mono" style={{ padding: '8px' }}>
+                        {typeof fillVal === 'number' ? `₹${fillVal.toFixed(2)}` : fillVal}
+                      </td>
                       <td className="mono" style={{ padding: '8px', color: exitPriceVal ? 'var(--text-primary)' : 'var(--text-muted)' }}>
                         {exitPriceVal !== undefined && exitPriceVal !== null ? `₹${Number(exitPriceVal).toFixed(2)}` : '—'}
                       </td>
                       <td style={{ padding: '8px' }}>
-                        {ord.status === 'FILLED' && !ord.exit_reason ? (
+                        {isRejected ? (
+                          <div>
+                            <span style={{
+                              padding: '2px 8px',
+                              borderRadius: 'var(--radius-sm)',
+                              fontSize: '0.7rem',
+                              fontWeight: '700',
+                              background: 'rgba(255, 51, 102, 0.15)',
+                              color: 'var(--pe-red)',
+                              border: '1px solid var(--pe-red)',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '4px'
+                            }}>
+                              <XCircle size={11} />
+                              {ord.status === 'REJECTED_BY_BROKER' ? 'RMS REJECTED' : (ord.status === 'UNPLACED_AUTH_FAIL' ? 'AUTH TIMEOUT' : 'ORDER REJECTED')}
+                            </span>
+                            {(ord.rejection_reason || ord.reason) && (
+                              <div 
+                                style={{ fontSize: '0.67rem', color: '#ff809b', marginTop: '3px', maxWidth: '190px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} 
+                                title={ord.rejection_reason || ord.reason}
+                              >
+                                {ord.rejection_reason || ord.reason}
+                              </div>
+                            )}
+                          </div>
+                        ) : ord.status === 'FILLED' && !ord.exit_reason ? (
                           <span style={{
                             padding: '2px 8px',
                             borderRadius: 'var(--radius-sm)',
@@ -964,7 +1130,9 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                         )}
                       </td>
                       <td className="mono" style={{ padding: '8px', fontWeight: '700' }}>
-                        {ord.status === 'FILLED' && !ord.exit_reason ? (
+                        {isRejected ? (
+                          <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem', fontStyle: 'italic' }}>— (Unplaced)</span>
+                        ) : ord.status === 'FILLED' && !ord.exit_reason ? (
                           <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem', fontStyle: 'italic', fontWeight: 'normal' }}>
                             {ord.unrealized_pnl !== undefined ? (
                               <span style={{ color: ord.unrealized_pnl >= 0 ? 'var(--ce-green)' : 'var(--pe-red)', fontStyle: 'normal', fontWeight: '700' }}>
@@ -1231,6 +1399,69 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
       {/* SUB-TAB 3: CONFIGURATION */}
       {activeSubTab === 'config' && (
         <div className="glass-panel" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          
+          {/* Phase 1 vs Phase 2 Mode Selection Card */}
+          <div style={{
+            padding: '1.25rem',
+            borderRadius: 'var(--radius-sm)',
+            background: status?.mode === 'LIVE' ? 'rgba(255, 51, 102, 0.05)' : 'rgba(0, 240, 255, 0.04)',
+            border: `1px solid ${status?.mode === 'LIVE' ? 'rgba(255, 51, 102, 0.3)' : 'rgba(0, 240, 255, 0.25)'}`
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                  <Zap size={18} color={status?.mode === 'LIVE' ? 'var(--pe-red)' : 'var(--accent-cyan)'} />
+                  <h3 style={{ fontSize: '1rem', fontWeight: '700' }}>
+                    Active Execution Mode: {status?.mode === 'LIVE' ? 'PHASE 2 — REAL TRADE (LIVE BROKER)' : 'PHASE 1 — DRY RUN (PAPER TRADE)'}
+                  </h3>
+                </div>
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                  {status?.mode === 'LIVE'
+                    ? 'Orders are routed directly to Angel One exchange via SmartAPI using ₹25k pool with single-lot micro-risk.'
+                    : 'Signals are validated through all risk gates and simulated with zero financial risk. Perfect for monitoring before going live.'}
+                </p>
+              </div>
+
+              <div style={{ display: 'flex', gap: '0.6rem' }}>
+                <button
+                  type="button"
+                  onClick={() => handleToggleMode('PAPER')}
+                  disabled={status?.mode === 'PAPER' || modeSwitching}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: 'var(--radius-sm)',
+                    fontSize: '0.78rem',
+                    fontWeight: '700',
+                    cursor: status?.mode === 'PAPER' ? 'default' : 'pointer',
+                    background: status?.mode === 'PAPER' ? 'rgba(0, 240, 255, 0.2)' : 'transparent',
+                    color: status?.mode === 'PAPER' ? 'var(--accent-cyan)' : 'var(--text-secondary)',
+                    border: `1px solid ${status?.mode === 'PAPER' ? 'var(--accent-cyan)' : 'var(--border-subtle)'}`
+                  }}
+                >
+                  Phase 1: Paper Trade
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleToggleMode('LIVE')}
+                  disabled={status?.mode === 'LIVE' || modeSwitching}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: 'var(--radius-sm)',
+                    fontSize: '0.78rem',
+                    fontWeight: '700',
+                    cursor: status?.mode === 'LIVE' ? 'default' : 'pointer',
+                    background: status?.mode === 'LIVE' ? 'rgba(255, 51, 102, 0.2)' : 'transparent',
+                    color: status?.mode === 'LIVE' ? 'var(--pe-red)' : 'var(--text-secondary)',
+                    border: `1px solid ${status?.mode === 'LIVE' ? 'var(--pe-red)' : 'var(--border-subtle)'}`
+                  }}
+                >
+                  Phase 2: Real Trade
+                </button>
+              </div>
+            </div>
+          </div>
+
           <div>
             <h3 style={{ fontSize: '1rem', fontWeight: '700' }}>Allowed Strategies</h3>
             <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '2px' }}>
@@ -1383,6 +1614,151 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
               </div>
             </div>
 
+            {/* LIMIT Order Settings & Exchange Safeguards */}
+            <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '1.25rem', marginTop: '1.5rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '4px' }}>
+                <Sliders size={16} color="var(--accent-cyan)" />
+                <h3 style={{ fontSize: '1rem', fontWeight: '700' }}>LIMIT Order Engine & Exchange Safeguards</h3>
+              </div>
+              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                Configures broker limit buffer, 0.05 tick size alignment, order timeouts, and automated fallback behaviors.
+              </p>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem', marginTop: '1rem' }}>
+                <div>
+                  <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>
+                    Broker Order Type
+                  </label>
+                  <select
+                    value={config.default_order_type}
+                    onChange={(e) => {
+                      setIsConfigDirty(true);
+                      setConfig({ ...config, default_order_type: e.target.value });
+                    }}
+                    style={{
+                      width: '100%',
+                      padding: '8px 12px',
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'var(--bg-secondary)',
+                      border: '1px solid var(--border-subtle)',
+                      color: '#fff',
+                      fontSize: '0.82rem',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <option value="LIMIT" style={{ background: '#0a0d14' }}>LIMIT (Recommended — Buffered Entry/Exit)</option>
+                    <option value="MARKET" style={{ background: '#0a0d14' }}>MARKET (Direct Best Quote Fill)</option>
+                  </select>
+                  <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: '3px', display: 'block' }}>
+                    LIMIT avoids severe bid-ask spread slippage on illiquid strikes.
+                  </span>
+                </div>
+
+                <div>
+                  <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>
+                    Limit Slippage Buffer (%)
+                  </label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    max="5"
+                    value={config.slippage_buffer_pct}
+                    onChange={(e) => {
+                      setIsConfigDirty(true);
+                      setConfig({ ...config, slippage_buffer_pct: parseFloat(e.target.value) || 0.5 });
+                    }}
+                    style={{
+                      width: '100%',
+                      padding: '8px 12px',
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'var(--bg-secondary)',
+                      border: '1px solid var(--border-subtle)',
+                      color: '#fff',
+                      fontFamily: 'var(--font-mono)'
+                    }}
+                  />
+                  <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: '3px', display: 'block' }}>
+                    Adds +{config.slippage_buffer_pct}% on BUY, -{config.slippage_buffer_pct}% on SELL exit.
+                  </span>
+                </div>
+
+                <div>
+                  <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>
+                    Order Timeout (Seconds)
+                  </label>
+                  <input
+                    type="number"
+                    min="5"
+                    max="60"
+                    value={config.limit_timeout_sec}
+                    onChange={(e) => {
+                      setIsConfigDirty(true);
+                      setConfig({ ...config, limit_timeout_sec: parseInt(e.target.value) || 15 });
+                    }}
+                    style={{
+                      width: '100%',
+                      padding: '8px 12px',
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'var(--bg-secondary)',
+                      border: '1px solid var(--border-subtle)',
+                      color: '#fff',
+                      fontFamily: 'var(--font-mono)'
+                    }}
+                  />
+                  <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: '3px', display: 'block' }}>
+                    Max wait window before order timeout or status inspection.
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+                  <label style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    fontSize: '0.8rem',
+                    color: 'var(--text-primary)',
+                    cursor: 'pointer',
+                    marginTop: '8px'
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={config.retry_on_network_failure}
+                      onChange={(e) => {
+                        setIsConfigDirty(true);
+                        setConfig({ ...config, retry_on_network_failure: e.target.checked });
+                      }}
+                      style={{ accentColor: 'var(--accent-cyan)', width: '16px', height: '16px', cursor: 'pointer' }}
+                    />
+                    <span>Auto-Reconnect & Retry on Network Glitch</span>
+                  </label>
+                  <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: '4px', marginLeft: '24px' }}>
+                    Attempts automatic SmartAPI session re-login if disconnected.
+                  </span>
+                </div>
+              </div>
+
+              {/* Protocol Summary Card */}
+              <div style={{
+                marginTop: '1.25rem',
+                padding: '0.85rem 1rem',
+                borderRadius: 'var(--radius-sm)',
+                background: 'rgba(0, 240, 255, 0.03)',
+                border: '1px solid rgba(0, 240, 255, 0.15)',
+                fontSize: '0.76rem',
+                lineHeight: '1.6',
+                color: 'var(--text-secondary)'
+              }}>
+                <div style={{ fontWeight: '700', color: 'var(--accent-cyan)', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <ShieldAlert size={14} />
+                  <span>Unplaced Orders & Broker RMS Safety Architecture</span>
+                </div>
+                <div>• <strong>0.05 Tick Size Alignment:</strong> All limit prices are strictly rounded to exchange tick multiples (₹0.05) to eliminate invalid tick rejections.</div>
+                <div>• <strong>Broker RMS Rejection Handling:</strong> If Angel One rejects an order (insufficient margin, strike band lock, or network drop), the error is logged in the audit trail, sent to Telegram, and <strong>zero capital is deployed</strong>.</div>
+                <div>• <strong>Exit Order Retention:</strong> If a position exit order fails at the broker, the system <strong>never forgets the open position</strong>. It flags the card in red and enables an instant "Retry Exit" button.</div>
+              </div>
+            </div>
+
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginTop: '1.25rem' }}>
               <button
                 className="btn-primary"
@@ -1465,6 +1841,88 @@ export function LiveTradeTerminal({ activeSignals = [] }) {
                 }}
               >
                 EXECUTE KILL SWITCH
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PHASE 2 REAL TRADE CONFIRMATION MODAL */}
+      {isModeModalOpen && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(0, 0, 0, 0.85)',
+          backdropFilter: 'blur(8px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+          padding: '1rem'
+        }}>
+          <div className="glass-panel" style={{
+            maxWidth: '480px',
+            width: '100%',
+            padding: '1.75rem',
+            border: '1px solid var(--pe-red)',
+            boxShadow: '0 0 32px rgba(255, 51, 102, 0.35)'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', color: 'var(--pe-red)' }}>
+              <Zap size={26} />
+              <h3 style={{ fontSize: '1.2rem', fontWeight: '700' }}>Confirm Switch to Phase 2 Real Trade</h3>
+            </div>
+
+            <p style={{ fontSize: '0.84rem', color: 'var(--text-secondary)', marginTop: '0.75rem', lineHeight: '1.5' }}>
+              You are about to switch the execution engine from <strong>Phase 1 (Paper / Dry Run)</strong> to <strong>Phase 2 (Live Broker Trading)</strong>.
+            </p>
+
+            <div style={{
+              background: 'rgba(255, 51, 102, 0.08)',
+              border: '1px solid rgba(255, 51, 102, 0.25)',
+              borderRadius: 'var(--radius-sm)',
+              padding: '0.85rem 1rem',
+              margin: '1rem 0',
+              fontSize: '0.8rem',
+              color: 'var(--text-secondary)',
+              lineHeight: '1.6'
+            }}>
+              <div style={{ color: '#fff', fontWeight: '700', marginBottom: '4px' }}>🔒 Active Safety Protocol:</div>
+              <div>• Real orders routed to Angel One exchange via SmartAPI.</div>
+              <div>• Strict ₹25,000 capital ceiling enforced per trade.</div>
+              <div>• Single-lot micro-risk testing (NIFTY: 1 lot 65q | SENSEX: 1 lot 20q).</div>
+              <div>• Emergency Kill Switch ready for immediate square-off.</div>
+              <div style={{ color: 'var(--accent-cyan)', marginTop: '4px', fontWeight: '600' }}>
+                💡 If you change your mind on Monday to monitor paper trades, simply click "Switch to Paper Trade" at any time.
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
+              <button
+                className="btn-secondary"
+                onClick={() => { setIsModeModalOpen(false); setPendingMode(null); }}
+                disabled={modeSwitching}
+                style={{ padding: '8px 16px' }}
+              >
+                Cancel (Stay in Paper)
+              </button>
+              <button
+                onClick={() => executeModeSwitch('LIVE')}
+                disabled={modeSwitching}
+                style={{
+                  padding: '8px 20px',
+                  borderRadius: 'var(--radius-sm)',
+                  background: 'var(--pe-red)',
+                  color: '#fff',
+                  border: 'none',
+                  fontWeight: '700',
+                  fontSize: '0.85rem',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem'
+                }}
+              >
+                {modeSwitching ? 'Activating...' : 'CONFIRM SWITCH TO REAL TRADE'}
               </button>
             </div>
           </div>

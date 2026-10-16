@@ -175,6 +175,25 @@ class RiskGovernor:
                     )
                     return None
 
+        # Daily Cutoff for OI_SQUEEZE: Reject entries after 14:30 IST
+        strat_name = str(raw_signal.get("strategy", "")).upper()
+        if "OI_SQUEEZE" in strat_name:
+            IST = timezone(timedelta(hours=5, minutes=30))
+            created_at_str = raw_signal.get("created_at")
+            if created_at_str:
+                try:
+                    now_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00")).astimezone(IST)
+                except Exception:
+                    now_dt = datetime.now(IST)
+            else:
+                now_dt = datetime.now(IST)
+            if (now_dt.hour > 14) or (now_dt.hour == 14 and now_dt.minute >= 30):
+                logger.warning(
+                    f"⏳ [OI_SQUEEZE CUTOFF] Signal {raw_signal.get('signal_id')} rejected: "
+                    f"OI_SQUEEZE entries disabled after 14:30 IST (current time: {now_dt.strftime('%H:%M:%S IST')})."
+                )
+                return None
+
         # 1. Spot ATR14: live calculated value or index-calibrated baseline fallback
         min_atr_floor = 80.0 if inst == "SENSEX" else 20.0
         atr_obj = self.spot_atr.get(inst)
