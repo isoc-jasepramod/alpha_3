@@ -247,12 +247,23 @@ async def get_digest_preview():
 
 @router.get("/api/execution/orders")
 async def get_execution_orders(date_str: Optional[str] = None):
-    """Returns the list of orders executed (simulated in Phase 1 Paper mode), optionally filtered by date."""
+    """Returns the list of orders executed (simulated or live), preferring PostgreSQL orders table with JSON file fallback."""
     bridge = getattr(app_state, "execution_bridge", None)
+
+    # 1. Primary: Try loading from PostgreSQL orders table
+    if bridge and hasattr(bridge, "get_orders_from_db"):
+        try:
+            db_orders = await bridge.get_orders_from_db(date_str=date_str)
+            if db_orders:
+                return db_orders
+        except Exception as e:
+            logger.warning(f"Error querying DB orders, falling back to file/memory: {e}")
+
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # If a historical date is requested, load directly from the date-partitioned JSON log
+    # 2. Fallback: If a historical date is requested, load directly from the date-partitioned JSON log
     if date_str and date_str != today_str:
+
         import os, json
         file_path = f"data/execution_logs/orders_{date_str}.json"
         if not os.path.exists(file_path):

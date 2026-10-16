@@ -99,3 +99,101 @@ class DailyJournal(Base):
             "circuit_breaker_time": self.circuit_breaker_time.isoformat() if self.circuit_breaker_time else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None
         }
+
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(String(64), unique=True, index=True, nullable=False)
+    parent_order_id = Column(String(64), index=True, nullable=True)
+    signal_id = Column(String(64), index=True, nullable=True)
+
+    instrument = Column(String(32), nullable=False, index=True) # NIFTY, SENSEX
+    symbol = Column(String(64), nullable=False)                 # e.g., NIFTY24OCT25000CE
+    option_symbol = Column(String(64), nullable=True)
+    option_token = Column(String(32), nullable=True)
+    direction = Column(String(16), nullable=True)               # CE, PE
+    action = Column(String(32), default="BUY", nullable=False)  # BUY, SELL, FULL_EXIT, PARTIAL_EXIT
+    order_type = Column(String(32), default="LIMIT", nullable=False) # LIMIT, MARKET
+    product_type = Column(String(32), default="INTRADAY", nullable=False) # INTRADAY
+    mode = Column(String(32), default="PAPER", nullable=False)  # PAPER, LIVE_EXCHANGE
+
+
+    quantity = Column(Integer, nullable=False)
+    filled_quantity = Column(Integer, default=0)
+    price = Column(Float, nullable=True)                        # Planned / limit price
+    fill_price = Column(Float, nullable=True)                   # Real executed price
+    slippage = Column(Float, default=0.0)
+    exit_price = Column(Float, nullable=True)
+    realized_pnl = Column(Float, default=0.0)
+    total_realized_pnl = Column(Float, default=0.0)
+
+    # State tracking: PENDING, FILLED, REJECTED, ABORTED_UNFILLED, PARTIAL_CLOSED, CLOSED, EXIT_FAILED
+    status = Column(String(32), default="PENDING", index=True, nullable=False)
+    reason = Column(Text, nullable=True)                        # Rejection or exit reason
+
+    placed_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    filled_at = Column(DateTime(timezone=True), nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+
+    broker_order_id = Column(String(64), nullable=True)
+    broker_payload = Column(JSON, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+
+    def to_dict(self):
+        dur_str = None
+        if self.duration_seconds is not None:
+            dur_sec = self.duration_seconds
+            if dur_sec < 60:
+                dur_str = f"{dur_sec}s"
+            elif dur_sec < 3600:
+                m, s = divmod(dur_sec, 60)
+                dur_str = f"{m}m {s}s" if s > 0 else f"{m}m"
+            else:
+                h, rem = divmod(dur_sec, 3600)
+                m = rem // 60
+                dur_str = f"{h}h {m}m"
+
+        entry_t = self.filled_at.isoformat() if self.filled_at else (self.placed_at.isoformat() if self.placed_at else None)
+        exit_t = self.closed_at.isoformat() if self.closed_at else None
+
+        return {
+            "id": self.id,
+            "order_id": self.order_id,
+            "parent_order_id": self.parent_order_id,
+            "signal_id": self.signal_id,
+            "instrument": self.instrument,
+            "symbol": self.symbol,
+            "option_symbol": self.option_symbol,
+            "option_token": self.option_token,
+            "direction": self.direction,
+            "action": self.action,
+            "order_type": self.order_type,
+            "product_type": self.product_type,
+            "mode": self.mode,
+            "quantity": self.quantity,
+            "filled_quantity": self.filled_quantity,
+            "price": self.price,
+            "fill_price": self.fill_price,
+            "slippage": self.slippage,
+            "exit_price": self.exit_price,
+            "realized_pnl": self.realized_pnl,
+            "total_realized_pnl": self.total_realized_pnl,
+            "status": self.status,
+            "reason": self.reason,
+            "placed_at": self.placed_at.isoformat() if self.placed_at else None,
+            "filled_at": self.filled_at.isoformat() if self.filled_at else None,
+            "closed_at": self.closed_at.isoformat() if self.closed_at else None,
+            "entry_time": entry_t,
+            "exit_time": exit_t,
+            "timestamp": exit_t or entry_t,
+            "duration_seconds": self.duration_seconds,
+            "duration_str": dur_str,
+            "broker_order_id": self.broker_order_id,
+            "broker_payload": self.broker_payload or {},
+            "metadata": self.metadata_json or {}
+        }
+
+

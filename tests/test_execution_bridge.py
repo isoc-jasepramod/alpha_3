@@ -708,5 +708,87 @@ async def test_live_exit_fill_confirmation_computes_real_pnl(bridge):
     assert signal["signal_id"] not in bridge.active_positions
 
 
+@pytest.mark.asyncio
+async def test_orders_persisted_to_database(bridge):
+    """Verifies that placed orders are persisted to the PostgreSQL 'orders' table."""
+    from backend.database.db import init_db
+    await init_db()
+
+    signal = {
+        "signal_id": "SIG-DB-TEST-001",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "strike": 22500.0,
+        "option_type": "CE",
+        "option_token": "44612",
+        "option_symbol": "NIFTY13OCT2622500CE",
+        "entry_price": 50.0,
+        "quantity": 65,
+        "lot_size": 65,
+        "stop_loss": 40.0,
+        "target": 65.0
+    }
+    try:
+        res = await bridge.execute_signal(signal)
+        assert res["status"] in ("FILLED", "SIMULATED_FILLED")
+        order_id = res["order_id"]
+
+        await bridge._persist_order_to_db(bridge.placed_orders[order_id])
+
+        db_orders = await bridge.get_orders_from_db()
+        matching = [o for o in db_orders if o["order_id"] == order_id]
+        assert len(matching) == 1
+        assert matching[0]["signal_id"] == "SIG-DB-TEST-001"
+        assert matching[0]["instrument"] == "NIFTY"
+        assert matching[0]["quantity"] == 65
+        assert matching[0]["fill_price"] == 50.0
+        assert matching[0]["status"] == "FILLED"
+    finally:
+        from backend.database.db import engine
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_exit_updates_parent_order_in_database(bridge):
+    """Verifies that an exit order updates the parent order's status, exit_price, and PnL in the DB."""
+    from backend.database.db import init_db, engine
+    await init_db()
+
+    try:
+        signal = {
+            "signal_id": "SIG-DB-EXIT-001",
+            "instrument": "NIFTY",
+            "direction": "CE",
+            "strike": 22500.0,
+            "option_type": "CE",
+            "option_token": "44612",
+            "option_symbol": "NIFTY13OCT2622500CE",
+            "entry_price": 50.0,
+            "quantity": 65,
+            "lot_size": 65,
+            "stop_loss": 40.0,
+            "target": 65.0
+        }
+        res = await bridge.execute_signal(signal)
+        order_id = res["order_id"]
+        await bridge._persist_order_to_db(bridge.placed_orders[order_id])
+
+        # Execute full exit at 65.0
+        exit_res = await bridge.handle_full_exit(signal, exit_price=65.0, reason="TARGET_HIT")
+        await bridge._persist_order_to_db(exit_res)
+
+        db_orders = await bridge.get_orders_from_db()
+        matching_parent = [o for o in db_orders if o["order_id"] == order_id]
+        assert len(matching_parent) == 1
+        assert matching_parent[0]["status"] == "CLOSED"
+        assert matching_parent[0]["exit_price"] == 65.0
+        assert matching_parent[0]["total_realized_pnl"] == round((65.0 - 50.0) * 65, 2)
+        assert matching_parent[0]["closed_at"] is not None
+    finally:
+        await engine.dispose()
+
+
+
+
 
 

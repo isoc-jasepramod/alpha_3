@@ -1110,18 +1110,193 @@ class AngelExecutionBridge:
             "order_id": exit_order_id,
             "parent_order_id": pos["order_id"],
             "signal_id": sig_id,
+            "instrument": pos.get("instrument", "NIFTY"),
+            "symbol": pos.get("symbol") or pos.get("option_symbol") or "-",
+            "option_symbol": pos.get("option_symbol"),
             "action": "FULL_EXIT",
             "reason": reason,
+            "quantity": rem_qty,
             "quantity_sold": rem_qty,
+            "fill_price": entry_price,
             "exit_price": exit_price,
+            "realized_pnl": leg2_pnl,
             "total_realized_pnl": total_pnl,
+            "status": "CLOSED",
             "timestamp": now_iso
         }
         self._append_audit_log(exit_event)
         return exit_event
 
+
+    async def _persist_order_to_db(self, record: Dict[str, Any]):
+        """
+        Persists or updates order record in PostgreSQL 'orders' table.
+        Resilient: logs warnings and never crashes the execution engine if DB is offline.
+        """
+        try:
+            from backend.database.db import AsyncSessionLocal
+            from backend.database.models import Order
+            from sqlalchemy import select
+
+            oid = str(record.get("order_id", ""))
+            if not oid:
+                return
+
+            async with AsyncSessionLocal() as session:
+                stmt = select(Order).where(Order.order_id == oid)
+                res = await session.execute(stmt)
+                db_order = res.scalar_one_or_none()
+
+                p_oid = record.get("parent_order_id")
+                meta = record.get("metadata") or {}
+                broker = record.get("broker_payload") or {}
+
+                def parse_dt(val):
+                    if not val:
+                        return None
+                    if isinstance(val, datetime):
+                        return val
+                    try:
+                        return datetime.fromisoformat(str(val))
+                    except Exception:
+                        return None
+
+                placed_at_dt = parse_dt(record.get("placed_at") or record.get("timestamp"))
+                filled_at_dt = parse_dt(record.get("filled_at"))
+                closed_at_dt = parse_dt(record.get("closed_at"))
+
+                dur_sec = record.get("duration_seconds")
+                if dur_sec is None and placed_at_dt and closed_at_dt:
+                    try:
+                        dur_sec = int(abs((closed_at_dt - placed_at_dt).total_seconds()))
+                    except Exception:
+                        pass
+
+                sym = record.get("symbol") or record.get("option_symbol") or meta.get("option_symbol") or broker.get("tradingsymbol") or "-"
+                opt_sym = record.get("option_symbol") or meta.get("option_symbol") or sym
+                opt_token = str(record.get("option_token") or meta.get("option_token") or broker.get("symboltoken") or "")
+                direction = record.get("direction") or meta.get("direction") or ("PE" if str(sym).endswith("PE") else "CE")
+                action = record.get("action") or broker.get("transactiontype") or "BUY"
+
+                qty = int(record.get("quantity") or meta.get("quantity") or 0)
+                fill_p = record.get("fill_price")
+                fill_p = float(fill_p) if fill_p is not None else None
+
+                price_val = record.get("price") or meta.get("expected_entry") or fill_p
+                price_val = float(price_val) if price_val is not None else None
+
+                exit_p = record.get("exit_price")
+                exit_p = float(exit_p) if exit_p is not None else None
+
+                realized = float(record.get("realized_pnl", 0.0) or 0.0)
+                total_realized = float(record.get("total_realized_pnl", realized) or 0.0)
+
+                if not db_order:
+                    db_order = Order(
+                        order_id=oid,
+                        parent_order_id=p_oid,
+                        signal_id=str(record.get("signal_id") or meta.get("signal_id") or ""),
+                        instrument=str(record.get("instrument") or meta.get("instrument") or "NIFTY"),
+                        symbol=sym,
+                        option_symbol=opt_sym,
+                        option_token=opt_token,
+                        direction=direction,
+                        action=action,
+                        order_type=record.get("order_type") or self.default_order_type,
+                        product_type=record.get("product_type") or self.default_product_type,
+                        mode=record.get("mode") or self.mode,
+                        quantity=qty,
+                        filled_quantity=qty if record.get("status") in ("FILLED", "PARTIAL_CLOSED", "CLOSED") else 0,
+                        price=price_val,
+                        fill_price=fill_p,
+                        slippage=float(record.get("slippage") or 0.0),
+                        exit_price=exit_p,
+                        realized_pnl=realized,
+                        total_realized_pnl=total_realized,
+                        status=str(record.get("status") or "PENDING"),
+                        reason=record.get("reason"),
+                        placed_at=placed_at_dt or datetime.now(timezone.utc),
+                        filled_at=filled_at_dt,
+                        closed_at=closed_at_dt,
+                        duration_seconds=dur_sec,
+                        broker_order_id=record.get("broker_order_id"),
+                        broker_payload=broker,
+                        metadata_json=meta
+                    )
+                    session.add(db_order)
+                else:
+                    db_order.status = str(record.get("status") or db_order.status)
+                    if fill_p is not None:
+                        db_order.fill_price = fill_p
+                    if exit_p is not None:
+                        db_order.exit_price = exit_p
+                    if filled_at_dt:
+                        db_order.filled_at = filled_at_dt
+                    if closed_at_dt:
+                        db_order.closed_at = closed_at_dt
+                    if dur_sec is not None:
+                        db_order.duration_seconds = dur_sec
+                    db_order.realized_pnl = realized
+                    db_order.total_realized_pnl = total_realized
+                    if record.get("reason"):
+                        db_order.reason = record.get("reason")
+
+                # If this is an EXIT order with parent_order_id, sync parent entry order
+                is_full_exit = (record.get("event") == "FULL_EXIT" or record.get("action") == "FULL_EXIT")
+                is_partial_exit = (record.get("event") == "PARTIAL_EXIT" or record.get("action") == "PARTIAL_EXIT")
+                if p_oid and (is_full_exit or is_partial_exit):
+                    stmt_p = select(Order).where(Order.order_id == p_oid)
+                    res_p = await session.execute(stmt_p)
+                    parent_db = res_p.scalar_one_or_none()
+                    if parent_db:
+                        if is_full_exit:
+                            parent_db.status = "CLOSED"
+                            parent_db.exit_price = exit_p
+                            parent_db.total_realized_pnl = total_realized
+                            parent_db.closed_at = closed_at_dt or datetime.now(timezone.utc)
+                            parent_db.reason = record.get("reason")
+                            if parent_db.placed_at and parent_db.closed_at:
+                                parent_db.duration_seconds = int(abs((parent_db.closed_at - parent_db.placed_at).total_seconds()))
+                        elif is_partial_exit:
+                            parent_db.status = "PARTIAL_CLOSED"
+                            parent_db.realized_pnl = realized
+
+
+                try:
+                    await session.commit()
+                except Exception as commit_err:
+                    await session.rollback()
+                    # Retry as update if it was an insert race condition
+                    stmt_retry = select(Order).where(Order.order_id == oid)
+                    res_retry = await session.execute(stmt_retry)
+                    db_order = res_retry.scalar_one_or_none()
+                    if db_order:
+                        db_order.status = str(record.get("status") or db_order.status)
+                        if fill_p is not None:
+                            db_order.fill_price = fill_p
+                        if exit_p is not None:
+                            db_order.exit_price = exit_p
+                        if filled_at_dt:
+                            db_order.filled_at = filled_at_dt
+                        if closed_at_dt:
+                            db_order.closed_at = closed_at_dt
+                        if dur_sec is not None:
+                            db_order.duration_seconds = dur_sec
+                        db_order.realized_pnl = realized
+                        db_order.total_realized_pnl = total_realized
+                        if record.get("reason"):
+                            db_order.reason = record.get("reason")
+                        await session.commit()
+                    else:
+                        raise commit_err
+
+                logger.debug(f"💾 Persisted order {oid} ({record.get('status')}) to PostgreSQL 'orders' table.")
+        except Exception as e:
+            logger.warning(f"⚠️ DB order persistence warning for {record.get('order_id')}: {e} (file audit preserved)")
+
+
     def _append_audit_log(self, record: Dict[str, Any]):
-        """Persists order event to daily JSON audit file with atomic write protection."""
+        """Persists order event to daily JSON audit file with atomic write protection, and schedules DB persist."""
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         filepath = os.path.join(self.audit_dir, f"orders_{today_str}.json")
         temp_filepath = f"{filepath}.tmp"
@@ -1142,8 +1317,16 @@ class AngelExecutionBridge:
                 except Exception:
                     pass
 
+        # Also schedule persistence to DB if an event loop is running
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                loop.create_task(self._persist_order_to_db(record))
+        except RuntimeError:
+            pass
+
     def get_today_orders(self) -> List[Dict[str, Any]]:
-        """Returns all order and rejection audit records recorded today."""
+        """Returns all order and rejection audit records recorded today from JSON audit file."""
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         filepath = os.path.join(self.audit_dir, f"orders_{today_str}.json")
         if os.path.exists(filepath):
@@ -1154,9 +1337,31 @@ class AngelExecutionBridge:
                 logger.error(f"Error reading today's audit file {filepath}: {e}")
         return list(self.placed_orders.values())
 
+    async def get_orders_from_db(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetches orders from PostgreSQL 'orders' table, optionally filtered by date (YYYY-MM-DD)."""
+        try:
+            from backend.database.db import AsyncSessionLocal
+            from backend.database.models import Order
+            from sqlalchemy import select, and_, desc
+
+            async with AsyncSessionLocal() as session:
+                stmt = select(Order).order_by(desc(Order.placed_at))
+                if date_str:
+                    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    start_dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
+                    end_dt = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc)
+                    stmt = stmt.where(and_(Order.placed_at >= start_dt, Order.placed_at <= end_dt))
+                res = await session.execute(stmt)
+                orders = res.scalars().all()
+                return [o.to_dict() for o in orders]
+        except Exception as e:
+            logger.warning(f"⚠️ Error querying orders table from DB: {e}")
+            return []
+
     def get_audit_history(self) -> List[Dict[str, Any]]:
         """Returns all placed orders in current session."""
         return list(self.placed_orders.values())
+
 
     def get_capital_metrics(self) -> Dict[str, Any]:
         """Returns real-time execution capital pool metrics."""
