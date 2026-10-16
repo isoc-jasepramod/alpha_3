@@ -15,9 +15,12 @@ TEST_AUDIT_DIR = "data/test_execution_logs"
 
 @pytest.fixture
 def bridge():
-    # Setup test instance with a clean test audit dir
+    # Setup test instance with a clean test audit dir and isolated test config
     os.makedirs(TEST_AUDIT_DIR, exist_ok=True)
-    b = AngelExecutionBridge(force_dry_run=True, audit_dir=TEST_AUDIT_DIR)
+    test_cfg_path = os.path.join(TEST_AUDIT_DIR, "test_settings.yaml")
+    if os.path.exists("config/settings.yaml"):
+        shutil.copy("config/settings.yaml", test_cfg_path)
+    b = AngelExecutionBridge(config_path=test_cfg_path, force_dry_run=True, audit_dir=TEST_AUDIT_DIR)
     b.max_capital_per_trade = 25000.0
     b.max_active_orders = 3
     b.risk_governor.expiry_gate_enabled = False  # Avoid wall-clock Friday cutoff during testing
@@ -60,8 +63,9 @@ async def test_nifty_order_payload_validation(bridge):
     assert payload["producttype"] == "INTRADAY"
     assert payload["ordertype"] == "LIMIT"
     assert int(payload["quantity"]) == 130
-    # Entry 76.55 * 1.005 = 76.93275 -> aligned to 0.05 tick size = 76.95
-    assert float(payload["price"]) == bridge.align_tick_size(76.55 * 1.005, 0.05)
+    # Buffered price aligned to 0.05 tick size
+    expected_price = bridge.align_tick_size(76.55 * (1.0 + bridge.slippage_buffer_pct / 100.0), 0.05)
+    assert float(payload["price"]) == expected_price
 
     # Execute simulation
     res = await bridge.execute_signal(signal)
@@ -523,6 +527,186 @@ async def test_exit_order_broker_failure_preserves_position(bridge):
     held_pos = bridge.active_positions["SIG-EXIT-FAIL-001"]
     assert held_pos["exit_failed"] is True
     assert "Exchange Gateway Timeout" in held_pos["last_exit_error"]
+
+
+def test_safe_production_defaults():
+    """
+    P0-1 Blocker Verification:
+    Asserts that the committed settings.yaml ships with safe defaults:
+    mode: PAPER, dry_run: True, force_single_lot: True.
+    A cold boot must never place real money trades.
+    """
+    import yaml
+    with open("config/settings.yaml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    exec_cfg = cfg.get("execution", {})
+
+    assert exec_cfg.get("mode") == "PAPER"
+    assert exec_cfg.get("dry_run") is True
+    assert exec_cfg.get("force_single_lot") is True
+
+
+@pytest.mark.asyncio
+async def test_live_entry_fill_confirmation_real_price_anchors_sl_target(bridge):
+    """
+    P0-2 & P0-4 Verification:
+    Asserts that after placeOrder returns an order_id, the bridge confirms fill via
+    smart_connect.orderBook(), records the actual executed averageprice, and re-anchors
+    stop-loss and profit targets to the REAL fill price.
+    """
+    from unittest.mock import MagicMock
+
+    mock_sc = MagicMock()
+    mock_sc.placeOrder.return_value = "24101600099881"
+    # Broker fills at ₹62.50 instead of expected entry ₹60.00
+    mock_sc.orderBook.return_value = {
+        "status": True,
+        "data": [
+            {
+                "orderid": "24101600099881",
+                "status": "complete",
+                "averageprice": 62.50,
+                "filledshares": 65
+            }
+        ]
+    }
+    mock_auth = MagicMock()
+    mock_auth.smart_connect = mock_sc
+    bridge.auth = mock_auth
+    bridge.set_execution_mode("LIVE")
+
+    signal = {
+        "signal_id": "SIG-REAL-FILL-001",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "strike": 22500.0,
+        "option_type": "CE",
+        "option_token": "44612",
+        "option_symbol": "NIFTY13OCT2622500CE",
+        "entry_price": 60.0,
+        "quantity": 65,
+        "lot_size": 65,
+        "stop_loss": 45.0,  # 15.00 delta
+        "target": 90.0
+    }
+
+    res = await bridge.execute_signal(signal)
+    assert res["status"] == "LIVE_FILLED"
+    assert res["fill_price"] == 62.50
+
+    pos = bridge.active_positions["SIG-REAL-FILL-001"]
+    assert pos["fill_price"] == 62.50
+    # Re-anchored with 15.00 risk delta from real fill price (62.50)
+    assert pos["stop_loss"] == 47.50   # 62.50 - 15.00
+    assert pos["target_1r"] == 77.50   # 62.50 + 15.00
+    assert pos["target_2r"] == 92.50   # 62.50 + 30.00
+
+
+@pytest.mark.asyncio
+async def test_live_entry_unfilled_timeout_aborts_and_cancels(bridge):
+    """
+    P0-3 Verification:
+    If a limit order sits unfilled until limit_timeout_sec expires, the bridge
+    must send cancelOrder to the broker and abort the trade with ZERO active positions.
+    """
+    from unittest.mock import MagicMock
+
+    mock_sc = MagicMock()
+    mock_sc.placeOrder.return_value = "24101600099882"
+    # Order stays OPEN on the exchange
+    mock_sc.orderBook.return_value = {
+        "status": True,
+        "data": [
+            {
+                "orderid": "24101600099882",
+                "status": "open",
+                "filledshares": 0
+            }
+        ]
+    }
+    mock_sc.cancelOrder.return_value = {"status": True, "message": "SUCCESS"}
+    mock_auth = MagicMock()
+    mock_auth.smart_connect = mock_sc
+    bridge.auth = mock_auth
+    bridge.set_execution_mode("LIVE")
+    bridge.limit_timeout_sec = 1  # 1s timeout for fast test
+
+    signal = {
+        "signal_id": "SIG-TIMEOUT-001",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "strike": 22500.0,
+        "option_type": "CE",
+        "option_token": "44612",
+        "option_symbol": "NIFTY13OCT2622500CE",
+        "entry_price": 50.0,
+        "quantity": 65,
+        "lot_size": 65,
+        "stop_loss": 40.0,
+        "target": 70.0
+    }
+
+    res = await bridge.execute_signal(signal)
+    assert res["status"] == "ABORTED_UNFILLED"
+    assert "LIMIT_TIMEOUT" in res["reason"]
+
+    # Verify cancelOrder was dispatched to broker
+    assert mock_sc.cancelOrder.call_count == 1
+    # Verify no active position was created
+    assert "SIG-TIMEOUT-001" not in bridge.active_positions
+
+
+@pytest.mark.asyncio
+async def test_live_exit_fill_confirmation_computes_real_pnl(bridge):
+    """
+    P1-2 Verification:
+    When an exit order fills on the broker, realized P&L must be computed
+    from the actual broker fill price, not the theoretical target level.
+    """
+    from unittest.mock import MagicMock
+
+    mock_sc = MagicMock()
+    mock_auth = MagicMock()
+    mock_auth.smart_connect = mock_sc
+    bridge.auth = mock_auth
+    bridge.set_execution_mode("LIVE")
+
+    # 1. Entry fill confirmed at 50.00
+    mock_sc.placeOrder.return_value = "24101600099883"
+    mock_sc.orderBook.return_value = {
+        "status": True,
+        "data": [{"orderid": "24101600099883", "status": "complete", "averageprice": 50.0, "filledshares": 65}]
+    }
+    signal = {
+        "signal_id": "SIG-EXIT-REAL-PNL",
+        "instrument": "NIFTY",
+        "direction": "CE",
+        "strike": 22500.0,
+        "option_type": "CE",
+        "option_token": "44612",
+        "option_symbol": "NIFTY13OCT2622500CE",
+        "entry_price": 50.0,
+        "quantity": 65,
+        "lot_size": 65,
+        "stop_loss": 40.0,
+        "target": 65.0
+    }
+    await bridge.execute_signal(signal)
+
+    # 2. Exit fill confirmed at 58.40 (instead of target 65.00)
+    mock_sc.placeOrder.return_value = "24101600099884"
+    mock_sc.orderBook.return_value = {
+        "status": True,
+        "data": [{"orderid": "24101600099884", "status": "complete", "averageprice": 58.40, "filledshares": 65}]
+    }
+
+    exit_res = await bridge.handle_full_exit(signal, exit_price=65.0, reason="TARGET_HIT")
+    assert exit_res["action"] == "FULL_EXIT"
+    assert exit_res["exit_price"] == 58.40
+    # Realized PnL: (58.40 - 50.00) * 65 = 8.40 * 65 = 546.00
+    assert exit_res["total_realized_pnl"] == round((58.40 - 50.00) * 65, 2)
+    assert signal["signal_id"] not in bridge.active_positions
+
 
 
 

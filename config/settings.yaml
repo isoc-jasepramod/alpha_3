@@ -94,13 +94,13 @@ telegram:
     - '15:15'
 execution:
   enabled: true
-  mode: LIVE
-  dry_run: false
+  mode: PAPER
+  dry_run: true
   total_capital: 25000.0
-  force_single_lot: false
+  force_single_lot: true
   default_product_type: INTRADAY
   default_order_type: LIMIT
-  slippage_buffer_pct: 0.5
+  slippage_buffer_pct: 1.0
   limit_timeout_sec: 15
   retry_on_network_failure: true
   max_capital_per_trade: 25000.0
