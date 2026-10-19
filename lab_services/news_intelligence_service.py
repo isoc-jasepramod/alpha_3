@@ -640,26 +640,10 @@ class NewsIntelligenceAgent:
         return msg
 
     async def run_and_dispatch(self, spot_data: Optional[Dict[str, Any]] = None) -> bool:
-        """Executes full intelligence run and broadcasts to Telegram."""
-        data = self.compile_full_intelligence(spot_data=spot_data)
-        html_msg = self.format_telegram_html(data)
-
-        notifier = TelegramNotifier()
-        await notifier.initialize()
-        if not notifier.enabled or not notifier.client:
-            logger.warning("Telegram notifier not available.")
-            return False
-
-        try:
-            await notifier.enqueue_message(html_msg)
-            await asyncio.sleep(2.0)
-            logger.info("✅ [AI NEWS INTELLIGENCE] Successfully dispatched digest to Telegram!")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to dispatch News Intelligence digest: {e}")
-            return False
-        finally:
-            await notifier.close()
+        """Executes full intelligence run and broadcasts to Telegram (guarded)."""
+        # HARD DISABLE: User explicitly requested to stop all AI reports to Telegram
+        logger.info("🛑 [AI NEWS INTELLIGENCE] Telegram AI reports are explicitly DISABLED by user request. Skipping dispatch.")
+        return False
 
 
 if __name__ == "__main__":

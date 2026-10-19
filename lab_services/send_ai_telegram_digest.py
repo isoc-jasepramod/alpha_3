@@ -24,8 +24,16 @@ from backend.core.telegram_notifier import TelegramNotifier
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
+# HARD DISABLE: User explicitly requested to stop all AI reports to Telegram
+AI_REPORTS_ENABLED = False
+
+
 async def dispatch_telegram_ai_report(html_message: str) -> bool:
     """Dispatches a formatted HTML AI analysis message to Telegram."""
+    if not AI_REPORTS_ENABLED:
+        print("[INFO] AI Telegram reports are explicitly DISABLED by user request. Skipping dispatch.")
+        return False
+
     notifier = TelegramNotifier()
     await notifier.initialize()
     if not notifier.enabled or not notifier.client:
